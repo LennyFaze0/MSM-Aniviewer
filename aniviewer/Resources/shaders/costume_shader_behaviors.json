@@ -1,0 +1,65 @@
+{
+  "shadercostumea3": {
+    "texture_suffix": "_sequence",
+    "replace_base_sprite": true,
+    "sheet_width": 512.0,
+    "sheet_height": 1024.0,
+    "sheet_offset_x": 268.0,
+    "sheet_offset_y": 489.0,
+    "uv_divisor": 2.0,
+    "strip_width": 512.0,
+    "strip_height": 128.0,
+    "frame_width": 63.0,
+    "frame_axis": "u",
+    "cycle_time": 4.0,
+    "frame_thresholds": [0.03, 0.06, 0.56, 0.59, 0.63, 0.69],
+    "frame_values": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 0.0]
+  },
+  "shadercostumee9": {
+    "texture_suffix": "_sequence",
+    "replace_base_sprite": true,
+    "mapping_mode": "sheet",
+    "sheet_width": 512.0,
+    "sheet_height": 512.0,
+    "sheet_offset_x": 335.0,
+    "sheet_offset_y": 188.0,
+    "uv_divisor": 2.0,
+    "strip_width": 64.0,
+    "strip_height": 128.0,
+    "frame_width": 26.0,
+    "frame_axis": "v",
+    "cycle_time": 3.0,
+    "frame_thresholds": [0.03, 0.09, 0.17, 0.24, 0.3, 0.38, 0.51, 0.56, 0.68, 0.76, 0.8, 0.88, 0.95, 0.99],
+    "frame_values": [1.0, 2.0, 1.0, 2.0, 3.0, 2.0, 3.0, 2.0, 3.0, 2.0, 1.0, 2.0, 3.0, 1.0, 0.0]
+  },
+  "shadercostumeabe3rare": {
+    "replace_base_sprite": true,
+    "mapping_mode": "sheet",
+    "texture_suffix": "_sheet"
+  },
+  "shadercostumeace2": {
+    "requires_texture": false,
+    "color_wave": {
+      "frequency": 2.0,
+      "channels": [
+        {
+          "channel": "r",
+          "min": 0.7,
+          "max": 1.2
+        },
+        {
+          "channel": "g",
+          "min": 0.6,
+          "max": 1.35,
+          "phase": 0.7
+        },
+        {
+          "channel": "b",
+          "min": 0.85,
+          "max": 1.35,
+          "phase": 1.4
+        }
+      ]
+    }
+  }
+}

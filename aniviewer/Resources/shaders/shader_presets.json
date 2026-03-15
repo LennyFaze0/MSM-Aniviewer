@@ -1,0 +1,79 @@
+{
+  "anim2d/normal+alpha": {
+    "display_name": "Anim2D/Normal+Alpha",
+    "color_scale": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "alpha_scale": 1.0,
+    "blend_override": "standard",
+    "notes": "Unity Anim2D base sprite shader approximation: straight color + alpha with standard blending."
+  },
+  "dawnoffire/effects/blendaddglow": {
+    "display_name": "DawnOfFire/Effects/BlendAddGlow",
+    "color_scale": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "alpha_scale": 1.0,
+    "blend_override": "additive",
+    "notes": "DOF particle shader (additive glow)."
+  },
+  "dawnoffire/effects/particle_additive": {
+    "display_name": "DawnOfFire/Effects/Particle_Additive",
+    "color_scale": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "alpha_scale": 1.0,
+    "blend_override": "additive",
+    "notes": "DOF particle shader (additive)."
+  },
+  "legacy shaders/particles/alpha blended premultiply": {
+    "display_name": "Legacy Shaders/Particles/Alpha Blended Premultiply",
+    "color_scale": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "alpha_scale": 1.0,
+    "blend_override": "premult_alpha",
+    "notes": "Unity legacy premultiplied particle shader."
+  },
+  "mobile/particles/additive": {
+    "display_name": "Mobile/Particles/Additive",
+    "color_scale": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "alpha_scale": 1.0,
+    "blend_override": "additive",
+    "notes": "Unity mobile particle shader (additive)."
+  },
+  "mobile/particles/alpha blended": {
+    "display_name": "Mobile/Particles/Alpha Blended",
+    "color_scale": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "alpha_scale": 1.0,
+    "blend_override": "standard",
+    "notes": "Unity mobile particle shader (alpha blended)."
+  },
+  "mobile/particles/multiply": {
+    "display_name": "Mobile/Particles/Multiply",
+    "color_scale": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "alpha_scale": 1.0,
+    "blend_override": "multiply",
+    "notes": "Unity mobile particle shader (multiply)."
+  }
+}

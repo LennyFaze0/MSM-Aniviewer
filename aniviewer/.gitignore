@@ -1,0 +1,22 @@
+# Python cache
+__pycache__/
+*/__pycache__/
+*.py[cod]
+
+# Local logs / debug dumps
+anchor_debug.txt
+*.log
+
+# Build and packaged outputs
+build/
+dist/
+Output/
+
+# Local environment
+.venv/
+venv/
+env/
+
+# OS/editor
+.DS_Store
+Thumbs.db
