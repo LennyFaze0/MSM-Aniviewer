@@ -36,6 +36,227 @@ except Exception:  # pragma: no cover - optional dependency
     QSvgRenderer = None
 from utils.shader_registry import ShaderRegistry
 
+_POST_AA_VERTEX_SHADER = """
+#version 120
+void main()
+{
+    gl_Position = ftransform();
+    gl_TexCoord[0] = gl_MultiTexCoord0;
+}
+"""
+
+# Hidden/PostProcessing/FinalPass-style FXAA pass for the fixed-function
+# viewport pipeline. This is a lightweight approximation of the game's
+# fullscreen final AA behavior and keeps source alpha intact.
+_POST_AA_FRAGMENT_SHADER = """
+#version 120
+uniform sampler2D u_texture;
+uniform sampler2D u_prevTexture;
+uniform vec2 u_texelSize;
+uniform float u_strength;
+uniform int u_aaMode;          // 0=FXAA (FinalPass style), 1=SMAA-like approximation
+uniform int u_aaEnabled;
+uniform int u_bloomEnabled;
+uniform float u_bloomStrength;
+uniform float u_bloomThreshold;
+uniform float u_bloomRadius;
+uniform int u_vignetteEnabled;
+uniform float u_vignetteStrength;
+uniform int u_grainEnabled;
+uniform float u_grainStrength;
+uniform int u_caEnabled;
+uniform float u_caStrength;
+uniform int u_motionBlurEnabled;
+uniform float u_motionBlurStrength;
+uniform float u_time;
+
+float luma(vec3 c)
+{
+    return dot(c, vec3(0.299, 0.587, 0.114));
+}
+
+float hash12(vec2 p)
+{
+    return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123);
+}
+
+vec3 apply_smaa_like(vec2 uv, vec3 src)
+{
+    vec4 c = vec4(src, 1.0);
+    vec4 l = texture2D(u_texture, uv + vec2(-u_texelSize.x, 0.0));
+    vec4 r = texture2D(u_texture, uv + vec2( u_texelSize.x, 0.0));
+    vec4 t = texture2D(u_texture, uv + vec2(0.0, -u_texelSize.y));
+    vec4 b = texture2D(u_texture, uv + vec2(0.0,  u_texelSize.y));
+    vec4 d1 = texture2D(u_texture, uv + vec2(-u_texelSize.x, -u_texelSize.y));
+    vec4 d2 = texture2D(u_texture, uv + vec2( u_texelSize.x, -u_texelSize.y));
+    vec4 d3 = texture2D(u_texture, uv + vec2(-u_texelSize.x,  u_texelSize.y));
+    vec4 d4 = texture2D(u_texture, uv + vec2( u_texelSize.x,  u_texelSize.y));
+
+    float lc = luma(c.rgb);
+    float edge_h = abs(luma(l.rgb) - lc) + abs(luma(r.rgb) - lc);
+    float edge_v = abs(luma(t.rgb) - lc) + abs(luma(b.rgb) - lc);
+    float edge_d = abs(luma(d1.rgb) - lc) + abs(luma(d2.rgb) - lc)
+                 + abs(luma(d3.rgb) - lc) + abs(luma(d4.rgb) - lc);
+
+    float edge = clamp((edge_h + edge_v + 0.5 * edge_d) * 0.65, 0.0, 1.0);
+    float w = clamp(edge * clamp(u_strength, 0.0, 1.0), 0.0, 1.0);
+
+    vec3 axial = (l.rgb + r.rgb + t.rgb + b.rgb) * 0.25;
+    vec3 diag = (d1.rgb + d2.rgb + d3.rgb + d4.rgb) * 0.25;
+    vec3 neighborhood = mix(axial, diag, 0.35);
+    return mix(c.rgb, neighborhood, w * 0.72);
+}
+
+vec3 apply_fxaa(vec2 uv, vec3 src)
+{
+    vec3 rgbNW = texture2D(u_texture, uv + vec2(-u_texelSize.x, -u_texelSize.y)).rgb;
+    vec3 rgbNE = texture2D(u_texture, uv + vec2( u_texelSize.x, -u_texelSize.y)).rgb;
+    vec3 rgbSW = texture2D(u_texture, uv + vec2(-u_texelSize.x,  u_texelSize.y)).rgb;
+    vec3 rgbSE = texture2D(u_texture, uv + vec2( u_texelSize.x,  u_texelSize.y)).rgb;
+    vec3 rgbM  = src;
+
+    float lumaNW = luma(rgbNW);
+    float lumaNE = luma(rgbNE);
+    float lumaSW = luma(rgbSW);
+    float lumaSE = luma(rgbSE);
+    float lumaM  = luma(rgbM);
+
+    float lumaMin = min(lumaM, min(min(lumaNW, lumaNE), min(lumaSW, lumaSE)));
+    float lumaMax = max(lumaM, max(max(lumaNW, lumaNE), max(lumaSW, lumaSE)));
+    float edge = max(0.0, lumaMax - lumaMin);
+    float edgeWeight = clamp((edge - 0.015) * 8.0, 0.0, 1.0);
+
+    vec2 dir;
+    dir.x = -((lumaNW + lumaNE) - (lumaSW + lumaSE));
+    dir.y =  ((lumaNW + lumaSW) - (lumaNE + lumaSE));
+
+    const float FXAA_REDUCE_MIN = 1.0 / 128.0;
+    const float FXAA_REDUCE_MUL = 1.0 / 8.0;
+    const float FXAA_SPAN_MAX = 8.0;
+
+    float dirReduce = max(
+        (lumaNW + lumaNE + lumaSW + lumaSE) * (0.25 * FXAA_REDUCE_MUL),
+        FXAA_REDUCE_MIN
+    );
+    float rcpDirMin = 1.0 / (min(abs(dir.x), abs(dir.y)) + dirReduce);
+    float strength = clamp(u_strength, 0.0, 1.0);
+    dir = clamp(dir * rcpDirMin, vec2(-FXAA_SPAN_MAX), vec2(FXAA_SPAN_MAX));
+    dir *= u_texelSize * mix(0.35, 1.0, strength);
+
+    vec3 rgbA = 0.5 * (
+        texture2D(u_texture, uv + dir * (1.0 / 3.0 - 0.5)).rgb +
+        texture2D(u_texture, uv + dir * (2.0 / 3.0 - 0.5)).rgb
+    );
+    vec3 rgbB = rgbA * 0.5 + 0.25 * (
+        texture2D(u_texture, uv + dir * -0.5).rgb +
+        texture2D(u_texture, uv + dir *  0.5).rgb
+    );
+
+    float lumaB = luma(rgbB);
+    vec3 fxaaColor = ((lumaB < lumaMin) || (lumaB > lumaMax)) ? rgbA : rgbB;
+    float blend = clamp(strength * edgeWeight, 0.0, 1.0);
+    return mix(rgbM, fxaaColor, blend);
+}
+
+float bright_weight(vec3 c, float threshold)
+{
+    float m = max(max(c.r, c.g), c.b);
+    return max(m - threshold, 0.0);
+}
+
+vec3 apply_bloom(vec2 uv, vec3 src)
+{
+    if (u_bloomEnabled == 0 || u_bloomStrength <= 0.0001)
+        return src;
+
+    vec2 stepv = u_texelSize * max(u_bloomRadius, 0.5);
+    vec3 s0 = texture2D(u_texture, uv + vec2( stepv.x, 0.0)).rgb;
+    vec3 s1 = texture2D(u_texture, uv + vec2(-stepv.x, 0.0)).rgb;
+    vec3 s2 = texture2D(u_texture, uv + vec2(0.0,  stepv.y)).rgb;
+    vec3 s3 = texture2D(u_texture, uv + vec2(0.0, -stepv.y)).rgb;
+    vec3 s4 = texture2D(u_texture, uv + vec2( stepv.x,  stepv.y)).rgb;
+    vec3 s5 = texture2D(u_texture, uv + vec2(-stepv.x,  stepv.y)).rgb;
+    vec3 s6 = texture2D(u_texture, uv + vec2( stepv.x, -stepv.y)).rgb;
+    vec3 s7 = texture2D(u_texture, uv + vec2(-stepv.x, -stepv.y)).rgb;
+
+    float w0 = bright_weight(s0, u_bloomThreshold);
+    float w1 = bright_weight(s1, u_bloomThreshold);
+    float w2 = bright_weight(s2, u_bloomThreshold);
+    float w3 = bright_weight(s3, u_bloomThreshold);
+    float w4 = bright_weight(s4, u_bloomThreshold);
+    float w5 = bright_weight(s5, u_bloomThreshold);
+    float w6 = bright_weight(s6, u_bloomThreshold);
+    float w7 = bright_weight(s7, u_bloomThreshold);
+
+    float wsum = w0 + w1 + w2 + w3 + w4 + w5 + w6 + w7;
+    vec3 bloom = vec3(0.0);
+    if (wsum > 0.0001) {
+        bloom = (
+            s0 * w0 + s1 * w1 + s2 * w2 + s3 * w3 +
+            s4 * w4 + s5 * w5 + s6 * w6 + s7 * w7
+        ) / wsum;
+    }
+
+    return src + bloom * clamp(u_bloomStrength, 0.0, 2.0);
+}
+
+vec3 apply_chromatic_aberration(vec2 uv, vec3 src)
+{
+    if (u_caEnabled == 0 || u_caStrength <= 0.0001)
+        return src;
+    vec2 fromCenter = uv - vec2(0.5, 0.5);
+    float dist = length(fromCenter);
+    vec2 off = fromCenter * dist * u_caStrength * 2.0 * u_texelSize;
+    float r = texture2D(u_texture, uv + off).r;
+    float g = src.g;
+    float b = texture2D(u_texture, uv - off).b;
+    return vec3(r, g, b);
+}
+
+vec3 apply_vignette(vec2 uv, vec3 src)
+{
+    if (u_vignetteEnabled == 0 || u_vignetteStrength <= 0.0001)
+        return src;
+    vec2 p = (uv - vec2(0.5, 0.5)) * 2.0;
+    float radial = dot(p, p);
+    float v = 1.0 - smoothstep(0.35, 1.45, radial) * clamp(u_vignetteStrength, 0.0, 1.0);
+    return src * max(v, 0.0);
+}
+
+vec3 apply_grain(vec2 uv, vec3 src)
+{
+    if (u_grainEnabled == 0 || u_grainStrength <= 0.0001)
+        return src;
+    float n = hash12(uv * vec2(1920.0, 1080.0) + vec2(u_time * 37.0, u_time * 17.0));
+    float g = (n - 0.5) * clamp(u_grainStrength, 0.0, 1.0) * 0.12;
+    return src + vec3(g);
+}
+
+void main()
+{
+    vec2 uv = gl_TexCoord[0].xy;
+    vec4 c = texture2D(u_texture, uv);
+    vec3 out_rgb = c.rgb;
+    if (u_aaEnabled != 0) {
+        out_rgb = (u_aaMode == 1)
+            ? apply_smaa_like(uv, c.rgb)
+            : apply_fxaa(uv, c.rgb);
+    }
+    out_rgb = apply_bloom(uv, out_rgb);
+    out_rgb = apply_chromatic_aberration(uv, out_rgb);
+    out_rgb = apply_vignette(uv, out_rgb);
+    out_rgb = apply_grain(uv, out_rgb);
+    if (u_motionBlurEnabled != 0 && u_motionBlurStrength > 0.0001) {
+        vec3 prev_rgb = texture2D(u_prevTexture, uv).rgb;
+        out_rgb = mix(out_rgb, prev_rgb, clamp(u_motionBlurStrength, 0.0, 0.95));
+    }
+    out_rgb = clamp(out_rgb, 0.0, 1.0);
+
+    // Match Unity FinalPass "keep alpha" behavior for transparent workflows.
+    gl_FragColor = vec4(out_rgb, c.a);
+}
+"""
+
 
 @dataclass
 class AttachmentInstance:
@@ -258,11 +479,13 @@ class OpenGLAnimationWidget(QOpenGLWidget):
         self.dof_alpha_smoothing_enabled: bool = False
         self.dof_alpha_smoothing_strength: float = 0.5
         self.dof_alpha_smoothing_mode: str = "normal"
+        self.dof_sprite_shader_mode: str = "auto"
         self.renderer.set_texture_filter_mode(self.sprite_filter_mode)
         self.renderer.set_texture_filter_strength(self.sprite_filter_strength)
         self.renderer.set_dof_alpha_smoothing_enabled(self.dof_alpha_smoothing_enabled)
         self.renderer.set_dof_alpha_smoothing_strength(self.dof_alpha_smoothing_strength)
         self.renderer.set_dof_alpha_smoothing_mode(self.dof_alpha_smoothing_mode)
+        self.renderer.set_dof_sprite_shader_mode(self.dof_sprite_shader_mode)
         configured_flag_order = os.environ.get("ANIVIEWER_TILE_FLAG_ORDER", "flag0_then1").strip().lower()
         if configured_flag_order not in {"as_is", "flag0_then1", "flag1_then0"}:
             configured_flag_order = "flag0_then1"
@@ -315,6 +538,47 @@ class OpenGLAnimationWidget(QOpenGLWidget):
         # Rendering settings
         self.render_scale: float = 1.0
         self.background_color = (0.2, 0.2, 0.2, 1.0)
+        self.post_aa_enabled: bool = False
+        self.post_aa_mode: str = "fxaa"  # fxaa | smaa
+        self.post_aa_strength: float = 0.5
+        self.post_bloom_enabled: bool = False
+        self.post_bloom_strength: float = 0.15
+        self.post_bloom_threshold: float = 0.6
+        self.post_bloom_radius: float = 1.5
+        self.post_vignette_enabled: bool = False
+        self.post_vignette_strength: float = 0.25
+        self.post_grain_enabled: bool = False
+        self.post_grain_strength: float = 0.2
+        self.post_ca_enabled: bool = False
+        self.post_ca_strength: float = 0.25
+        self.post_motion_blur_enabled: bool = False
+        self.post_motion_blur_strength: float = 0.35
+        self._post_aa_program: int = 0
+        self._post_aa_uniform_texture: int = -1
+        self._post_aa_uniform_prev_texture: int = -1
+        self._post_aa_uniform_texel_size: int = -1
+        self._post_aa_uniform_strength: int = -1
+        self._post_aa_uniform_mode: int = -1
+        self._post_aa_uniform_aa_enabled: int = -1
+        self._post_aa_uniform_bloom_enabled: int = -1
+        self._post_aa_uniform_bloom_strength: int = -1
+        self._post_aa_uniform_bloom_threshold: int = -1
+        self._post_aa_uniform_bloom_radius: int = -1
+        self._post_aa_uniform_vignette_enabled: int = -1
+        self._post_aa_uniform_vignette_strength: int = -1
+        self._post_aa_uniform_grain_enabled: int = -1
+        self._post_aa_uniform_grain_strength: int = -1
+        self._post_aa_uniform_ca_enabled: int = -1
+        self._post_aa_uniform_ca_strength: int = -1
+        self._post_aa_uniform_motion_blur_enabled: int = -1
+        self._post_aa_uniform_motion_blur_strength: int = -1
+        self._post_aa_uniform_time: int = -1
+        self._post_aa_scene_fbo: Optional[int] = None
+        self._post_aa_scene_texture: Optional[int] = None
+        self._post_aa_history_fbo: Optional[int] = None
+        self._post_aa_history_texture: Optional[int] = None
+        self._post_aa_history_valid: bool = False
+        self._post_aa_scene_size: Tuple[int, int] = (0, 0)
         self.viewport_background_color_mode: str = "none"
         self.viewport_background_enabled: bool = True
         self.viewport_background_image_enabled: bool = False
@@ -354,6 +618,14 @@ class OpenGLAnimationWidget(QOpenGLWidget):
         self.dragging_camera: bool = False
         self.last_mouse_x: int = 0
         self.last_mouse_y: int = 0
+        self.interaction_tool: str = "cursor"
+        self._tool_cursor_default = Qt.CursorShape.ArrowCursor
+        self._tool_cursor_zoom = Qt.CursorShape.CrossCursor
+        self._zoom_scrub_active: bool = False
+        self._zoom_scrub_start_x: float = 0.0
+        self._zoom_scrub_start_scale: float = 1.0
+        self._zoom_scrub_anchor_world: Optional[Tuple[float, float]] = None
+        self._zoom_scrub_anchor_screen: Optional[Tuple[float, float]] = None
         
         # Sprite dragging / selection
         self.dragging_sprite: bool = False
@@ -418,6 +690,7 @@ class OpenGLAnimationWidget(QOpenGLWidget):
         
         # Timing
         self.last_update_time: Optional[float] = None
+        self._motion_blur_frame_dt: float = 1.0 / 60.0
         
         # Set OpenGL format
         fmt = QSurfaceFormat()
@@ -479,6 +752,27 @@ class OpenGLAnimationWidget(QOpenGLWidget):
         self._upload_particle_textures()
         self._upload_viewport_background_texture()
         self._upload_default_viewport_background_texture()
+        self._clear_post_aa_resources()
+        self._post_aa_program = 0
+        self._post_aa_uniform_texture = -1
+        self._post_aa_uniform_prev_texture = -1
+        self._post_aa_uniform_texel_size = -1
+        self._post_aa_uniform_strength = -1
+        self._post_aa_uniform_mode = -1
+        self._post_aa_uniform_aa_enabled = -1
+        self._post_aa_uniform_bloom_enabled = -1
+        self._post_aa_uniform_bloom_strength = -1
+        self._post_aa_uniform_bloom_threshold = -1
+        self._post_aa_uniform_bloom_radius = -1
+        self._post_aa_uniform_vignette_enabled = -1
+        self._post_aa_uniform_vignette_strength = -1
+        self._post_aa_uniform_grain_enabled = -1
+        self._post_aa_uniform_grain_strength = -1
+        self._post_aa_uniform_ca_enabled = -1
+        self._post_aa_uniform_ca_strength = -1
+        self._post_aa_uniform_motion_blur_enabled = -1
+        self._post_aa_uniform_motion_blur_strength = -1
+        self._post_aa_uniform_time = -1
         
         self._apply_antialiasing_state()
     
@@ -495,6 +789,219 @@ class OpenGLAnimationWidget(QOpenGLWidget):
     def paintGL(self):
         """Render the animation"""
         self._apply_antialiasing_state()
+        view_w, view_h = self._current_framebuffer_size()
+
+        if (
+            self._is_post_pass_required()
+            and self._ensure_post_aa_program()
+            and self._ensure_post_aa_resources(view_w, view_h)
+            and self._post_aa_scene_fbo
+            and self._post_aa_scene_texture
+        ):
+            default_fbo = int(self.defaultFramebufferObject())
+            source_texture = int(self._post_aa_scene_texture)
+            if self._should_use_subframe_motion_blur():
+                source_texture = int(self._render_subframe_motion_blur(view_w, view_h))
+            else:
+                glBindFramebuffer(GL_FRAMEBUFFER, int(self._post_aa_scene_fbo))
+                glViewport(0, 0, view_w, view_h)
+                self._render_scene_contents(view_w, view_h)
+            glBindFramebuffer(GL_FRAMEBUFFER, default_fbo)
+            glViewport(0, 0, view_w, view_h)
+            pass_ok = self._draw_post_aa_pass(
+                source_texture=source_texture,
+                width=view_w,
+                height=view_h,
+            )
+            if pass_ok:
+                return
+            # Graceful fallback: if the post pass fails, draw scene directly.
+            self._render_scene_contents(view_w, view_h)
+            return
+
+        self._render_scene_contents(view_w, view_h)
+
+    def _current_framebuffer_size(self) -> Tuple[int, int]:
+        """Return current framebuffer pixel size (handles HiDPI correctly)."""
+        try:
+            vp = glGetIntegerv(GL_VIEWPORT)
+            if vp is not None and len(vp) >= 4:
+                w = max(1, int(vp[2]))
+                h = max(1, int(vp[3]))
+                if w > 0 and h > 0:
+                    return w, h
+        except Exception:
+            pass
+        try:
+            dpr = float(self.devicePixelRatioF())
+        except Exception:
+            dpr = 1.0
+        if dpr <= 0.0:
+            dpr = 1.0
+        return max(1, int(round(float(self.width()) * dpr))), max(
+            1, int(round(float(self.height()) * dpr))
+        )
+
+    def _should_use_subframe_motion_blur(self) -> bool:
+        """Return whether AE-like subframe motion blur should be applied this frame."""
+        if not self.post_motion_blur_enabled:
+            return False
+        if self.post_motion_blur_strength <= 1e-4:
+            return False
+        if not self.player.animation and not self.extra_render_entries:
+            return False
+        return True
+
+    def _resolve_sample_time(self, base_time: float, delta: float, duration: float) -> float:
+        t = float(base_time + delta)
+        if duration > 1e-6:
+            if self.player.loop:
+                t = float(t % duration)
+            else:
+                t = float(max(0.0, min(duration, t)))
+        return t
+
+    def _draw_weighted_texture(
+        self,
+        source_texture: int,
+        width: int,
+        height: int,
+        weight: float,
+        *,
+        additive: bool,
+    ) -> None:
+        """Draw source texture to bound target with weighted accumulation."""
+        if not source_texture:
+            return
+        try:
+            prev_program = glGetIntegerv(GL_CURRENT_PROGRAM)
+        except Exception:
+            prev_program = 0
+        try:
+            prev_active = glGetIntegerv(GL_ACTIVE_TEXTURE)
+        except Exception:
+            prev_active = GL_TEXTURE0
+        try:
+            glActiveTexture(GL_TEXTURE0)
+            prev_tex = glGetIntegerv(GL_TEXTURE_BINDING_2D)
+        except Exception:
+            prev_tex = 0
+
+        blend_enabled = bool(glIsEnabled(GL_BLEND))
+
+        glMatrixMode(GL_PROJECTION)
+        glPushMatrix()
+        glLoadIdentity()
+        glOrtho(0, width, height, 0, -1, 1)
+        glMatrixMode(GL_MODELVIEW)
+        glPushMatrix()
+        glLoadIdentity()
+
+        glUseProgram(0)
+        if additive:
+            glEnable(GL_BLEND)
+            glBlendFunc(GL_ONE, GL_ONE)
+        else:
+            glDisable(GL_BLEND)
+        glActiveTexture(GL_TEXTURE0)
+        glBindTexture(GL_TEXTURE_2D, int(source_texture))
+        w = max(0.0, min(1.0, float(weight)))
+        glColor4f(w, w, w, w)
+        # Keep orientation identical to post-pass resolve.
+        glBegin(GL_QUADS)
+        glTexCoord2f(0.0, 1.0)
+        glVertex2f(0.0, 0.0)
+        glTexCoord2f(1.0, 1.0)
+        glVertex2f(float(width), 0.0)
+        glTexCoord2f(1.0, 0.0)
+        glVertex2f(float(width), float(height))
+        glTexCoord2f(0.0, 0.0)
+        glVertex2f(0.0, float(height))
+        glEnd()
+        glColor4f(1.0, 1.0, 1.0, 1.0)
+
+        glUseProgram(int(prev_program or 0))
+        glBindTexture(GL_TEXTURE_2D, int(prev_tex))
+        glActiveTexture(int(prev_active))
+
+        glMatrixMode(GL_MODELVIEW)
+        glPopMatrix()
+        glMatrixMode(GL_PROJECTION)
+        glPopMatrix()
+        glMatrixMode(GL_MODELVIEW)
+
+        if blend_enabled:
+            glEnable(GL_BLEND)
+        else:
+            glDisable(GL_BLEND)
+        glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA)
+
+    def _render_subframe_motion_blur(self, view_w: int, view_h: int) -> int:
+        """
+        Render AE-like shutter accumulation into history texture and return it.
+        Falls back to single scene texture if resources are missing.
+        """
+        if not (
+            self._post_aa_scene_fbo
+            and self._post_aa_scene_texture
+            and self._post_aa_history_fbo
+            and self._post_aa_history_texture
+        ):
+            return int(self._post_aa_scene_texture or 0)
+
+        strength = max(0.0, min(1.0, float(self.post_motion_blur_strength)))
+        frame_dt = max(1.0 / 240.0, min(1.0 / 20.0, float(getattr(self, "_motion_blur_frame_dt", 1.0 / 60.0))))
+        shutter_span = frame_dt * strength
+        sample_count = max(2, min(12, int(round(2.0 + strength * 10.0))))
+        if shutter_span <= 1e-5 or sample_count <= 1:
+            glBindFramebuffer(GL_FRAMEBUFFER, int(self._post_aa_scene_fbo))
+            glViewport(0, 0, view_w, view_h)
+            self._render_scene_contents(view_w, view_h)
+            return int(self._post_aa_scene_texture)
+
+        base_time = float(self.player.current_time)
+        duration = float(self.player.duration or 0.0)
+        step = shutter_span / float(sample_count)
+        start = -0.5 * shutter_span + 0.5 * step
+        weight = 1.0 / float(sample_count)
+
+        glBindFramebuffer(GL_FRAMEBUFFER, int(self._post_aa_history_fbo))
+        glViewport(0, 0, view_w, view_h)
+        glClearColor(0.0, 0.0, 0.0, 0.0)
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+
+        for idx in range(sample_count):
+            offset = start + float(idx) * step
+            sample_time = self._resolve_sample_time(base_time, offset, duration)
+            glBindFramebuffer(GL_FRAMEBUFFER, int(self._post_aa_scene_fbo))
+            glViewport(0, 0, view_w, view_h)
+            self._render_scene_contents(
+                view_w,
+                view_h,
+                main_time=sample_time,
+                extra_time_offset=(sample_time - base_time),
+            )
+            glBindFramebuffer(GL_FRAMEBUFFER, int(self._post_aa_history_fbo))
+            glViewport(0, 0, view_w, view_h)
+            self._draw_weighted_texture(
+                int(self._post_aa_scene_texture),
+                view_w,
+                view_h,
+                weight,
+                additive=(idx > 0),
+            )
+
+        return int(self._post_aa_history_texture)
+
+    def _render_scene_contents(
+        self,
+        view_w: int,
+        view_h: int,
+        *,
+        main_time: Optional[float] = None,
+        extra_time_offset: float = 0.0,
+    ) -> None:
+        """Render the current scene into the currently bound framebuffer."""
         if self.viewport_background_enabled:
             glClearColor(*self.background_color)
         else:
@@ -507,7 +1014,7 @@ class OpenGLAnimationWidget(QOpenGLWidget):
             and self._default_viewport_background_texture_id is None
         ):
             self._upload_default_viewport_background_texture()
-        self._render_viewport_background_image()
+        self._render_viewport_background_image(view_width=view_w, view_height=view_h)
         if not self.player.animation and not self.extra_render_entries:
             return
 
@@ -525,9 +1032,10 @@ class OpenGLAnimationWidget(QOpenGLWidget):
 
         if self.player.animation:
             fast_preview = bool(self.fast_preview_enabled)
+            current_time = float(self.player.current_time if main_time is None else main_time)
             self._render_animation_entry(
                 self.player.animation,
-                self.player.current_time,
+                current_time,
                 self.texture_atlases,
                 duration=float(self.player.duration or 0.0),
                 offset_x=0.0,
@@ -546,11 +1054,18 @@ class OpenGLAnimationWidget(QOpenGLWidget):
                 animation = entry.get("animation")
                 if not animation:
                     continue
+                entry_time = float(entry.get("time", 0.0)) + float(extra_time_offset)
+                entry_duration = float(entry.get("duration", 0.0))
+                if entry_duration > 1e-6:
+                    if self.player.loop:
+                        entry_time = float(entry_time % entry_duration)
+                    else:
+                        entry_time = float(max(0.0, min(entry_duration, entry_time)))
                 self._render_animation_entry(
                     animation,
-                    float(entry.get("time", 0.0)),
+                    entry_time,
                     entry.get("atlases", []) or [],
-                    duration=float(entry.get("duration", 0.0)),
+                    duration=entry_duration,
                     offset_x=float(entry.get("offset_x", 0.0)),
                     offset_y=float(entry.get("offset_y", 0.0)),
                     render_overlays=False,
@@ -560,6 +1075,406 @@ class OpenGLAnimationWidget(QOpenGLWidget):
                     render_particles=False,
                     world_states=entry.get("world_states"),
                 )
+
+    def _compile_post_aa_program(self) -> int:
+        """Compile the optional post-process anti-aliasing shader."""
+        try:
+            vert = glCreateShader(GL_VERTEX_SHADER)
+            glShaderSource(vert, _POST_AA_VERTEX_SHADER)
+            glCompileShader(vert)
+            if glGetShaderiv(vert, GL_COMPILE_STATUS) != GL_TRUE:
+                info = glGetShaderInfoLog(vert).decode("utf-8", "ignore")
+                print(f"[PostAA] Vertex shader compile failed: {info}")
+                glDeleteShader(vert)
+                return 0
+
+            frag = glCreateShader(GL_FRAGMENT_SHADER)
+            glShaderSource(frag, _POST_AA_FRAGMENT_SHADER)
+            glCompileShader(frag)
+            if glGetShaderiv(frag, GL_COMPILE_STATUS) != GL_TRUE:
+                info = glGetShaderInfoLog(frag).decode("utf-8", "ignore")
+                print(f"[PostAA] Fragment shader compile failed: {info}")
+                glDeleteShader(vert)
+                glDeleteShader(frag)
+                return 0
+
+            program = glCreateProgram()
+            glAttachShader(program, vert)
+            glAttachShader(program, frag)
+            glLinkProgram(program)
+            if glGetProgramiv(program, GL_LINK_STATUS) != GL_TRUE:
+                info = glGetProgramInfoLog(program).decode("utf-8", "ignore")
+                print(f"[PostAA] Program link failed: {info}")
+                glDeleteShader(vert)
+                glDeleteShader(frag)
+                glDeleteProgram(program)
+                return 0
+
+            glDeleteShader(vert)
+            glDeleteShader(frag)
+            self._post_aa_uniform_texture = glGetUniformLocation(program, "u_texture")
+            self._post_aa_uniform_prev_texture = glGetUniformLocation(program, "u_prevTexture")
+            self._post_aa_uniform_texel_size = glGetUniformLocation(program, "u_texelSize")
+            self._post_aa_uniform_strength = glGetUniformLocation(program, "u_strength")
+            self._post_aa_uniform_mode = glGetUniformLocation(program, "u_aaMode")
+            self._post_aa_uniform_aa_enabled = glGetUniformLocation(program, "u_aaEnabled")
+            self._post_aa_uniform_bloom_enabled = glGetUniformLocation(program, "u_bloomEnabled")
+            self._post_aa_uniform_bloom_strength = glGetUniformLocation(program, "u_bloomStrength")
+            self._post_aa_uniform_bloom_threshold = glGetUniformLocation(program, "u_bloomThreshold")
+            self._post_aa_uniform_bloom_radius = glGetUniformLocation(program, "u_bloomRadius")
+            self._post_aa_uniform_vignette_enabled = glGetUniformLocation(program, "u_vignetteEnabled")
+            self._post_aa_uniform_vignette_strength = glGetUniformLocation(program, "u_vignetteStrength")
+            self._post_aa_uniform_grain_enabled = glGetUniformLocation(program, "u_grainEnabled")
+            self._post_aa_uniform_grain_strength = glGetUniformLocation(program, "u_grainStrength")
+            self._post_aa_uniform_ca_enabled = glGetUniformLocation(program, "u_caEnabled")
+            self._post_aa_uniform_ca_strength = glGetUniformLocation(program, "u_caStrength")
+            self._post_aa_uniform_motion_blur_enabled = glGetUniformLocation(program, "u_motionBlurEnabled")
+            self._post_aa_uniform_motion_blur_strength = glGetUniformLocation(program, "u_motionBlurStrength")
+            self._post_aa_uniform_time = glGetUniformLocation(program, "u_time")
+            return int(program)
+        except Exception as exc:
+            print(f"[PostAA] Shader compile exception: {exc}")
+            return 0
+
+    def _ensure_post_aa_program(self) -> bool:
+        if self._post_aa_program:
+            return True
+        self._post_aa_program = self._compile_post_aa_program()
+        return bool(self._post_aa_program)
+
+    def _clear_post_aa_resources(self) -> None:
+        """Delete post-process AA GL resources."""
+        if self._post_aa_scene_fbo:
+            try:
+                glDeleteFramebuffers(1, [int(self._post_aa_scene_fbo)])
+            except Exception:
+                pass
+            self._post_aa_scene_fbo = None
+        if self._post_aa_history_fbo:
+            try:
+                glDeleteFramebuffers(1, [int(self._post_aa_history_fbo)])
+            except Exception:
+                pass
+            self._post_aa_history_fbo = None
+        if self._post_aa_scene_texture:
+            try:
+                glDeleteTextures(1, [int(self._post_aa_scene_texture)])
+            except Exception:
+                pass
+            self._post_aa_scene_texture = None
+        if self._post_aa_history_texture:
+            try:
+                glDeleteTextures(1, [int(self._post_aa_history_texture)])
+            except Exception:
+                pass
+            self._post_aa_history_texture = None
+        self._post_aa_history_valid = False
+        self._post_aa_scene_size = (0, 0)
+
+    def _ensure_post_aa_resources(self, width: int, height: int) -> bool:
+        """Ensure the offscreen scene target exists for post-process AA."""
+        target_w = max(1, int(width))
+        target_h = max(1, int(height))
+        if (
+            self._post_aa_scene_fbo
+            and self._post_aa_scene_texture
+            and self._post_aa_history_fbo
+            and self._post_aa_history_texture
+            and self._post_aa_scene_size == (target_w, target_h)
+        ):
+            return True
+
+        self._clear_post_aa_resources()
+        try:
+            prev_fbo = int(glGetIntegerv(GL_FRAMEBUFFER_BINDING))
+            prev_tex = int(glGetIntegerv(GL_TEXTURE_BINDING_2D))
+            tex = glGenTextures(1)
+            glBindTexture(GL_TEXTURE_2D, tex)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+            glTexImage2D(
+                GL_TEXTURE_2D,
+                0,
+                GL_RGBA,
+                target_w,
+                target_h,
+                0,
+                GL_RGBA,
+                GL_UNSIGNED_BYTE,
+                None,
+            )
+            history_tex = glGenTextures(1)
+            glBindTexture(GL_TEXTURE_2D, history_tex)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+            glTexImage2D(
+                GL_TEXTURE_2D,
+                0,
+                GL_RGBA,
+                target_w,
+                target_h,
+                0,
+                GL_RGBA,
+                GL_UNSIGNED_BYTE,
+                None,
+            )
+            history_fbo = glGenFramebuffers(1)
+            glBindFramebuffer(GL_FRAMEBUFFER, history_fbo)
+            glFramebufferTexture2D(
+                GL_FRAMEBUFFER,
+                GL_COLOR_ATTACHMENT0,
+                GL_TEXTURE_2D,
+                history_tex,
+                0,
+            )
+            if glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE:
+                print("[PostAA] History framebuffer is not complete.")
+                glDeleteFramebuffers(1, [history_fbo])
+                glDeleteTextures(1, [history_tex])
+                glDeleteTextures(1, [tex])
+                glBindFramebuffer(GL_FRAMEBUFFER, prev_fbo)
+                glBindTexture(GL_TEXTURE_2D, prev_tex)
+                return False
+            fbo = glGenFramebuffers(1)
+            glBindFramebuffer(GL_FRAMEBUFFER, fbo)
+            glFramebufferTexture2D(
+                GL_FRAMEBUFFER,
+                GL_COLOR_ATTACHMENT0,
+                GL_TEXTURE_2D,
+                tex,
+                0,
+            )
+            if glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE:
+                print("[PostAA] Offscreen framebuffer is not complete.")
+                glDeleteFramebuffers(1, [fbo])
+                glDeleteFramebuffers(1, [history_fbo])
+                glDeleteTextures(1, [tex])
+                glDeleteTextures(1, [history_tex])
+                glBindFramebuffer(GL_FRAMEBUFFER, prev_fbo)
+                glBindTexture(GL_TEXTURE_2D, prev_tex)
+                return False
+            glBindFramebuffer(GL_FRAMEBUFFER, prev_fbo)
+            glBindTexture(GL_TEXTURE_2D, prev_tex)
+            self._post_aa_scene_fbo = int(fbo)
+            self._post_aa_scene_texture = int(tex)
+            self._post_aa_history_fbo = int(history_fbo)
+            self._post_aa_history_texture = int(history_tex)
+            self._post_aa_history_valid = False
+            self._post_aa_scene_size = (target_w, target_h)
+            return True
+        except Exception as exc:
+            print(f"[PostAA] Failed to create resources: {exc}")
+            self._clear_post_aa_resources()
+            return False
+
+    def _draw_post_aa_pass(self, source_texture: int, width: int, height: int) -> bool:
+        """Draw the post-process AA pass from source texture to the bound framebuffer."""
+        if not source_texture:
+            return False
+        if not self._ensure_post_aa_program():
+            return False
+        program = int(self._post_aa_program or 0)
+        if not program:
+            return False
+
+        try:
+            prev_program = glGetIntegerv(GL_CURRENT_PROGRAM)
+        except Exception:
+            prev_program = 0
+        try:
+            prev_active = glGetIntegerv(GL_ACTIVE_TEXTURE)
+        except Exception:
+            prev_active = GL_TEXTURE0
+        try:
+            glActiveTexture(GL_TEXTURE0)
+            prev_tex0 = glGetIntegerv(GL_TEXTURE_BINDING_2D)
+        except Exception:
+            prev_tex0 = 0
+        try:
+            glActiveTexture(GL_TEXTURE1)
+            prev_tex1 = glGetIntegerv(GL_TEXTURE_BINDING_2D)
+        except Exception:
+            prev_tex1 = 0
+        blend_enabled = bool(glIsEnabled(GL_BLEND))
+        if blend_enabled:
+            glDisable(GL_BLEND)
+
+        glMatrixMode(GL_PROJECTION)
+        glPushMatrix()
+        glLoadIdentity()
+        glOrtho(0, width, height, 0, -1, 1)
+        glMatrixMode(GL_MODELVIEW)
+        glPushMatrix()
+        glLoadIdentity()
+
+        glUseProgram(program)
+        aa_enabled = bool(self.post_aa_enabled)
+        motion_blur_enabled = False
+        glActiveTexture(GL_TEXTURE0)
+        glBindTexture(GL_TEXTURE_2D, int(source_texture))
+        if self._post_aa_uniform_texture >= 0:
+            glUniform1i(self._post_aa_uniform_texture, 0)
+        if self._post_aa_uniform_prev_texture >= 0:
+            glUniform1i(self._post_aa_uniform_prev_texture, 1)
+        glActiveTexture(GL_TEXTURE1)
+        glBindTexture(
+            GL_TEXTURE_2D,
+            int(self._post_aa_history_texture if motion_blur_enabled else source_texture),
+        )
+        glActiveTexture(GL_TEXTURE0)
+        if self._post_aa_uniform_texel_size >= 0:
+            glUniform2f(
+                self._post_aa_uniform_texel_size,
+                1.0 / max(1.0, float(width)),
+                1.0 / max(1.0, float(height)),
+            )
+        if self._post_aa_uniform_strength >= 0:
+            glUniform1f(
+                self._post_aa_uniform_strength,
+                max(0.0, min(1.0, float(self.post_aa_strength if aa_enabled else 0.0))),
+            )
+        if self._post_aa_uniform_mode >= 0:
+            glUniform1i(self._post_aa_uniform_mode, 1 if str(self.post_aa_mode).lower() == "smaa" else 0)
+        if self._post_aa_uniform_aa_enabled >= 0:
+            glUniform1i(self._post_aa_uniform_aa_enabled, 1 if aa_enabled else 0)
+        if self._post_aa_uniform_bloom_enabled >= 0:
+            glUniform1i(self._post_aa_uniform_bloom_enabled, 1 if (aa_enabled and self.post_bloom_enabled) else 0)
+        if self._post_aa_uniform_bloom_strength >= 0:
+            glUniform1f(self._post_aa_uniform_bloom_strength, max(0.0, min(2.0, float(self.post_bloom_strength))))
+        if self._post_aa_uniform_bloom_threshold >= 0:
+            glUniform1f(self._post_aa_uniform_bloom_threshold, max(0.0, min(2.0, float(self.post_bloom_threshold))))
+        if self._post_aa_uniform_bloom_radius >= 0:
+            glUniform1f(self._post_aa_uniform_bloom_radius, max(0.1, min(8.0, float(self.post_bloom_radius))))
+        if self._post_aa_uniform_vignette_enabled >= 0:
+            glUniform1i(
+                self._post_aa_uniform_vignette_enabled,
+                1 if (aa_enabled and self.post_vignette_enabled) else 0,
+            )
+        if self._post_aa_uniform_vignette_strength >= 0:
+            glUniform1f(self._post_aa_uniform_vignette_strength, max(0.0, min(1.0, float(self.post_vignette_strength))))
+        if self._post_aa_uniform_grain_enabled >= 0:
+            glUniform1i(self._post_aa_uniform_grain_enabled, 1 if (aa_enabled and self.post_grain_enabled) else 0)
+        if self._post_aa_uniform_grain_strength >= 0:
+            glUniform1f(self._post_aa_uniform_grain_strength, max(0.0, min(1.0, float(self.post_grain_strength))))
+        if self._post_aa_uniform_ca_enabled >= 0:
+            glUniform1i(self._post_aa_uniform_ca_enabled, 1 if (aa_enabled and self.post_ca_enabled) else 0)
+        if self._post_aa_uniform_ca_strength >= 0:
+            glUniform1f(self._post_aa_uniform_ca_strength, max(0.0, min(1.0, float(self.post_ca_strength))))
+        if self._post_aa_uniform_motion_blur_enabled >= 0:
+            glUniform1i(self._post_aa_uniform_motion_blur_enabled, 1 if motion_blur_enabled else 0)
+        if self._post_aa_uniform_motion_blur_strength >= 0:
+            glUniform1f(
+                self._post_aa_uniform_motion_blur_strength,
+                0.0,
+            )
+        if self._post_aa_uniform_time >= 0:
+            glUniform1f(self._post_aa_uniform_time, float(self.player.current_time))
+
+        glColor4f(1.0, 1.0, 1.0, 1.0)
+        # FBO textures are bottom-origin; viewport space here is y-down.
+        # Flip V so the resolved frame keeps the same orientation as the scene.
+        glBegin(GL_QUADS)
+        glTexCoord2f(0.0, 1.0)
+        glVertex2f(0.0, 0.0)
+        glTexCoord2f(1.0, 1.0)
+        glVertex2f(float(width), 0.0)
+        glTexCoord2f(1.0, 0.0)
+        glVertex2f(float(width), float(height))
+        glTexCoord2f(0.0, 0.0)
+        glVertex2f(0.0, float(height))
+        glEnd()
+
+        glUseProgram(int(prev_program or 0))
+        glActiveTexture(GL_TEXTURE1)
+        glBindTexture(GL_TEXTURE_2D, int(prev_tex1))
+        glActiveTexture(GL_TEXTURE0)
+        glBindTexture(GL_TEXTURE_2D, int(prev_tex0))
+        glActiveTexture(int(prev_active))
+
+        glMatrixMode(GL_MODELVIEW)
+        glPopMatrix()
+        glMatrixMode(GL_PROJECTION)
+        glPopMatrix()
+        glMatrixMode(GL_MODELVIEW)
+
+        if blend_enabled:
+            glEnable(GL_BLEND)
+        else:
+            glDisable(GL_BLEND)
+        glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA)
+        return True
+
+    def _capture_post_history(self, width: int, height: int) -> None:
+        """Capture the currently bound framebuffer into post history texture."""
+        if not self._post_aa_history_texture:
+            self._post_aa_history_valid = False
+            return
+        target_w = max(1, int(width))
+        target_h = max(1, int(height))
+        try:
+            prev_active = glGetIntegerv(GL_ACTIVE_TEXTURE)
+        except Exception:
+            prev_active = GL_TEXTURE0
+        try:
+            glActiveTexture(GL_TEXTURE0)
+            prev_tex = glGetIntegerv(GL_TEXTURE_BINDING_2D)
+        except Exception:
+            prev_tex = 0
+        try:
+            glBindTexture(GL_TEXTURE_2D, int(self._post_aa_history_texture))
+            glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, target_w, target_h)
+            self._post_aa_history_valid = True
+        except Exception:
+            self._post_aa_history_valid = False
+        finally:
+            glBindTexture(GL_TEXTURE_2D, int(prev_tex))
+            glActiveTexture(int(prev_active))
+
+    def _is_post_pass_required(self) -> bool:
+        return bool(self.post_aa_enabled or self.post_motion_blur_enabled)
+
+    def is_post_pass_enabled(self) -> bool:
+        return self._is_post_pass_required()
+
+    def resolve_post_aa_texture(self, source_texture: int, width: int, height: int) -> Tuple[int, int]:
+        """
+        Resolve a source color texture through the post AA pass.
+
+        Returns:
+            (fbo_id, texture_id) for the resolved result, or (0, source_texture)
+            if post AA is disabled/unavailable.
+        """
+        if not self._is_post_pass_required():
+            return 0, int(source_texture or 0)
+        if not source_texture:
+            return 0, 0
+        if not self._ensure_post_aa_program():
+            return 0, int(source_texture)
+        if not self._ensure_post_aa_resources(width, height):
+            return 0, int(source_texture)
+        target_fbo = int(self._post_aa_scene_fbo or 0)
+        target_texture = int(self._post_aa_scene_texture or 0)
+        if not target_fbo or not target_texture or target_texture == int(source_texture):
+            return 0, int(source_texture)
+
+        prev_fbo = int(glGetIntegerv(GL_FRAMEBUFFER_BINDING))
+        prev_viewport = glGetIntegerv(GL_VIEWPORT)
+        try:
+            glBindFramebuffer(GL_FRAMEBUFFER, target_fbo)
+            glViewport(0, 0, int(width), int(height))
+            glClearColor(0.0, 0.0, 0.0, 0.0)
+            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+            ok = self._draw_post_aa_pass(int(source_texture), int(width), int(height))
+            if not ok:
+                return 0, int(source_texture)
+            return target_fbo, target_texture
+        finally:
+            glBindFramebuffer(GL_FRAMEBUFFER, prev_fbo)
+            glViewport(*prev_viewport)
 
     def _theme_background_rgba(self) -> Tuple[float, float, float, float]:
         """Return the widget's theme background color as normalized RGBA."""
@@ -1497,6 +2412,14 @@ class OpenGLAnimationWidget(QOpenGLWidget):
         if self.dof_alpha_smoothing_mode == normalized:
             return
         self.dof_alpha_smoothing_mode = normalized
+        self.update()
+
+    def set_dof_sprite_shader_mode(self, mode: str) -> None:
+        """Set experimental DOF sprite shader emulation mode."""
+        normalized = self.renderer.set_dof_sprite_shader_mode(mode)
+        if self.dof_sprite_shader_mode == normalized:
+            return
+        self.dof_sprite_shader_mode = normalized
         self.update()
 
     def set_tile_flag_order_mode(self, mode: str) -> None:
@@ -6119,6 +7042,7 @@ class OpenGLAnimationWidget(QOpenGLWidget):
             delta_time = 0.016
 
         self.last_update_time = current_time
+        self._motion_blur_frame_dt = max(1.0 / 240.0, min(1.0 / 20.0, float(delta_time)))
 
         was_playing = self.player.playing
         previous_time = self.player.current_time
@@ -6153,6 +7077,163 @@ class OpenGLAnimationWidget(QOpenGLWidget):
         self.antialias_enabled = enabled
         self._apply_antialiasing_state()
         self.update()
+
+    def set_post_aa_enabled(self, enabled: bool) -> None:
+        """Enable or disable the post-process AA/effects pass."""
+        normalized = bool(enabled)
+        if self.post_aa_enabled == normalized:
+            return
+        self.post_aa_enabled = normalized
+        self._post_aa_history_valid = False
+        if not self._is_post_pass_required():
+            ctx = self.context()
+            if ctx and ctx.isValid():
+                try:
+                    self.makeCurrent()
+                    self._clear_post_aa_resources()
+                finally:
+                    self.doneCurrent()
+            else:
+                self._post_aa_scene_fbo = None
+                self._post_aa_scene_texture = None
+                self._post_aa_history_fbo = None
+                self._post_aa_history_texture = None
+                self._post_aa_history_valid = False
+                self._post_aa_scene_size = (0, 0)
+        self.update()
+
+    def set_post_aa_strength(self, strength: float) -> None:
+        """Set post-process AA blend strength (0..1)."""
+        try:
+            value = float(strength)
+        except (TypeError, ValueError):
+            value = 0.5
+        value = max(0.0, min(1.0, value))
+        if abs(self.post_aa_strength - value) < 1e-6:
+            return
+        self.post_aa_strength = value
+        if self._is_post_pass_required():
+            self.update()
+
+    def set_post_aa_mode(self, mode: str) -> None:
+        """Set post-process AA mode: 'fxaa' or 'smaa'."""
+        normalized = str(mode or "fxaa").strip().lower()
+        if normalized not in {"fxaa", "smaa"}:
+            normalized = "fxaa"
+        if self.post_aa_mode == normalized:
+            return
+        self.post_aa_mode = normalized
+        if self._is_post_pass_required():
+            self.update()
+
+    def set_post_bloom_enabled(self, enabled: bool) -> None:
+        self.post_bloom_enabled = bool(enabled)
+        if self._is_post_pass_required():
+            self.update()
+
+    def set_post_bloom_strength(self, value: float) -> None:
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            v = 0.15
+        self.post_bloom_strength = max(0.0, min(2.0, v))
+        if self._is_post_pass_required():
+            self.update()
+
+    def set_post_bloom_threshold(self, value: float) -> None:
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            v = 0.6
+        self.post_bloom_threshold = max(0.0, min(2.0, v))
+        if self._is_post_pass_required():
+            self.update()
+
+    def set_post_bloom_radius(self, value: float) -> None:
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            v = 1.5
+        self.post_bloom_radius = max(0.1, min(8.0, v))
+        if self._is_post_pass_required():
+            self.update()
+
+    def set_post_vignette_enabled(self, enabled: bool) -> None:
+        self.post_vignette_enabled = bool(enabled)
+        if self._is_post_pass_required():
+            self.update()
+
+    def set_post_vignette_strength(self, value: float) -> None:
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            v = 0.25
+        self.post_vignette_strength = max(0.0, min(1.0, v))
+        if self._is_post_pass_required():
+            self.update()
+
+    def set_post_grain_enabled(self, enabled: bool) -> None:
+        self.post_grain_enabled = bool(enabled)
+        if self._is_post_pass_required():
+            self.update()
+
+    def set_post_grain_strength(self, value: float) -> None:
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            v = 0.2
+        self.post_grain_strength = max(0.0, min(1.0, v))
+        if self._is_post_pass_required():
+            self.update()
+
+    def set_post_ca_enabled(self, enabled: bool) -> None:
+        self.post_ca_enabled = bool(enabled)
+        if self._is_post_pass_required():
+            self.update()
+
+    def set_post_ca_strength(self, value: float) -> None:
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            v = 0.25
+        self.post_ca_strength = max(0.0, min(1.0, v))
+        if self._is_post_pass_required():
+            self.update()
+
+    def set_post_motion_blur_enabled(self, enabled: bool) -> None:
+        normalized = bool(enabled)
+        if self.post_motion_blur_enabled == normalized:
+            return
+        self.post_motion_blur_enabled = normalized
+        self._post_aa_history_valid = False
+        if not self._is_post_pass_required():
+            ctx = self.context()
+            if ctx and ctx.isValid():
+                try:
+                    self.makeCurrent()
+                    self._clear_post_aa_resources()
+                finally:
+                    self.doneCurrent()
+            else:
+                self._post_aa_scene_fbo = None
+                self._post_aa_scene_texture = None
+                self._post_aa_history_fbo = None
+                self._post_aa_history_texture = None
+                self._post_aa_history_valid = False
+                self._post_aa_scene_size = (0, 0)
+        self.update()
+
+    def set_post_motion_blur_strength(self, strength: float) -> None:
+        try:
+            value = float(strength)
+        except (TypeError, ValueError):
+            value = 0.35
+        value = max(0.0, min(1.0, value))
+        if abs(self.post_motion_blur_strength - value) < 1e-6:
+            return
+        self.post_motion_blur_strength = value
+        if self._is_post_pass_required():
+            self.update()
 
     def set_scale_gizmo_enabled(self, enabled: bool):
         """Toggle the scale gizmo overlay."""
@@ -6202,6 +7283,30 @@ class OpenGLAnimationWidget(QOpenGLWidget):
         """Enable or disable zooming towards the mouse cursor."""
         self.zoom_to_cursor = enabled
 
+    def set_interaction_cursors(self, default_cursor=None, zoom_cursor=None) -> None:
+        """Set cursor visuals used by the viewport interaction tools."""
+        if default_cursor is not None:
+            self._tool_cursor_default = default_cursor
+        if zoom_cursor is not None:
+            self._tool_cursor_zoom = zoom_cursor
+        self._apply_interaction_tool_cursor()
+
+    def set_interaction_tool(self, tool: str) -> None:
+        """Set interaction mode: 'cursor' or 'zoom'."""
+        normalized = "zoom" if str(tool or "").strip().lower() == "zoom" else "cursor"
+        if self.interaction_tool == normalized:
+            self._apply_interaction_tool_cursor()
+            return
+        self.interaction_tool = normalized
+        self._zoom_scrub_active = False
+        self._apply_interaction_tool_cursor()
+
+    def _apply_interaction_tool_cursor(self) -> None:
+        if self.interaction_tool == "zoom":
+            self.setCursor(self._tool_cursor_zoom)
+        else:
+            self.setCursor(self._tool_cursor_default)
+
     def set_anchor_logging_enabled(self, enabled: bool):
         """Toggle renderer anchor logging for diagnostics."""
         self.renderer.enable_logging = enabled
@@ -6215,6 +7320,24 @@ class OpenGLAnimationWidget(QOpenGLWidget):
     def mousePressEvent(self, event):
         """Handle mouse press for camera dragging or sprite dragging"""
         try:
+            if self.interaction_tool == "zoom":
+                if event.button() == Qt.MouseButton.LeftButton:
+                    self._zoom_scrub_active = True
+                    self._zoom_scrub_start_x = float(event.position().x())
+                    self._zoom_scrub_start_scale = float(self.render_scale)
+                    self._zoom_scrub_anchor_screen = (
+                        float(event.position().x()),
+                        float(event.position().y()),
+                    )
+                    # Zoom tool is always mouse-anchored to match scrub-zoom behavior.
+                    self._zoom_scrub_anchor_world = self.screen_to_world(
+                        event.position().x(), event.position().y()
+                    )
+                    event.accept()
+                    return
+                event.ignore()
+                return
+
             if event.button() == Qt.MouseButton.LeftButton:
                 self._current_drag_targets = []
                 self._scale_uniform_active = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
@@ -6350,6 +7473,17 @@ class OpenGLAnimationWidget(QOpenGLWidget):
     def mouseReleaseEvent(self, event):
         """Handle mouse release"""
         try:
+            if self.interaction_tool == "zoom":
+                if event.button() == Qt.MouseButton.LeftButton and self._zoom_scrub_active:
+                    self._zoom_scrub_active = False
+                    self._zoom_scrub_anchor_world = None
+                    self._zoom_scrub_anchor_screen = None
+                    self._apply_interaction_tool_cursor()
+                    event.accept()
+                    return
+                event.ignore()
+                return
+
             self._rotation_snap_active = False
             self._scale_uniform_active = False
             if event.button() == Qt.MouseButton.LeftButton:
@@ -6406,6 +7540,31 @@ class OpenGLAnimationWidget(QOpenGLWidget):
         try:
             current_x = event.position().x()
             current_y = event.position().y()
+
+            if self.interaction_tool == "zoom" and self._zoom_scrub_active:
+                delta_x = float(current_x - self._zoom_scrub_start_x)
+                scale_factor = max(0.05, 1.0 + (delta_x * 0.01))
+                old_scale = float(self.render_scale)
+                self.render_scale = max(0.001, float(self._zoom_scrub_start_scale) * scale_factor)
+                self._schedule_svg_background_quality_refresh()
+                anchor_world = self._zoom_scrub_anchor_world
+                if anchor_world:
+                    before = self.world_to_screen(*anchor_world)
+                    target = (
+                        self._zoom_scrub_anchor_screen
+                        if self._zoom_scrub_anchor_screen is not None
+                        else (float(current_x), float(current_y))
+                    )
+                    self.camera_x += target[0] - before[0]
+                    self.camera_y += target[1] - before[1]
+                elif old_scale > 0.0:
+                    ratio = self.render_scale / old_scale
+                    self.camera_x *= ratio
+                    self.camera_y *= ratio
+                self.update()
+                event.accept()
+                return
+
             world_x, world_y = self.screen_to_world(current_x, current_y)
             self._rotation_snap_active = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
             self._scale_uniform_active = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)

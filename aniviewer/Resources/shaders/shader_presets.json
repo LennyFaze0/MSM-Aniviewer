@@ -7,8 +7,56 @@
       1.0
     ],
     "alpha_scale": 1.0,
+    "blend_override": "straight_alpha",
+    "notes": "Unity Anim2D base sprite shader approximation using straight-alpha blending."
+  },
+  "dawnoffire/unlitshader": {
+    "display_name": "DawnOfFire/UnlitShader",
+    "color_scale": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "alpha_scale": 1.0,
     "blend_override": "standard",
-    "notes": "Unity Anim2D base sprite shader approximation: straight color + alpha with standard blending."
+    "notes": "Experimental sprite approximation for DawnOfFire/UnlitShader."
+  },
+  "sprites/default": {
+    "display_name": "Sprites/Default",
+    "color_scale": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "alpha_scale": 1.0,
+    "blend_override": "standard",
+    "notes": "Unity Sprites/Default approximation for comparison."
+  },
+  "unlit/transparent": {
+    "display_name": "Unlit/Transparent",
+    "color_scale": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "alpha_scale": 1.0,
+    "blend_override": "straight_alpha",
+    "notes": "Unity Unlit/Transparent approximation using straight-alpha blending."
+  },
+  "unlit/transparent masked": {
+    "display_name": "Unlit/Transparent Masked",
+    "color_scale": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "alpha_scale": 1.0,
+    "blend_override": "straight_alpha",
+    "metadata": {
+      "mask_source": "base",
+      "use_base_alpha_mask": true
+    },
+    "notes": "Unity Unlit/Transparent Masked approximation using straight-alpha blending."
   },
   "dawnoffire/effects/blendaddglow": {
     "display_name": "DawnOfFire/Effects/BlendAddGlow",

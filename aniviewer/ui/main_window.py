@@ -40,7 +40,7 @@ from PyQt6.QtWidgets import (
     QLineEdit, QTextEdit, QPlainTextEdit, QAbstractSpinBox, QComboBox
 )
 from PyQt6.QtCore import Qt, QSettings, QTimer, QEvent, QProcess
-from PyQt6.QtGui import QSurfaceFormat, QColor, QShortcut, QKeySequence, QPixmap, QImage
+from PyQt6.QtGui import QSurfaceFormat, QColor, QShortcut, QKeySequence, QPixmap, QImage, QIcon, QCursor
 from PyQt6.QtWidgets import QGraphicsDropShadowEffect
 from PIL import Image, ImageChops, ImageDraw
 from OpenGL.GL import *
@@ -241,6 +241,101 @@ class MSMAnimationViewer(QMainWindow):
         if dof_alpha_mode not in {'normal', 'strong'}:
             dof_alpha_mode = 'normal'
         self.dof_alpha_edge_smoothing_mode: str = dof_alpha_mode
+        dof_shader_mode_value = (
+            self.settings.value('dof/sprite_shader_mode', 'auto', type=str) or 'auto'
+        )
+        dof_shader_mode = str(dof_shader_mode_value).strip().lower()
+        if dof_shader_mode not in {
+            'auto',
+            'anim2d',
+            'dawnoffire_unlit',
+            'sprites_default',
+            'unlit_transparent',
+            'unlit_transparent_masked',
+        }:
+            dof_shader_mode = 'auto'
+        self.dof_sprite_shader_mode: str = dof_shader_mode
+        self.viewport_post_aa_enabled: bool = bool(
+            self.settings.value('viewport/post_aa_enabled', False, type=bool)
+        )
+        self.viewport_post_aa_strength: float = max(
+            0.0,
+            min(
+                1.0,
+                float(self.settings.value('viewport/post_aa_strength', 0.5, type=float)),
+            ),
+        )
+        viewport_post_aa_mode = (
+            self.settings.value('viewport/post_aa_mode', 'fxaa', type=str) or 'fxaa'
+        )
+        viewport_post_aa_mode = str(viewport_post_aa_mode).strip().lower()
+        if viewport_post_aa_mode not in {'fxaa', 'smaa'}:
+            viewport_post_aa_mode = 'fxaa'
+        self.viewport_post_aa_mode: str = viewport_post_aa_mode
+        self.viewport_post_motion_blur_enabled: bool = bool(
+            self.settings.value('viewport/post_motion_blur_enabled', False, type=bool)
+        )
+        self.viewport_post_motion_blur_strength: float = max(
+            0.0,
+            min(
+                1.0,
+                float(self.settings.value('viewport/post_motion_blur_strength', 0.35, type=float)),
+            ),
+        )
+        self.viewport_post_bloom_enabled: bool = bool(
+            self.settings.value('viewport/post_bloom_enabled', False, type=bool)
+        )
+        self.viewport_post_bloom_strength: float = max(
+            0.0,
+            min(
+                2.0,
+                float(self.settings.value('viewport/post_bloom_strength', 0.15, type=float)),
+            ),
+        )
+        self.viewport_post_bloom_threshold: float = max(
+            0.0,
+            min(
+                2.0,
+                float(self.settings.value('viewport/post_bloom_threshold', 0.6, type=float)),
+            ),
+        )
+        self.viewport_post_bloom_radius: float = max(
+            0.1,
+            min(
+                8.0,
+                float(self.settings.value('viewport/post_bloom_radius', 1.5, type=float)),
+            ),
+        )
+        self.viewport_post_vignette_enabled: bool = bool(
+            self.settings.value('viewport/post_vignette_enabled', False, type=bool)
+        )
+        self.viewport_post_vignette_strength: float = max(
+            0.0,
+            min(
+                1.0,
+                float(self.settings.value('viewport/post_vignette_strength', 0.25, type=float)),
+            ),
+        )
+        self.viewport_post_grain_enabled: bool = bool(
+            self.settings.value('viewport/post_grain_enabled', False, type=bool)
+        )
+        self.viewport_post_grain_strength: float = max(
+            0.0,
+            min(
+                1.0,
+                float(self.settings.value('viewport/post_grain_strength', 0.2, type=float)),
+            ),
+        )
+        self.viewport_post_ca_enabled: bool = bool(
+            self.settings.value('viewport/post_ca_enabled', False, type=bool)
+        )
+        self.viewport_post_ca_strength: float = max(
+            0.0,
+            min(
+                1.0,
+                float(self.settings.value('viewport/post_ca_strength', 0.25, type=float)),
+            ),
+        )
         self.shader_registry.set_game_path(self.game_path or None)
         self.sync_audio_to_bpm: bool = True
         self.pitch_shift_enabled: bool = False
@@ -511,6 +606,16 @@ class MSMAnimationViewer(QMainWindow):
         self._content_splitter_last_sizes: Optional[List[int]] = None
         self._log_visible: bool = True
         self._log_splitter_last_sizes: Optional[List[int]] = None
+        self.viewport_tool_mode: str = "cursor"
+        self.control_panel_host: Optional[QWidget] = None
+        self.viewport_tool_buttons: List[QToolButton] = []
+        self.viewport_tool_cursor_btn: Optional[QToolButton] = None
+        self.viewport_tool_zoom_btn: Optional[QToolButton] = None
+        self._viewport_tool_icon_cursor_selected: Optional[QIcon] = None
+        self._viewport_tool_icon_cursor_unselected: Optional[QIcon] = None
+        self._viewport_tool_icon_zoom_selected: Optional[QIcon] = None
+        self._viewport_tool_icon_zoom_unselected: Optional[QIcon] = None
+        self._viewport_zoom_cursor: Optional[QCursor] = None
 
         self.init_ui()
         self._apply_anchor_logging_preferences()
@@ -670,7 +775,13 @@ class MSMAnimationViewer(QMainWindow):
         self.control_panel.set_joint_solver_parented(self.joint_solver_parented)
         self.control_panel.set_propagate_user_transforms(self.propagate_user_transforms)
         self.control_panel.set_preserve_children_on_record(self.preserve_children_on_record)
-        self.main_splitter.addWidget(self.control_panel)
+        self.control_panel_host = QWidget()
+        control_panel_host_layout = QVBoxLayout(self.control_panel_host)
+        control_panel_host_layout.setContentsMargins(0, 0, 0, 0)
+        control_panel_host_layout.setSpacing(0)
+        control_panel_host_layout.addWidget(self.control_panel, 1)
+        control_panel_host_layout.addWidget(self._build_viewport_tool_strip(), 0)
+        self.main_splitter.addWidget(self.control_panel_host)
         
         # Center - OpenGL viewer
         self.gl_widget = OpenGLAnimationWidget(shader_registry=self.shader_registry)
@@ -688,6 +799,8 @@ class MSMAnimationViewer(QMainWindow):
         self.gl_widget.set_dof_alpha_smoothing_enabled(self.dof_alpha_edge_smoothing_enabled)
         self.gl_widget.set_dof_alpha_smoothing_strength(self.dof_alpha_edge_smoothing_strength)
         self.gl_widget.set_dof_alpha_smoothing_mode(self.dof_alpha_edge_smoothing_mode)
+        self.gl_widget.set_dof_sprite_shader_mode(self.dof_sprite_shader_mode)
+        self._apply_postfx_settings_to_widget(self.gl_widget)
         self.gl_widget.set_viewport_background_enabled(self.viewport_bg_enabled)
         self.gl_widget.set_background_color_rgba(self.solid_bg_color)
         self.gl_widget.set_viewport_background_color_mode(self.viewport_bg_color_mode)
@@ -706,6 +819,7 @@ class MSMAnimationViewer(QMainWindow):
         )
         self.gl_widget.set_viewport_background_image_enabled(self.viewport_bg_image_enabled)
         self.gl_widget.set_viewport_background_image_path(self.viewport_bg_image_path)
+        self._refresh_viewport_tool_buttons()
         self.gl_widget.animation_time_changed.connect(self.on_animation_time_changed)
         self.gl_widget.animation_looped.connect(self.on_animation_looped)
         self.gl_widget.playback_state_changed.connect(self.on_playback_state_changed)
@@ -902,7 +1016,10 @@ class MSMAnimationViewer(QMainWindow):
     def _apply_splitter_visibility(self, left_visible: bool, right_visible: bool):
         if not hasattr(self, "main_splitter"):
             return
-        self.control_panel.setVisible(left_visible)
+        if self.control_panel_host is not None:
+            self.control_panel_host.setVisible(left_visible)
+        else:
+            self.control_panel.setVisible(left_visible)
         self.layer_panel.setVisible(right_visible)
         sizes = self.main_splitter.sizes()
         total = sum(sizes) if sizes else max(1, self.width())
@@ -1055,6 +1172,150 @@ class MSMAnimationViewer(QMainWindow):
                 self.settings.setValue("ui/right_panel_visible", self._right_panel_visible)
         if self._left_panel_visible and self._right_panel_visible:
             self._update_last_splitter_sizes()
+
+    def _load_viewport_tool_icon(self, filename: str) -> Optional[QIcon]:
+        path = self.project_root / "assets" / filename
+        if not path.exists():
+            return None
+        pix = QPixmap(str(path))
+        if pix.isNull():
+            return None
+        return QIcon(pix)
+
+    def _build_system_zoom_cursor(self) -> QCursor:
+        """Best-effort native zoom cursor, with crosshair fallback."""
+        zoom_shape = getattr(Qt.CursorShape, "ZoomInCursor", None)
+        if zoom_shape is not None:
+            try:
+                return QCursor(zoom_shape)
+            except Exception:
+                pass
+
+        if os.name == "nt":
+            win_root = os.environ.get("SystemRoot", r"C:\Windows")
+            cursor_dir = Path(win_root) / "Cursors"
+            candidates = (
+                "aero_zoomin.cur",
+                "zoomin.cur",
+                "Aero_zoomin.cur",
+            )
+            for name in candidates:
+                cur_path = cursor_dir / name
+                if not cur_path.exists():
+                    continue
+                pix = QPixmap(str(cur_path))
+                if pix.isNull():
+                    continue
+                hot_x = max(0, min(pix.width() - 1, int(round(pix.width() * 0.45))))
+                hot_y = max(0, min(pix.height() - 1, int(round(pix.height() * 0.20))))
+                return QCursor(pix, hot_x, hot_y)
+
+        return QCursor(Qt.CursorShape.CrossCursor)
+
+    def _build_viewport_tool_strip(self) -> QWidget:
+        container = QWidget()
+        layout = QHBoxLayout(container)
+        layout.setContentsMargins(8, 6, 8, 8)
+        layout.setSpacing(6)
+        highlight = self.palette().color(self.palette().ColorRole.Highlight)
+        checked_bg = f"rgba({highlight.red()}, {highlight.green()}, {highlight.blue()}, 70)"
+        checked_border = highlight.lighter(120).name()
+
+        base_style = (
+            "QToolButton {"
+            " background-color: #2a2a2a;"
+            " border: 1px solid #4a4a4a;"
+            " border-radius: 4px;"
+            " padding: 2px;"
+            "}"
+            "QToolButton:hover {"
+            " background-color: #353535;"
+            "}"
+            "QToolButton:pressed {"
+            " background-color: #3b3b3b;"
+            "}"
+            "QToolButton:checked {"
+            f" background-color: {checked_bg};"
+            f" border: 1px solid {checked_border};"
+            "}"
+        )
+
+        def _make_button() -> QToolButton:
+            btn = QToolButton()
+            btn.setCheckable(True)
+            btn.setAutoRaise(False)
+            btn.setFixedSize(38, 38)
+            btn.setIconSize(QPixmap(25, 25).size())
+            btn.setStyleSheet(base_style)
+            return btn
+
+        self._viewport_tool_icon_cursor_selected = self._load_viewport_tool_icon("Cursor Icon Selected.png")
+        self._viewport_tool_icon_cursor_unselected = self._load_viewport_tool_icon("Cursor Icon Unselected.png")
+        self._viewport_tool_icon_zoom_selected = self._load_viewport_tool_icon("Zoom Icon Selected.png")
+        self._viewport_tool_icon_zoom_unselected = self._load_viewport_tool_icon("Zoom Icon Unselected.png")
+
+        self._viewport_zoom_cursor = self._build_system_zoom_cursor()
+
+        self.viewport_tool_cursor_btn = _make_button()
+        self.viewport_tool_cursor_btn.setToolTip("Cursor Tool")
+        self.viewport_tool_cursor_btn.clicked.connect(lambda: self._set_viewport_tool_mode("cursor"))
+        self.viewport_tool_buttons.append(self.viewport_tool_cursor_btn)
+        layout.addWidget(self.viewport_tool_cursor_btn)
+
+        self.viewport_tool_zoom_btn = _make_button()
+        self.viewport_tool_zoom_btn.setToolTip("Zoom Tool")
+        self.viewport_tool_zoom_btn.clicked.connect(lambda: self._set_viewport_tool_mode("zoom"))
+        self.viewport_tool_buttons.append(self.viewport_tool_zoom_btn)
+        layout.addWidget(self.viewport_tool_zoom_btn)
+
+        for _ in range(5):
+            placeholder_btn = _make_button()
+            placeholder_btn.setCheckable(False)
+            placeholder_btn.setToolTip("Reserved")
+            self.viewport_tool_buttons.append(placeholder_btn)
+            layout.addWidget(placeholder_btn)
+
+        layout.addStretch(1)
+        self._refresh_viewport_tool_buttons()
+        return container
+
+    def _refresh_viewport_tool_buttons(self) -> None:
+        if self.viewport_tool_cursor_btn is not None:
+            self.viewport_tool_cursor_btn.blockSignals(True)
+            self.viewport_tool_cursor_btn.setChecked(self.viewport_tool_mode == "cursor")
+            icon = (
+                self._viewport_tool_icon_cursor_selected
+                if self.viewport_tool_mode == "cursor"
+                else self._viewport_tool_icon_cursor_unselected
+            )
+            if icon is not None:
+                self.viewport_tool_cursor_btn.setIcon(icon)
+            self.viewport_tool_cursor_btn.blockSignals(False)
+
+        if self.viewport_tool_zoom_btn is not None:
+            self.viewport_tool_zoom_btn.blockSignals(True)
+            self.viewport_tool_zoom_btn.setChecked(self.viewport_tool_mode == "zoom")
+            icon = (
+                self._viewport_tool_icon_zoom_selected
+                if self.viewport_tool_mode == "zoom"
+                else self._viewport_tool_icon_zoom_unselected
+            )
+            if icon is not None:
+                self.viewport_tool_zoom_btn.setIcon(icon)
+            self.viewport_tool_zoom_btn.blockSignals(False)
+
+        if hasattr(self, "gl_widget"):
+            zoom_cursor = self._viewport_zoom_cursor or QCursor(Qt.CursorShape.CrossCursor)
+            self.gl_widget.set_interaction_cursors(
+                default_cursor=QCursor(Qt.CursorShape.ArrowCursor),
+                zoom_cursor=zoom_cursor,
+            )
+            self.gl_widget.set_interaction_tool(self.viewport_tool_mode)
+
+    def _set_viewport_tool_mode(self, mode: str) -> None:
+        normalized = "zoom" if str(mode or "").strip().lower() == "zoom" else "cursor"
+        self.viewport_tool_mode = normalized
+        self._refresh_viewport_tool_buttons()
 
     def _on_content_splitter_moved(self, _pos: int, _index: int):
         if not hasattr(self, "content_splitter"):
@@ -7367,6 +7628,13 @@ class MSMAnimationViewer(QMainWindow):
             and self.control_panel.dof_premultiply_alpha_checkbox.isChecked()
         ):
             cmd.append("--premultiply-alpha")
+        try:
+            alpha_hardness = float(self.settings.value("dof/alpha_hardness", 0.0, type=float))
+        except (TypeError, ValueError):
+            alpha_hardness = 0.0
+        alpha_hardness = max(0.0, min(2.0, alpha_hardness))
+        if alpha_hardness > 1e-6:
+            cmd += ["--alpha-hardness", f"{alpha_hardness:.3f}"]
         if getattr(self.control_panel, "dof_swap_anchor_report_checkbox", None) and self.control_panel.dof_swap_anchor_report_checkbox.isChecked():
             cmd.append("--swap-anchor-report")
         if getattr(self.control_panel, "dof_swap_anchor_edge_align_checkbox", None) and self.control_panel.dof_swap_anchor_edge_align_checkbox.isChecked():
@@ -13566,6 +13834,24 @@ class MSMAnimationViewer(QMainWindow):
         layout.addWidget(widget, 1)
         return container, widget, label
 
+    def _apply_postfx_settings_to_widget(self, widget: OpenGLAnimationWidget) -> None:
+        """Apply viewport post AA + Uber-subset post effects to a GL widget."""
+        widget.set_post_aa_enabled(self.viewport_post_aa_enabled)
+        widget.set_post_aa_strength(self.viewport_post_aa_strength)
+        widget.set_post_aa_mode(self.viewport_post_aa_mode)
+        widget.set_post_motion_blur_enabled(self.viewport_post_motion_blur_enabled)
+        widget.set_post_motion_blur_strength(self.viewport_post_motion_blur_strength)
+        widget.set_post_bloom_enabled(self.viewport_post_bloom_enabled)
+        widget.set_post_bloom_strength(self.viewport_post_bloom_strength)
+        widget.set_post_bloom_threshold(self.viewport_post_bloom_threshold)
+        widget.set_post_bloom_radius(self.viewport_post_bloom_radius)
+        widget.set_post_vignette_enabled(self.viewport_post_vignette_enabled)
+        widget.set_post_vignette_strength(self.viewport_post_vignette_strength)
+        widget.set_post_grain_enabled(self.viewport_post_grain_enabled)
+        widget.set_post_grain_strength(self.viewport_post_grain_strength)
+        widget.set_post_ca_enabled(self.viewport_post_ca_enabled)
+        widget.set_post_ca_strength(self.viewport_post_ca_strength)
+
     def _configure_multi_view_widget(self, widget: OpenGLAnimationWidget) -> None:
         widget.set_constraint_manager(self.constraint_manager)
         widget.set_joint_solver_enabled(self.joint_solver_enabled)
@@ -13580,6 +13866,8 @@ class MSMAnimationViewer(QMainWindow):
         widget.set_dof_alpha_smoothing_enabled(self.dof_alpha_edge_smoothing_enabled)
         widget.set_dof_alpha_smoothing_strength(self.dof_alpha_edge_smoothing_strength)
         widget.set_dof_alpha_smoothing_mode(self.dof_alpha_edge_smoothing_mode)
+        widget.set_dof_sprite_shader_mode(self.dof_sprite_shader_mode)
+        self._apply_postfx_settings_to_widget(widget)
         sprite_filter = self.settings.value("viewport/sprite_filter", "bilinear", type=str)
         widget.set_sprite_filter_mode(sprite_filter)
         sprite_filter_strength = self.settings.value("viewport/sprite_filter_strength", 1.0, type=float)
@@ -17115,6 +17403,7 @@ class MSMAnimationViewer(QMainWindow):
         apply_centering: bool = True,
         background_color: Optional[Tuple[int, int, int, int]] = None,
         include_viewport_background: bool = False,
+        motion_blur_frame_dt: Optional[float] = None,
     ) -> Optional[Image.Image]:
         """
         Render the current frame to a PIL Image.
@@ -17127,6 +17416,7 @@ class MSMAnimationViewer(QMainWindow):
             apply_centering=apply_centering,
             background_color=background_color,
             include_viewport_background=include_viewport_background,
+            motion_blur_frame_dt=motion_blur_frame_dt,
         )
         if rgba is None:
             return None
@@ -17142,12 +17432,15 @@ class MSMAnimationViewer(QMainWindow):
         apply_centering: bool = True,
         background_color: Optional[Tuple[int, int, int, int]] = None,
         include_viewport_background: bool = False,
+        motion_blur_frame_dt: Optional[float] = None,
     ) -> Optional[np.ndarray]:
         """
         Render the current frame to a top-down straight-alpha RGBA numpy array.
         """
         fbo = None
         texture = None
+        accum_fbo = None
+        accum_texture = None
         default_fbo = None
         viewport_before = (0, 0, self.gl_widget.width(), self.gl_widget.height())
         projection_pushed = False
@@ -17184,26 +17477,145 @@ class MSMAnimationViewer(QMainWindow):
             camera_x = camera_override[0] if camera_override else self.gl_widget.camera_x
             camera_y = camera_override[1] if camera_override else self.gl_widget.camera_y
             render_scale = render_scale_override if render_scale_override is not None else self.gl_widget.render_scale
-            if include_viewport_background:
-                self.gl_widget._render_viewport_background_image(
-                    view_width=width,
-                    view_height=height,
-                    camera_x=camera_x,
-                    camera_y=camera_y,
-                    render_scale=render_scale,
-                )
-            if self.gl_widget.player.animation:
+
+            def _render_export_scene(sample_time: float) -> None:
+                glBindFramebuffer(GL_FRAMEBUFFER, int(fbo))
+                glViewport(0, 0, width, height)
+                glClearColor(0.0, 0.0, 0.0, 0.0)
+                glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+                glEnable(GL_BLEND)
+                glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA)
+                glEnable(GL_TEXTURE_2D)
+                if include_viewport_background:
+                    self.gl_widget._render_viewport_background_image(
+                        view_width=width,
+                        view_height=height,
+                        camera_x=camera_x,
+                        camera_y=camera_y,
+                        render_scale=render_scale,
+                    )
+                if self.gl_widget.player.animation:
+                    glLoadIdentity()
+                    glTranslatef(camera_x, camera_y, 0)
+                    glScalef(render_scale, render_scale, 1.0)
+                    if apply_centering and self.gl_widget.player.animation.centered:
+                        glTranslatef(width / 2, height / 2, 0)
+                    self.gl_widget._render_tile_batches()
+                    self.gl_widget.render_all_layers(
+                        float(sample_time),
+                        apply_constraints=False,
+                        render_particles=True,
+                    )
+
+            def _accumulate_scene_texture(weight: float, additive: bool) -> None:
+                glBindFramebuffer(GL_FRAMEBUFFER, int(accum_fbo))
+                glViewport(0, 0, width, height)
+                if additive:
+                    glEnable(GL_BLEND)
+                    glBlendFunc(GL_ONE, GL_ONE)
+                else:
+                    glDisable(GL_BLEND)
                 glLoadIdentity()
-                glTranslatef(camera_x, camera_y, 0)
-                glScalef(render_scale, render_scale, 1.0)
-                if apply_centering and self.gl_widget.player.animation.centered:
-                    glTranslatef(width / 2, height / 2, 0)
-                self.gl_widget._render_tile_batches()
-                self.gl_widget.render_all_layers(
-                    self.gl_widget.player.current_time,
-                    apply_constraints=False,
-                    render_particles=True,
-                )
+                glBindTexture(GL_TEXTURE_2D, int(texture))
+                w = max(0.0, min(1.0, float(weight)))
+                glColor4f(w, w, w, w)
+                # Match post resolve orientation for FBO textures.
+                glBegin(GL_QUADS)
+                glTexCoord2f(0.0, 1.0)
+                glVertex2f(0.0, 0.0)
+                glTexCoord2f(1.0, 1.0)
+                glVertex2f(float(width), 0.0)
+                glTexCoord2f(1.0, 0.0)
+                glVertex2f(float(width), float(height))
+                glTexCoord2f(0.0, 0.0)
+                glVertex2f(0.0, float(height))
+                glEnd()
+                glColor4f(1.0, 1.0, 1.0, 1.0)
+                glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA)
+                glEnable(GL_BLEND)
+
+            source_texture = int(texture)
+            current_time = float(self.gl_widget.player.current_time)
+            motion_blur_strength = max(
+                0.0,
+                min(1.0, float(getattr(self.gl_widget, "post_motion_blur_strength", 0.0))),
+            )
+            motion_blur_enabled = bool(
+                getattr(self.gl_widget, "post_motion_blur_enabled", False)
+                and motion_blur_strength > 1e-4
+                and self.gl_widget.player.animation is not None
+            )
+            frame_dt = None
+            try:
+                if motion_blur_frame_dt is not None:
+                    frame_dt = float(motion_blur_frame_dt)
+            except Exception:
+                frame_dt = None
+            if frame_dt is None or frame_dt <= 0.0:
+                frame_dt = 1.0 / max(1.0, float(self.control_panel.fps_spin.value()))
+            frame_dt = max(1.0 / 240.0, min(1.0 / 20.0, frame_dt))
+            shutter_span = frame_dt * motion_blur_strength
+
+            if motion_blur_enabled and shutter_span > 1e-5:
+                accum_fbo = glGenFramebuffers(1)
+                glBindFramebuffer(GL_FRAMEBUFFER, accum_fbo)
+                accum_texture = glGenTextures(1)
+                glBindTexture(GL_TEXTURE_2D, accum_texture)
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, None)
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, accum_texture, 0)
+                if glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE:
+                    sample_count = max(2, min(12, int(round(2.0 + motion_blur_strength * 10.0))))
+                    step = shutter_span / float(sample_count)
+                    start = -0.5 * shutter_span + 0.5 * step
+                    sample_weight = 1.0 / float(sample_count)
+                    duration = float(self.gl_widget.player.duration or 0.0)
+                    loop_enabled = bool(self.gl_widget.player.loop)
+
+                    glBindFramebuffer(GL_FRAMEBUFFER, int(accum_fbo))
+                    glViewport(0, 0, width, height)
+                    glClearColor(0.0, 0.0, 0.0, 0.0)
+                    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+
+                    for sample_index in range(sample_count):
+                        sample_offset = start + float(sample_index) * step
+                        sample_time = float(current_time + sample_offset)
+                        if duration > 1e-6:
+                            if loop_enabled:
+                                sample_time = float(sample_time % duration)
+                            else:
+                                sample_time = float(max(0.0, min(duration, sample_time)))
+                        _render_export_scene(sample_time)
+                        _accumulate_scene_texture(sample_weight, additive=(sample_index > 0))
+                    source_texture = int(accum_texture)
+                else:
+                    if accum_fbo is not None:
+                        glDeleteFramebuffers(1, [int(accum_fbo)])
+                    if accum_texture is not None:
+                        glDeleteTextures(1, [int(accum_texture)])
+                    accum_fbo = None
+                    accum_texture = None
+
+            if source_texture == int(texture):
+                _render_export_scene(current_time)
+
+            read_fbo = int(accum_fbo) if (accum_fbo and source_texture == int(accum_texture)) else int(fbo)
+            if bool(getattr(self.gl_widget, "is_post_pass_enabled", lambda: False)()):
+                try:
+                    post_fbo, _post_texture = self.gl_widget.resolve_post_aa_texture(
+                        int(source_texture),
+                        int(width),
+                        int(height),
+                    )
+                    if post_fbo:
+                        read_fbo = int(post_fbo)
+                except Exception as exc:
+                    self.log_widget.log(
+                        f"Post AA resolve failed for export frame: {exc}",
+                        "WARNING",
+                    )
+            glBindFramebuffer(GL_FRAMEBUFFER, read_fbo)
             glReadBuffer(GL_COLOR_ATTACHMENT0)
             pixels = glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE)
             rgba = np.frombuffer(pixels, dtype=np.uint8).reshape((height, width, 4))
@@ -17224,6 +17636,10 @@ class MSMAnimationViewer(QMainWindow):
                 glDeleteFramebuffers(1, [fbo])
             if texture is not None:
                 glDeleteTextures(1, [texture])
+            if accum_fbo is not None:
+                glDeleteFramebuffers(1, [accum_fbo])
+            if accum_texture is not None:
+                glDeleteTextures(1, [accum_texture])
             if projection_pushed:
                 glMatrixMode(GL_PROJECTION)
                 glPopMatrix()
@@ -17650,6 +18066,7 @@ class MSMAnimationViewer(QMainWindow):
                     apply_centering=apply_centering,
                     background_color=background_color,
                     include_viewport_background=include_viewport_bg,
+                    motion_blur_frame_dt=1.0 / max(1.0, float(self.control_panel.fps_spin.value())),
                 )
                 
                 if image:
@@ -17719,6 +18136,7 @@ class MSMAnimationViewer(QMainWindow):
                     apply_centering=apply_centering,
                     background_color=background_color,
                     include_viewport_background=include_viewport_bg,
+                    motion_blur_frame_dt=1.0 / max(1e-6, float(fps)),
                 )
                 if image:
                     filename = os.path.join(
@@ -18836,6 +19254,7 @@ class MSMAnimationViewer(QMainWindow):
                     apply_centering=apply_centering,
                     background_color=background_color,
                     include_viewport_background=include_viewport_bg,
+                    motion_blur_frame_dt=1.0 / max(1e-6, float(fps)),
                 )
                 if image:
                     frame_path = os.path.join(temp_dir, f"frame_{frame_num:06d}.png")
@@ -19427,6 +19846,100 @@ class MSMAnimationViewer(QMainWindow):
             self.gl_widget.set_sprite_filter_mode(sprite_filter)
             sprite_filter_strength = self.settings.value("viewport/sprite_filter_strength", 1.0, type=float)
             self.gl_widget.set_sprite_filter_strength(sprite_filter_strength)
+            self.viewport_post_aa_enabled = bool(
+                self.settings.value('viewport/post_aa_enabled', self.viewport_post_aa_enabled, type=bool)
+            )
+            self.viewport_post_aa_strength = max(
+                0.0,
+                min(
+                    1.0,
+                    float(self.settings.value('viewport/post_aa_strength', self.viewport_post_aa_strength, type=float)),
+                ),
+            )
+            viewport_post_aa_mode = (
+                self.settings.value('viewport/post_aa_mode', self.viewport_post_aa_mode, type=str) or self.viewport_post_aa_mode
+            )
+            viewport_post_aa_mode = str(viewport_post_aa_mode).strip().lower()
+            if viewport_post_aa_mode not in {'fxaa', 'smaa'}:
+                viewport_post_aa_mode = 'fxaa'
+            self.viewport_post_aa_mode = viewport_post_aa_mode
+            self.viewport_post_motion_blur_enabled = bool(
+                self.settings.value(
+                    'viewport/post_motion_blur_enabled',
+                    self.viewport_post_motion_blur_enabled,
+                    type=bool,
+                )
+            )
+            self.viewport_post_motion_blur_strength = max(
+                0.0,
+                min(
+                    1.0,
+                    float(
+                        self.settings.value(
+                            'viewport/post_motion_blur_strength',
+                            self.viewport_post_motion_blur_strength,
+                            type=float,
+                        )
+                    ),
+                ),
+            )
+            self.viewport_post_bloom_enabled = bool(
+                self.settings.value('viewport/post_bloom_enabled', self.viewport_post_bloom_enabled, type=bool)
+            )
+            self.viewport_post_bloom_strength = max(
+                0.0,
+                min(
+                    2.0,
+                    float(self.settings.value('viewport/post_bloom_strength', self.viewport_post_bloom_strength, type=float)),
+                ),
+            )
+            self.viewport_post_bloom_threshold = max(
+                0.0,
+                min(
+                    2.0,
+                    float(self.settings.value('viewport/post_bloom_threshold', self.viewport_post_bloom_threshold, type=float)),
+                ),
+            )
+            self.viewport_post_bloom_radius = max(
+                0.1,
+                min(
+                    8.0,
+                    float(self.settings.value('viewport/post_bloom_radius', self.viewport_post_bloom_radius, type=float)),
+                ),
+            )
+            self.viewport_post_vignette_enabled = bool(
+                self.settings.value('viewport/post_vignette_enabled', self.viewport_post_vignette_enabled, type=bool)
+            )
+            self.viewport_post_vignette_strength = max(
+                0.0,
+                min(
+                    1.0,
+                    float(self.settings.value('viewport/post_vignette_strength', self.viewport_post_vignette_strength, type=float)),
+                ),
+            )
+            self.viewport_post_grain_enabled = bool(
+                self.settings.value('viewport/post_grain_enabled', self.viewport_post_grain_enabled, type=bool)
+            )
+            self.viewport_post_grain_strength = max(
+                0.0,
+                min(
+                    1.0,
+                    float(self.settings.value('viewport/post_grain_strength', self.viewport_post_grain_strength, type=float)),
+                ),
+            )
+            self.viewport_post_ca_enabled = bool(
+                self.settings.value('viewport/post_ca_enabled', self.viewport_post_ca_enabled, type=bool)
+            )
+            self.viewport_post_ca_strength = max(
+                0.0,
+                min(
+                    1.0,
+                    float(self.settings.value('viewport/post_ca_strength', self.viewport_post_ca_strength, type=float)),
+                ),
+            )
+            self._apply_postfx_settings_to_widget(self.gl_widget)
+            for widget in self.multi_view_widgets:
+                self._apply_postfx_settings_to_widget(widget)
             self.viewport_bg_enabled = bool(
                 self.settings.value('viewport/background_enabled', self.viewport_bg_enabled, type=bool)
             )
@@ -19566,18 +20079,34 @@ class MSMAnimationViewer(QMainWindow):
             if dof_alpha_mode not in {'normal', 'strong'}:
                 dof_alpha_mode = 'normal'
             self.dof_alpha_edge_smoothing_mode = dof_alpha_mode
+            dof_shader_mode_value = (
+                self.settings.value('dof/sprite_shader_mode', 'auto', type=str) or 'auto'
+            )
+            dof_shader_mode = str(dof_shader_mode_value).strip().lower()
+            if dof_shader_mode not in {
+                'auto',
+                'anim2d',
+                'dawnoffire_unlit',
+                'sprites_default',
+                'unlit_transparent',
+                'unlit_transparent_masked',
+            }:
+                dof_shader_mode = 'auto'
+            self.dof_sprite_shader_mode = dof_shader_mode
             self.gl_widget.set_particle_world_space_override(self.dof_particles_world_space)
             self.gl_widget.set_particle_viewport_cap(self.dof_particle_viewport_cap)
             self.gl_widget.set_particle_distance_sensitivity(self.dof_particle_distance_sensitivity)
             self.gl_widget.set_dof_alpha_smoothing_enabled(self.dof_alpha_edge_smoothing_enabled)
             self.gl_widget.set_dof_alpha_smoothing_strength(self.dof_alpha_edge_smoothing_strength)
             self.gl_widget.set_dof_alpha_smoothing_mode(self.dof_alpha_edge_smoothing_mode)
+            self.gl_widget.set_dof_sprite_shader_mode(self.dof_sprite_shader_mode)
             for widget in self.multi_view_widgets:
                 widget.set_particle_viewport_cap(self.dof_particle_viewport_cap)
                 widget.set_particle_distance_sensitivity(self.dof_particle_distance_sensitivity)
                 widget.set_dof_alpha_smoothing_enabled(self.dof_alpha_edge_smoothing_enabled)
                 widget.set_dof_alpha_smoothing_strength(self.dof_alpha_edge_smoothing_strength)
                 widget.set_dof_alpha_smoothing_mode(self.dof_alpha_edge_smoothing_mode)
+                widget.set_dof_sprite_shader_mode(self.dof_sprite_shader_mode)
     
     def export_as_gif(self):
         """Export animation as animated GIF"""
@@ -19672,6 +20201,7 @@ class MSMAnimationViewer(QMainWindow):
                     apply_centering=apply_centering,
                     background_color=background_color,
                     include_viewport_background=include_viewport_bg,
+                    motion_blur_frame_dt=1.0 / max(1e-6, float(gif_fps)),
                 )
                 
                 if image:
@@ -19911,6 +20441,98 @@ All game assets and content are owned by Big Blue Bubble Inc.
             self.gl_widget.set_sprite_filter_mode(sprite_filter)
             sprite_filter_strength = self.settings.value("viewport/sprite_filter_strength", 1.0, type=float)
             self.gl_widget.set_sprite_filter_strength(sprite_filter_strength)
+            self.viewport_post_aa_enabled = bool(
+                self.settings.value('viewport/post_aa_enabled', self.viewport_post_aa_enabled, type=bool)
+            )
+            self.viewport_post_aa_strength = max(
+                0.0,
+                min(
+                    1.0,
+                    float(self.settings.value('viewport/post_aa_strength', self.viewport_post_aa_strength, type=float)),
+                ),
+            )
+            viewport_post_aa_mode = (
+                self.settings.value('viewport/post_aa_mode', self.viewport_post_aa_mode, type=str) or self.viewport_post_aa_mode
+            )
+            viewport_post_aa_mode = str(viewport_post_aa_mode).strip().lower()
+            if viewport_post_aa_mode not in {'fxaa', 'smaa'}:
+                viewport_post_aa_mode = 'fxaa'
+            self.viewport_post_aa_mode = viewport_post_aa_mode
+            self.viewport_post_motion_blur_enabled = bool(
+                self.settings.value(
+                    'viewport/post_motion_blur_enabled',
+                    self.viewport_post_motion_blur_enabled,
+                    type=bool,
+                )
+            )
+            self.viewport_post_motion_blur_strength = max(
+                0.0,
+                min(
+                    1.0,
+                    float(
+                        self.settings.value(
+                            'viewport/post_motion_blur_strength',
+                            self.viewport_post_motion_blur_strength,
+                            type=float,
+                        )
+                    ),
+                ),
+            )
+            self.viewport_post_bloom_enabled = bool(
+                self.settings.value('viewport/post_bloom_enabled', self.viewport_post_bloom_enabled, type=bool)
+            )
+            self.viewport_post_bloom_strength = max(
+                0.0,
+                min(
+                    2.0,
+                    float(self.settings.value('viewport/post_bloom_strength', self.viewport_post_bloom_strength, type=float)),
+                ),
+            )
+            self.viewport_post_bloom_threshold = max(
+                0.0,
+                min(
+                    2.0,
+                    float(self.settings.value('viewport/post_bloom_threshold', self.viewport_post_bloom_threshold, type=float)),
+                ),
+            )
+            self.viewport_post_bloom_radius = max(
+                0.1,
+                min(
+                    8.0,
+                    float(self.settings.value('viewport/post_bloom_radius', self.viewport_post_bloom_radius, type=float)),
+                ),
+            )
+            self.viewport_post_vignette_enabled = bool(
+                self.settings.value('viewport/post_vignette_enabled', self.viewport_post_vignette_enabled, type=bool)
+            )
+            self.viewport_post_vignette_strength = max(
+                0.0,
+                min(
+                    1.0,
+                    float(self.settings.value('viewport/post_vignette_strength', self.viewport_post_vignette_strength, type=float)),
+                ),
+            )
+            self.viewport_post_grain_enabled = bool(
+                self.settings.value('viewport/post_grain_enabled', self.viewport_post_grain_enabled, type=bool)
+            )
+            self.viewport_post_grain_strength = max(
+                0.0,
+                min(
+                    1.0,
+                    float(self.settings.value('viewport/post_grain_strength', self.viewport_post_grain_strength, type=float)),
+                ),
+            )
+            self.viewport_post_ca_enabled = bool(
+                self.settings.value('viewport/post_ca_enabled', self.viewport_post_ca_enabled, type=bool)
+            )
+            self.viewport_post_ca_strength = max(
+                0.0,
+                min(
+                    1.0,
+                    float(self.settings.value('viewport/post_ca_strength', self.viewport_post_ca_strength, type=float)),
+                ),
+            )
+            self._apply_postfx_settings_to_widget(self.gl_widget)
             self.dof_alpha_edge_smoothing_enabled = bool(
                 self.settings.value('dof/alpha_edge_smoothing_enabled', False, type=bool)
             )
@@ -19928,13 +20550,30 @@ All game assets and content are owned by Big Blue Bubble Inc.
             if dof_alpha_mode not in {'normal', 'strong'}:
                 dof_alpha_mode = 'normal'
             self.dof_alpha_edge_smoothing_mode = dof_alpha_mode
+            dof_shader_mode_value = (
+                self.settings.value('dof/sprite_shader_mode', 'auto', type=str) or 'auto'
+            )
+            dof_shader_mode = str(dof_shader_mode_value).strip().lower()
+            if dof_shader_mode not in {
+                'auto',
+                'anim2d',
+                'dawnoffire_unlit',
+                'sprites_default',
+                'unlit_transparent',
+                'unlit_transparent_masked',
+            }:
+                dof_shader_mode = 'auto'
+            self.dof_sprite_shader_mode = dof_shader_mode
             self.gl_widget.set_dof_alpha_smoothing_enabled(self.dof_alpha_edge_smoothing_enabled)
             self.gl_widget.set_dof_alpha_smoothing_strength(self.dof_alpha_edge_smoothing_strength)
             self.gl_widget.set_dof_alpha_smoothing_mode(self.dof_alpha_edge_smoothing_mode)
+            self.gl_widget.set_dof_sprite_shader_mode(self.dof_sprite_shader_mode)
             for widget in self.multi_view_widgets:
+                self._apply_postfx_settings_to_widget(widget)
                 widget.set_dof_alpha_smoothing_enabled(self.dof_alpha_edge_smoothing_enabled)
                 widget.set_dof_alpha_smoothing_strength(self.dof_alpha_edge_smoothing_strength)
                 widget.set_dof_alpha_smoothing_mode(self.dof_alpha_edge_smoothing_mode)
+                widget.set_dof_sprite_shader_mode(self.dof_sprite_shader_mode)
         self._update_path_label()
         if self.game_path or self.downloads_path:
             self.build_audio_library()

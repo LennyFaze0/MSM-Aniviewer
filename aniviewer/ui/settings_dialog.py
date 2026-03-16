@@ -1373,6 +1373,29 @@ class SettingsDialog(QDialog):
         )
         dof_form.addRow("", self.dof_premultiply_alpha_checkbox)
 
+        self.dof_alpha_hardness_slider = QSlider(Qt.Orientation.Horizontal)
+        self.dof_alpha_hardness_slider.setRange(0, 200)
+        self.dof_alpha_hardness_slider.setValue(0)
+        self.dof_alpha_hardness_spin = QDoubleSpinBox()
+        self.dof_alpha_hardness_spin.setRange(0.0, 2.0)
+        self.dof_alpha_hardness_spin.setDecimals(2)
+        self.dof_alpha_hardness_spin.setSingleStep(0.05)
+        self.dof_alpha_hardness_spin.setValue(0.0)
+        self.dof_alpha_hardness_slider.valueChanged.connect(
+            lambda v: self.dof_alpha_hardness_spin.setValue(float(v) / 100.0)
+        )
+        self.dof_alpha_hardness_spin.valueChanged.connect(
+            lambda v: self.dof_alpha_hardness_slider.setValue(int(round(float(v) * 100.0)))
+        )
+        self.dof_alpha_hardness_spin.setToolTip(
+            "Hardens split-alpha edges after resize. "
+            "0.0 = no hardening, higher values tighten feathered edges."
+        )
+        hardness_row = QHBoxLayout()
+        hardness_row.addWidget(self.dof_alpha_hardness_slider, 1)
+        hardness_row.addWidget(self.dof_alpha_hardness_spin, 0)
+        dof_form.addRow("Alpha Edge Hardness:", hardness_row)
+
         self.dof_hires_xml_checkbox = QCheckBox("Set hires attribute in atlas XML")
         self.dof_hires_xml_checkbox.setToolTip(
             "When enabled, exported XML uses hires=\"true\". Disable to force hires=\"false\"."
@@ -1918,6 +1941,255 @@ class SettingsDialog(QDialog):
         dof_alpha_strength_row.addWidget(self.dof_alpha_smoothing_strength_slider, 1)
         dof_alpha_strength_row.addWidget(self.dof_alpha_smoothing_strength_spin, 0)
         viewport_form.addRow("DOF Edge Strength:", dof_alpha_strength_row)
+        self.viewport_post_aa_check = QCheckBox("Enable post-process AA (FinalPass FXAA)")
+        self.viewport_post_aa_check.setToolTip(
+            "Applies a fullscreen FinalPass-style FXAA resolve after rendering the viewport."
+        )
+        viewport_form.addRow("", self.viewport_post_aa_check)
+        self.viewport_post_aa_strength_slider = QSlider(Qt.Orientation.Horizontal)
+        self.viewport_post_aa_strength_slider.setRange(0, 100)
+        self.viewport_post_aa_strength_slider.setValue(50)
+        self.viewport_post_aa_strength_slider.setSingleStep(1)
+        self.viewport_post_aa_strength_slider.setPageStep(5)
+        self.viewport_post_aa_strength_slider.setToolTip(
+            "Strength of the post-process FXAA blend."
+        )
+        self.viewport_post_aa_strength_spin = QSpinBox()
+        self.viewport_post_aa_strength_spin.setRange(0, 100)
+        self.viewport_post_aa_strength_spin.setSuffix("%")
+        self.viewport_post_aa_strength_spin.setValue(50)
+        self.viewport_post_aa_strength_spin.setToolTip(
+            "Strength of the post-process FXAA blend."
+        )
+        self.viewport_post_aa_strength_slider.valueChanged.connect(
+            self.viewport_post_aa_strength_spin.setValue
+        )
+        self.viewport_post_aa_strength_spin.valueChanged.connect(
+            self.viewport_post_aa_strength_slider.setValue
+        )
+        self.viewport_post_aa_check.toggled.connect(
+            self.viewport_post_aa_strength_slider.setEnabled
+        )
+        self.viewport_post_aa_check.toggled.connect(
+            self.viewport_post_aa_strength_spin.setEnabled
+        )
+        post_aa_strength_row = QHBoxLayout()
+        post_aa_strength_row.addWidget(self.viewport_post_aa_strength_slider, 1)
+        post_aa_strength_row.addWidget(self.viewport_post_aa_strength_spin, 0)
+        viewport_form.addRow("Post AA Strength:", post_aa_strength_row)
+        self.viewport_post_aa_mode_combo = QComboBox()
+        self.viewport_post_aa_mode_combo.addItem("FinalPass FXAA", "fxaa")
+        self.viewport_post_aa_mode_combo.addItem("SMAA Approximation", "smaa")
+        self.viewport_post_aa_mode_combo.setToolTip(
+            "AA mode for the viewport post-process pass."
+        )
+        viewport_form.addRow("Post AA Mode:", self.viewport_post_aa_mode_combo)
+        self.viewport_post_motion_blur_check = QCheckBox("Enable Motion Blur")
+        self.viewport_post_motion_blur_check.setToolTip(
+            "Blends each frame with the previous frame in viewport post-processing."
+        )
+        viewport_form.addRow("", self.viewport_post_motion_blur_check)
+        self.viewport_post_motion_blur_strength_slider = QSlider(Qt.Orientation.Horizontal)
+        self.viewport_post_motion_blur_strength_slider.setRange(0, 100)
+        self.viewport_post_motion_blur_strength_slider.setValue(35)
+        self.viewport_post_motion_blur_strength_slider.setSingleStep(1)
+        self.viewport_post_motion_blur_strength_slider.setPageStep(5)
+        self.viewport_post_motion_blur_strength_slider.setToolTip(
+            "Motion blur intensity (previous-frame blend amount)."
+        )
+        self.viewport_post_motion_blur_strength_spin = QSpinBox()
+        self.viewport_post_motion_blur_strength_spin.setRange(0, 100)
+        self.viewport_post_motion_blur_strength_spin.setSuffix("%")
+        self.viewport_post_motion_blur_strength_spin.setValue(35)
+        self.viewport_post_motion_blur_strength_spin.setToolTip(
+            "Motion blur intensity (previous-frame blend amount)."
+        )
+        self.viewport_post_motion_blur_strength_slider.valueChanged.connect(
+            self.viewport_post_motion_blur_strength_spin.setValue
+        )
+        self.viewport_post_motion_blur_strength_spin.valueChanged.connect(
+            self.viewport_post_motion_blur_strength_slider.setValue
+        )
+        self.viewport_post_motion_blur_check.toggled.connect(
+            self.viewport_post_motion_blur_strength_slider.setEnabled
+        )
+        self.viewport_post_motion_blur_check.toggled.connect(
+            self.viewport_post_motion_blur_strength_spin.setEnabled
+        )
+        motion_blur_strength_row = QHBoxLayout()
+        motion_blur_strength_row.addWidget(self.viewport_post_motion_blur_strength_slider, 1)
+        motion_blur_strength_row.addWidget(self.viewport_post_motion_blur_strength_spin, 0)
+        viewport_form.addRow("Motion Blur Strength:", motion_blur_strength_row)
+
+        self.viewport_post_bloom_check = QCheckBox("Enable Bloom")
+        self.viewport_post_bloom_check.setToolTip(
+            "Adds a lightweight fullscreen bloom pass (Uber subset)."
+        )
+        viewport_form.addRow("", self.viewport_post_bloom_check)
+        self.viewport_post_bloom_strength_slider = QSlider(Qt.Orientation.Horizontal)
+        self.viewport_post_bloom_strength_slider.setRange(0, 200)
+        self.viewport_post_bloom_strength_slider.setValue(15)
+        self.viewport_post_bloom_strength_spin = QSpinBox()
+        self.viewport_post_bloom_strength_spin.setRange(0, 200)
+        self.viewport_post_bloom_strength_spin.setSuffix("%")
+        self.viewport_post_bloom_strength_spin.setValue(15)
+        self.viewport_post_bloom_strength_slider.valueChanged.connect(
+            self.viewport_post_bloom_strength_spin.setValue
+        )
+        self.viewport_post_bloom_strength_spin.valueChanged.connect(
+            self.viewport_post_bloom_strength_slider.setValue
+        )
+        bloom_strength_row = QHBoxLayout()
+        bloom_strength_row.addWidget(self.viewport_post_bloom_strength_slider, 1)
+        bloom_strength_row.addWidget(self.viewport_post_bloom_strength_spin, 0)
+        viewport_form.addRow("Bloom Strength:", bloom_strength_row)
+        self.viewport_post_bloom_threshold_slider = QSlider(Qt.Orientation.Horizontal)
+        self.viewport_post_bloom_threshold_slider.setRange(0, 200)
+        self.viewport_post_bloom_threshold_slider.setValue(60)
+        self.viewport_post_bloom_threshold_spin = QDoubleSpinBox()
+        self.viewport_post_bloom_threshold_spin.setRange(0.0, 2.0)
+        self.viewport_post_bloom_threshold_spin.setDecimals(2)
+        self.viewport_post_bloom_threshold_spin.setSingleStep(0.01)
+        self.viewport_post_bloom_threshold_spin.setValue(0.60)
+        self.viewport_post_bloom_threshold_slider.valueChanged.connect(
+            lambda v: self.viewport_post_bloom_threshold_spin.setValue(float(v) / 100.0)
+        )
+        self.viewport_post_bloom_threshold_spin.valueChanged.connect(
+            lambda v: self.viewport_post_bloom_threshold_slider.setValue(int(round(float(v) * 100.0)))
+        )
+        bloom_threshold_row = QHBoxLayout()
+        bloom_threshold_row.addWidget(self.viewport_post_bloom_threshold_slider, 1)
+        bloom_threshold_row.addWidget(self.viewport_post_bloom_threshold_spin, 0)
+        viewport_form.addRow("Bloom Threshold:", bloom_threshold_row)
+        self.viewport_post_bloom_radius_slider = QSlider(Qt.Orientation.Horizontal)
+        self.viewport_post_bloom_radius_slider.setRange(10, 800)
+        self.viewport_post_bloom_radius_slider.setValue(150)
+        self.viewport_post_bloom_radius_spin = QDoubleSpinBox()
+        self.viewport_post_bloom_radius_spin.setRange(0.1, 8.0)
+        self.viewport_post_bloom_radius_spin.setDecimals(2)
+        self.viewport_post_bloom_radius_spin.setSingleStep(0.1)
+        self.viewport_post_bloom_radius_spin.setValue(1.5)
+        self.viewport_post_bloom_radius_slider.valueChanged.connect(
+            lambda v: self.viewport_post_bloom_radius_spin.setValue(float(v) / 100.0)
+        )
+        self.viewport_post_bloom_radius_spin.valueChanged.connect(
+            lambda v: self.viewport_post_bloom_radius_slider.setValue(int(round(float(v) * 100.0)))
+        )
+        bloom_radius_row = QHBoxLayout()
+        bloom_radius_row.addWidget(self.viewport_post_bloom_radius_slider, 1)
+        bloom_radius_row.addWidget(self.viewport_post_bloom_radius_spin, 0)
+        viewport_form.addRow("Bloom Radius:", bloom_radius_row)
+
+        self.viewport_post_vignette_check = QCheckBox("Enable Vignette")
+        viewport_form.addRow("", self.viewport_post_vignette_check)
+        self.viewport_post_vignette_strength_slider = QSlider(Qt.Orientation.Horizontal)
+        self.viewport_post_vignette_strength_slider.setRange(0, 100)
+        self.viewport_post_vignette_strength_slider.setValue(25)
+        self.viewport_post_vignette_strength_spin = QSpinBox()
+        self.viewport_post_vignette_strength_spin.setRange(0, 100)
+        self.viewport_post_vignette_strength_spin.setSuffix("%")
+        self.viewport_post_vignette_strength_spin.setValue(25)
+        self.viewport_post_vignette_strength_slider.valueChanged.connect(
+            self.viewport_post_vignette_strength_spin.setValue
+        )
+        self.viewport_post_vignette_strength_spin.valueChanged.connect(
+            self.viewport_post_vignette_strength_slider.setValue
+        )
+        vignette_strength_row = QHBoxLayout()
+        vignette_strength_row.addWidget(self.viewport_post_vignette_strength_slider, 1)
+        vignette_strength_row.addWidget(self.viewport_post_vignette_strength_spin, 0)
+        viewport_form.addRow("Vignette Strength:", vignette_strength_row)
+
+        self.viewport_post_grain_check = QCheckBox("Enable Grain")
+        viewport_form.addRow("", self.viewport_post_grain_check)
+        self.viewport_post_grain_strength_slider = QSlider(Qt.Orientation.Horizontal)
+        self.viewport_post_grain_strength_slider.setRange(0, 100)
+        self.viewport_post_grain_strength_slider.setValue(20)
+        self.viewport_post_grain_strength_spin = QSpinBox()
+        self.viewport_post_grain_strength_spin.setRange(0, 100)
+        self.viewport_post_grain_strength_spin.setSuffix("%")
+        self.viewport_post_grain_strength_spin.setValue(20)
+        self.viewport_post_grain_strength_slider.valueChanged.connect(
+            self.viewport_post_grain_strength_spin.setValue
+        )
+        self.viewport_post_grain_strength_spin.valueChanged.connect(
+            self.viewport_post_grain_strength_slider.setValue
+        )
+        grain_strength_row = QHBoxLayout()
+        grain_strength_row.addWidget(self.viewport_post_grain_strength_slider, 1)
+        grain_strength_row.addWidget(self.viewport_post_grain_strength_spin, 0)
+        viewport_form.addRow("Grain Strength:", grain_strength_row)
+
+        self.viewport_post_ca_check = QCheckBox("Enable Chromatic Aberration")
+        viewport_form.addRow("", self.viewport_post_ca_check)
+        self.viewport_post_ca_strength_slider = QSlider(Qt.Orientation.Horizontal)
+        self.viewport_post_ca_strength_slider.setRange(0, 100)
+        self.viewport_post_ca_strength_slider.setValue(25)
+        self.viewport_post_ca_strength_spin = QSpinBox()
+        self.viewport_post_ca_strength_spin.setRange(0, 100)
+        self.viewport_post_ca_strength_spin.setSuffix("%")
+        self.viewport_post_ca_strength_spin.setValue(25)
+        self.viewport_post_ca_strength_slider.valueChanged.connect(
+            self.viewport_post_ca_strength_spin.setValue
+        )
+        self.viewport_post_ca_strength_spin.valueChanged.connect(
+            self.viewport_post_ca_strength_slider.setValue
+        )
+        ca_strength_row = QHBoxLayout()
+        ca_strength_row.addWidget(self.viewport_post_ca_strength_slider, 1)
+        ca_strength_row.addWidget(self.viewport_post_ca_strength_spin, 0)
+        viewport_form.addRow("CA Strength:", ca_strength_row)
+        self.viewport_post_bloom_check.toggled.connect(
+            self.viewport_post_bloom_strength_slider.setEnabled
+        )
+        self.viewport_post_bloom_check.toggled.connect(
+            self.viewport_post_bloom_strength_spin.setEnabled
+        )
+        self.viewport_post_bloom_check.toggled.connect(
+            self.viewport_post_bloom_threshold_slider.setEnabled
+        )
+        self.viewport_post_bloom_check.toggled.connect(
+            self.viewport_post_bloom_threshold_spin.setEnabled
+        )
+        self.viewport_post_bloom_check.toggled.connect(
+            self.viewport_post_bloom_radius_slider.setEnabled
+        )
+        self.viewport_post_bloom_check.toggled.connect(
+            self.viewport_post_bloom_radius_spin.setEnabled
+        )
+        self.viewport_post_vignette_check.toggled.connect(
+            self.viewport_post_vignette_strength_slider.setEnabled
+        )
+        self.viewport_post_vignette_check.toggled.connect(
+            self.viewport_post_vignette_strength_spin.setEnabled
+        )
+        self.viewport_post_grain_check.toggled.connect(
+            self.viewport_post_grain_strength_slider.setEnabled
+        )
+        self.viewport_post_grain_check.toggled.connect(
+            self.viewport_post_grain_strength_spin.setEnabled
+        )
+        self.viewport_post_ca_check.toggled.connect(
+            self.viewport_post_ca_strength_slider.setEnabled
+        )
+        self.viewport_post_ca_check.toggled.connect(
+            self.viewport_post_ca_strength_spin.setEnabled
+        )
+        self.dof_sprite_shader_mode_combo = QComboBox()
+        self.dof_sprite_shader_mode_combo.addItem("Auto (From Animation Data)", "auto")
+        self.dof_sprite_shader_mode_combo.addItem("Anim2D/Normal+Alpha", "anim2d")
+        self.dof_sprite_shader_mode_combo.addItem("DawnOfFire/UnlitShader (Experimental)", "dawnoffire_unlit")
+        self.dof_sprite_shader_mode_combo.addItem("Sprites/Default (Experimental)", "sprites_default")
+        self.dof_sprite_shader_mode_combo.addItem("Unlit/Transparent (Experimental)", "unlit_transparent")
+        self.dof_sprite_shader_mode_combo.addItem(
+            "Unlit/Transparent Masked (Experimental)",
+            "unlit_transparent_masked",
+        )
+        self.dof_sprite_shader_mode_combo.setToolTip(
+            "Experimental DOF sprite shader emulation override. "
+            "Use this to A/B compare sprite rendering paths."
+        )
+        viewport_form.addRow("DOF Sprite Shader:", self.dof_sprite_shader_mode_combo)
         viewport_group.setLayout(viewport_form)
         app_layout.addWidget(viewport_group)
 
@@ -2408,6 +2680,117 @@ class SettingsDialog(QDialog):
             self.dof_alpha_smoothing_strength_spin.setEnabled(enabled)
             if hasattr(self, "dof_alpha_smoothing_mode_combo"):
                 self.dof_alpha_smoothing_mode_combo.setEnabled(enabled)
+        if hasattr(self, "viewport_post_aa_check"):
+            self.viewport_post_aa_check.setChecked(
+                self.app_settings.value("viewport/post_aa_enabled", False, type=bool)
+            )
+        if hasattr(self, "viewport_post_aa_strength_slider"):
+            post_aa_strength = self.app_settings.value(
+                "viewport/post_aa_strength", 0.5, type=float
+            )
+            try:
+                post_aa_strength_value = float(post_aa_strength)
+            except (TypeError, ValueError):
+                post_aa_strength_value = 0.5
+            post_aa_strength_value = max(0.0, min(1.0, post_aa_strength_value))
+            self.viewport_post_aa_strength_slider.setValue(
+                int(round(post_aa_strength_value * 100.0))
+            )
+        if hasattr(self, "viewport_post_aa_check"):
+            enabled = self.viewport_post_aa_check.isChecked()
+            self.viewport_post_aa_strength_slider.setEnabled(enabled)
+            self.viewport_post_aa_strength_spin.setEnabled(enabled)
+        if hasattr(self, "viewport_post_aa_mode_combo"):
+            mode = self.app_settings.value("viewport/post_aa_mode", "fxaa", type=str) or "fxaa"
+            idx = self.viewport_post_aa_mode_combo.findData(str(mode).strip().lower())
+            if idx < 0:
+                idx = self.viewport_post_aa_mode_combo.findData("fxaa")
+            if idx >= 0:
+                self.viewport_post_aa_mode_combo.setCurrentIndex(idx)
+        if hasattr(self, "viewport_post_motion_blur_check"):
+            self.viewport_post_motion_blur_check.setChecked(
+                self.app_settings.value("viewport/post_motion_blur_enabled", False, type=bool)
+            )
+            self.viewport_post_motion_blur_strength_slider.setValue(
+                int(
+                    round(
+                        max(
+                            0.0,
+                            min(
+                                1.0,
+                                float(
+                                    self.app_settings.value(
+                                        "viewport/post_motion_blur_strength",
+                                        0.35,
+                                        type=float,
+                                    )
+                                ),
+                            ),
+                        )
+                        * 100.0
+                    )
+                )
+            )
+            mb_enabled = self.viewport_post_motion_blur_check.isChecked()
+            self.viewport_post_motion_blur_strength_slider.setEnabled(mb_enabled)
+            self.viewport_post_motion_blur_strength_spin.setEnabled(mb_enabled)
+        if hasattr(self, "viewport_post_bloom_check"):
+            self.viewport_post_bloom_check.setChecked(
+                self.app_settings.value("viewport/post_bloom_enabled", False, type=bool)
+            )
+            self.viewport_post_bloom_strength_slider.setValue(
+                int(round(max(0.0, min(2.0, float(self.app_settings.value("viewport/post_bloom_strength", 0.15, type=float)))) * 100.0))
+            )
+            self.viewport_post_bloom_threshold_slider.setValue(
+                int(round(max(0.0, min(2.0, float(self.app_settings.value("viewport/post_bloom_threshold", 0.6, type=float)))) * 100.0))
+            )
+            self.viewport_post_bloom_radius_slider.setValue(
+                int(round(max(0.1, min(8.0, float(self.app_settings.value("viewport/post_bloom_radius", 1.5, type=float)))) * 100.0))
+            )
+            b_enabled = self.viewport_post_bloom_check.isChecked()
+            self.viewport_post_bloom_strength_slider.setEnabled(b_enabled)
+            self.viewport_post_bloom_strength_spin.setEnabled(b_enabled)
+            self.viewport_post_bloom_threshold_slider.setEnabled(b_enabled)
+            self.viewport_post_bloom_threshold_spin.setEnabled(b_enabled)
+            self.viewport_post_bloom_radius_slider.setEnabled(b_enabled)
+            self.viewport_post_bloom_radius_spin.setEnabled(b_enabled)
+        if hasattr(self, "viewport_post_vignette_check"):
+            self.viewport_post_vignette_check.setChecked(
+                self.app_settings.value("viewport/post_vignette_enabled", False, type=bool)
+            )
+            self.viewport_post_vignette_strength_slider.setValue(
+                int(round(max(0.0, min(1.0, float(self.app_settings.value("viewport/post_vignette_strength", 0.25, type=float)))) * 100.0))
+            )
+            v_enabled = self.viewport_post_vignette_check.isChecked()
+            self.viewport_post_vignette_strength_slider.setEnabled(v_enabled)
+            self.viewport_post_vignette_strength_spin.setEnabled(v_enabled)
+        if hasattr(self, "viewport_post_grain_check"):
+            self.viewport_post_grain_check.setChecked(
+                self.app_settings.value("viewport/post_grain_enabled", False, type=bool)
+            )
+            self.viewport_post_grain_strength_slider.setValue(
+                int(round(max(0.0, min(1.0, float(self.app_settings.value("viewport/post_grain_strength", 0.2, type=float)))) * 100.0))
+            )
+            g_enabled = self.viewport_post_grain_check.isChecked()
+            self.viewport_post_grain_strength_slider.setEnabled(g_enabled)
+            self.viewport_post_grain_strength_spin.setEnabled(g_enabled)
+        if hasattr(self, "viewport_post_ca_check"):
+            self.viewport_post_ca_check.setChecked(
+                self.app_settings.value("viewport/post_ca_enabled", False, type=bool)
+            )
+            self.viewport_post_ca_strength_slider.setValue(
+                int(round(max(0.0, min(1.0, float(self.app_settings.value("viewport/post_ca_strength", 0.25, type=float)))) * 100.0))
+            )
+            c_enabled = self.viewport_post_ca_check.isChecked()
+            self.viewport_post_ca_strength_slider.setEnabled(c_enabled)
+            self.viewport_post_ca_strength_spin.setEnabled(c_enabled)
+        if hasattr(self, "dof_sprite_shader_mode_combo"):
+            shader_mode = self.app_settings.value("dof/sprite_shader_mode", "auto", type=str) or "auto"
+            mode_idx = self.dof_sprite_shader_mode_combo.findData(str(shader_mode).strip().lower())
+            if mode_idx < 0:
+                mode_idx = self.dof_sprite_shader_mode_combo.findData("auto")
+            if mode_idx >= 0:
+                self.dof_sprite_shader_mode_combo.setCurrentIndex(mode_idx)
         self.metronome_default_check.setChecked(
             self.app_settings.value('metronome/enabled', False, type=bool)
         )
@@ -2538,6 +2921,16 @@ class SettingsDialog(QDialog):
             if hasattr(self, "dof_premultiply_alpha_checkbox"):
                 self.dof_premultiply_alpha_checkbox.setChecked(
                     self.app_settings.value("dof/premultiply_alpha", False, type=bool)
+                )
+            if hasattr(self, "dof_alpha_hardness_slider"):
+                alpha_hardness = self.app_settings.value("dof/alpha_hardness", 0.0, type=float)
+                try:
+                    alpha_hardness_value = float(alpha_hardness)
+                except (TypeError, ValueError):
+                    alpha_hardness_value = 0.0
+                alpha_hardness_value = max(0.0, min(2.0, alpha_hardness_value))
+                self.dof_alpha_hardness_slider.setValue(
+                    int(round(alpha_hardness_value * 100.0))
                 )
             if hasattr(self, "dof_deploy_premultiply_alpha_checkbox"):
                 self.dof_deploy_premultiply_alpha_checkbox.setChecked(
@@ -3006,6 +3399,31 @@ class SettingsDialog(QDialog):
                 self.sprite_filter_combo.setCurrentIndex(idx)
         if hasattr(self, "sprite_filter_strength_slider"):
             self.sprite_filter_strength_slider.setValue(100)
+        if hasattr(self, "viewport_post_aa_check"):
+            self.viewport_post_aa_check.setChecked(False)
+        if hasattr(self, "viewport_post_aa_strength_slider"):
+            self.viewport_post_aa_strength_slider.setValue(50)
+        if hasattr(self, "viewport_post_aa_mode_combo"):
+            idx = self.viewport_post_aa_mode_combo.findData("fxaa")
+            if idx >= 0:
+                self.viewport_post_aa_mode_combo.setCurrentIndex(idx)
+        if hasattr(self, "viewport_post_motion_blur_check"):
+            self.viewport_post_motion_blur_check.setChecked(False)
+            self.viewport_post_motion_blur_strength_slider.setValue(35)
+        if hasattr(self, "viewport_post_bloom_check"):
+            self.viewport_post_bloom_check.setChecked(False)
+            self.viewport_post_bloom_strength_slider.setValue(15)
+            self.viewport_post_bloom_threshold_slider.setValue(60)
+            self.viewport_post_bloom_radius_slider.setValue(150)
+        if hasattr(self, "viewport_post_vignette_check"):
+            self.viewport_post_vignette_check.setChecked(False)
+            self.viewport_post_vignette_strength_slider.setValue(25)
+        if hasattr(self, "viewport_post_grain_check"):
+            self.viewport_post_grain_check.setChecked(False)
+            self.viewport_post_grain_strength_slider.setValue(20)
+        if hasattr(self, "viewport_post_ca_check"):
+            self.viewport_post_ca_check.setChecked(False)
+            self.viewport_post_ca_strength_slider.setValue(25)
         self.metronome_default_check.setChecked(False)
         self.metronome_audible_check.setChecked(True)
         self.metronome_time_sig_num.setValue(4)
@@ -3022,6 +3440,10 @@ class SettingsDialog(QDialog):
         if hasattr(self, "dof_particle_sensitivity_slider"):
             self.dof_particle_sensitivity_spin.setValue(0.5)
             self._sync_dof_particle_sensitivity_slider(0.5)
+        if hasattr(self, "dof_sprite_shader_mode_combo"):
+            idx = self.dof_sprite_shader_mode_combo.findData("auto")
+            if idx >= 0:
+                self.dof_sprite_shader_mode_combo.setCurrentIndex(idx)
         self.barebones_browser_check.setChecked(False)
         self.update_source_json_check.setChecked(False)
         
@@ -3053,6 +3475,8 @@ class SettingsDialog(QDialog):
                 self.dof_include_mesh_xml_checkbox.setChecked(False)
             if hasattr(self, "dof_premultiply_alpha_checkbox"):
                 self.dof_premultiply_alpha_checkbox.setChecked(False)
+            if hasattr(self, "dof_alpha_hardness_slider"):
+                self.dof_alpha_hardness_slider.setValue(0)
             if hasattr(self, "dof_deploy_premultiply_alpha_checkbox"):
                 self.dof_deploy_premultiply_alpha_checkbox.setChecked(False)
             if hasattr(self, "dof_hires_xml_checkbox"):
@@ -3205,6 +3629,77 @@ class SettingsDialog(QDialog):
         if hasattr(self, "dof_alpha_smoothing_strength_slider"):
             dof_alpha_strength = float(self.dof_alpha_smoothing_strength_slider.value()) / 100.0
             self.app_settings.setValue("dof/alpha_edge_smoothing_strength", dof_alpha_strength)
+        if hasattr(self, "viewport_post_aa_check"):
+            self.app_settings.setValue(
+                "viewport/post_aa_enabled",
+                self.viewport_post_aa_check.isChecked(),
+            )
+        if hasattr(self, "viewport_post_aa_strength_slider"):
+            post_aa_strength = float(self.viewport_post_aa_strength_slider.value()) / 100.0
+            self.app_settings.setValue("viewport/post_aa_strength", post_aa_strength)
+        if hasattr(self, "viewport_post_aa_mode_combo"):
+            self.app_settings.setValue(
+                "viewport/post_aa_mode",
+                self.viewport_post_aa_mode_combo.currentData() or "fxaa",
+            )
+        if hasattr(self, "viewport_post_motion_blur_check"):
+            self.app_settings.setValue(
+                "viewport/post_motion_blur_enabled",
+                self.viewport_post_motion_blur_check.isChecked(),
+            )
+            self.app_settings.setValue(
+                "viewport/post_motion_blur_strength",
+                float(self.viewport_post_motion_blur_strength_slider.value()) / 100.0,
+            )
+        if hasattr(self, "viewport_post_bloom_check"):
+            self.app_settings.setValue(
+                "viewport/post_bloom_enabled",
+                self.viewport_post_bloom_check.isChecked(),
+            )
+            self.app_settings.setValue(
+                "viewport/post_bloom_strength",
+                float(self.viewport_post_bloom_strength_slider.value()) / 100.0,
+            )
+            self.app_settings.setValue(
+                "viewport/post_bloom_threshold",
+                float(self.viewport_post_bloom_threshold_slider.value()) / 100.0,
+            )
+            self.app_settings.setValue(
+                "viewport/post_bloom_radius",
+                float(self.viewport_post_bloom_radius_slider.value()) / 100.0,
+            )
+        if hasattr(self, "viewport_post_vignette_check"):
+            self.app_settings.setValue(
+                "viewport/post_vignette_enabled",
+                self.viewport_post_vignette_check.isChecked(),
+            )
+            self.app_settings.setValue(
+                "viewport/post_vignette_strength",
+                float(self.viewport_post_vignette_strength_slider.value()) / 100.0,
+            )
+        if hasattr(self, "viewport_post_grain_check"):
+            self.app_settings.setValue(
+                "viewport/post_grain_enabled",
+                self.viewport_post_grain_check.isChecked(),
+            )
+            self.app_settings.setValue(
+                "viewport/post_grain_strength",
+                float(self.viewport_post_grain_strength_slider.value()) / 100.0,
+            )
+        if hasattr(self, "viewport_post_ca_check"):
+            self.app_settings.setValue(
+                "viewport/post_ca_enabled",
+                self.viewport_post_ca_check.isChecked(),
+            )
+            self.app_settings.setValue(
+                "viewport/post_ca_strength",
+                float(self.viewport_post_ca_strength_slider.value()) / 100.0,
+            )
+        if hasattr(self, "dof_sprite_shader_mode_combo"):
+            self.app_settings.setValue(
+                "dof/sprite_shader_mode",
+                self.dof_sprite_shader_mode_combo.currentData() or "auto",
+            )
         self.app_settings.setValue('metronome/enabled', self.metronome_default_check.isChecked())
         self.app_settings.setValue('metronome/audible', self.metronome_audible_check.isChecked())
         self.app_settings.setValue('metronome/time_signature_numerator', self.metronome_time_sig_num.value())
@@ -3263,6 +3758,11 @@ class SettingsDialog(QDialog):
                 self.app_settings.setValue(
                     "dof/premultiply_alpha",
                     self.dof_premultiply_alpha_checkbox.isChecked(),
+                )
+            if hasattr(self, "dof_alpha_hardness_slider"):
+                self.app_settings.setValue(
+                    "dof/alpha_hardness",
+                    float(self.dof_alpha_hardness_slider.value()) / 100.0,
                 )
             if hasattr(self, "dof_hires_xml_checkbox"):
                 self.app_settings.setValue(
@@ -3932,6 +4432,15 @@ class SettingsDialog(QDialog):
             premultiply_alpha = True
         if premultiply_alpha:
             cmd.append("--premultiply-alpha")
+        alpha_hardness = 0.0
+        if hasattr(self, "dof_alpha_hardness_spin"):
+            try:
+                alpha_hardness = float(self.dof_alpha_hardness_spin.value())
+            except (TypeError, ValueError):
+                alpha_hardness = 0.0
+        alpha_hardness = max(0.0, min(2.0, alpha_hardness))
+        if alpha_hardness > 1e-6:
+            cmd += ["--alpha-hardness", f"{alpha_hardness:.3f}"]
         hires_state = None
         if hasattr(self, "dof_deploy_hires_xml_checkbox"):
             hires_state = self.dof_deploy_hires_xml_checkbox.isChecked()
@@ -5523,6 +6032,15 @@ class SettingsDialog(QDialog):
             and self.dof_premultiply_alpha_checkbox.isChecked()
         ):
             cmd.append("--premultiply-alpha")
+        alpha_hardness = 0.0
+        if hasattr(self, "dof_alpha_hardness_spin"):
+            try:
+                alpha_hardness = float(self.dof_alpha_hardness_spin.value())
+            except (TypeError, ValueError):
+                alpha_hardness = 0.0
+        alpha_hardness = max(0.0, min(2.0, alpha_hardness))
+        if alpha_hardness > 1e-6:
+            cmd += ["--alpha-hardness", f"{alpha_hardness:.3f}"]
         if hasattr(self, "dof_hires_xml_checkbox"):
             cmd.append("--hires-xml" if self.dof_hires_xml_checkbox.isChecked() else "--no-hires-xml")
         if getattr(self, "dof_swap_anchor_report_checkbox", None) and self.dof_swap_anchor_report_checkbox.isChecked():

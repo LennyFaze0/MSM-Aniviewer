@@ -1782,6 +1782,7 @@ def _apply_alpha_texture(
     alpha_flip_x: bool = False,
     alpha_flip_y: bool = False,
     alpha_channel_override: Optional[Any] = None,
+    alpha_hardness: float = 0.0,
 ) -> Image.Image:
     if base_img.mode != "RGBA":
         base_img = base_img.convert("RGBA")
@@ -1796,9 +1797,30 @@ def _apply_alpha_texture(
         if alpha_flip_y:
             alpha_channel = alpha_channel.transpose(Image.Transpose.FLIP_TOP_BOTTOM)
     # DOF split-alpha is authored to overlay the color atlas directly.
-    # Keep it literal: no auto flip/invert/offset, only size match.
+    # Keep mapping literal (no flip/invert/offset guessing), but use a
+    # high-quality resize for size mismatches so low-res alpha masks do not
+    # produce staircase edges after upscaling.
     if alpha_channel.size != base_img.size:
-        alpha_channel = alpha_channel.resize(base_img.size, Image.Resampling.NEAREST)
+        src_w, src_h = alpha_channel.size
+        dst_w, dst_h = base_img.size
+        scale_x = float(dst_w) / float(max(1, src_w))
+        scale_y = float(dst_h) / float(max(1, src_h))
+        upscale = scale_x > 1.001 or scale_y > 1.001
+        resample_mode = (
+            Image.Resampling.LANCZOS if upscale else Image.Resampling.BILINEAR
+        )
+        alpha_channel = alpha_channel.resize(base_img.size, resample_mode)
+    try:
+        hardness_value = float(alpha_hardness)
+    except (TypeError, ValueError):
+        hardness_value = 0.0
+    hardness_value = max(0.0, min(2.0, hardness_value))
+    if hardness_value > 1e-6:
+        contrast = 1.0 + hardness_value
+        midpoint = 127.5
+        alpha_channel = alpha_channel.point(
+            lambda v: int(max(0.0, min(255.0, round((float(v) - midpoint) * contrast + midpoint))))
+        )
     base_img.putalpha(alpha_channel)
     return base_img
 
@@ -1823,6 +1845,7 @@ def _build_texture(
     alpha_flip_x: bool = False,
     alpha_flip_y: bool = False,
     premultiply_alpha: bool = False,
+    alpha_hardness: float = 0.0,
 ) -> Tuple[int, int]:
     if Image is None:
         raise RuntimeError("Pillow is required for DOF conversion.")
@@ -1851,6 +1874,7 @@ def _build_texture(
                 sprites,
                 alpha_flip_x=alpha_flip_x,
                 alpha_flip_y=alpha_flip_y,
+                alpha_hardness=alpha_hardness,
             )
             alpha_applied = True
     if not alpha_applied:
@@ -1871,6 +1895,7 @@ def _build_texture_from_unitypy(
     alpha_flip_y: bool = False,
     alpha_channel_override: Optional[Any] = None,
     premultiply_alpha: bool = False,
+    alpha_hardness: float = 0.0,
 ) -> Tuple[int, int]:
     if Image is None:
         raise RuntimeError("Pillow is required for DOF conversion.")
@@ -1892,6 +1917,7 @@ def _build_texture_from_unitypy(
             alpha_flip_x=False,
             alpha_flip_y=False,
             alpha_channel_override=alpha_channel_override,
+            alpha_hardness=alpha_hardness,
         )
         alpha_applied = True
     elif alpha_obj is not None and getattr(alpha_obj, "image", None) is not None:
@@ -1907,6 +1933,7 @@ def _build_texture_from_unitypy(
                 sprites,
                 alpha_flip_x=alpha_flip_x,
                 alpha_flip_y=alpha_flip_y,
+                alpha_hardness=alpha_hardness,
             )
             alpha_applied = True
     if not alpha_applied:
@@ -3091,6 +3118,7 @@ def convert_anim(
     mesh_use_offset: bool = True,
     include_mesh_xml: bool = False,
     premultiply_alpha: bool = False,
+    alpha_hardness: float = 0.0,
     dof_anchor_offset: bool = False,
     dof_anchor_center: bool = False,
     swap_anchor_report: bool = False,
@@ -3185,6 +3213,7 @@ def convert_anim(
         texture_output,
         [],
         premultiply_alpha=premultiply_alpha,
+        alpha_hardness=alpha_hardness,
     )
     image_names: List[str] = []
     for guid in image_guids:
@@ -3813,6 +3842,7 @@ def convert_anim_bundle(
     mesh_use_offset: bool = True,
     include_mesh_xml: bool = False,
     premultiply_alpha: bool = False,
+    alpha_hardness: float = 0.0,
     dof_anchor_offset: bool = False,
     dof_anchor_center: bool = False,
     swap_anchor_report: bool = False,
@@ -4068,6 +4098,7 @@ def convert_anim_bundle(
         alpha_flip_y=alpha_selected_flip_y,
         alpha_channel_override=alpha_channel_override,
         premultiply_alpha=premultiply_alpha,
+        alpha_hardness=alpha_hardness,
     )
     atlas_flip_y = _detect_atlas_flip_y(texture_output, list(sprite_defs.values()))
 
@@ -4727,6 +4758,16 @@ def main() -> int:
         action="store_true",
         help="Premultiply atlas alpha when exporting PNGs.",
     )
+    parser.add_argument(
+        "--alpha-hardness",
+        dest="alpha_hardness",
+        type=float,
+        default=0.0,
+        help=(
+            "Additional alpha edge hardening after split-alpha resize "
+            "(0.0-2.0, default 0.0)."
+        ),
+    )
     hires_group = parser.add_mutually_exclusive_group()
     hires_group.add_argument(
         "--hires-xml",
@@ -4856,6 +4897,11 @@ def main() -> int:
     if bool(args.strip_mesh_xml):
         include_mesh_xml = False
     premultiply_alpha = bool(args.premultiply_alpha)
+    try:
+        alpha_hardness = float(args.alpha_hardness)
+    except (TypeError, ValueError):
+        alpha_hardness = 0.0
+    alpha_hardness = max(0.0, min(2.0, alpha_hardness))
     hires_override = args.hires_xml if args.hires_xml is not None else None
 
     if bundle_root is not None and bundle_anim:
@@ -4872,6 +4918,7 @@ def main() -> int:
                 mesh_use_offset,
                 include_mesh_xml,
                 premultiply_alpha,
+                alpha_hardness,
                 bool(args.dof_anchor_offset),
                 args.dof_anchor_center,
                 swap_anchor_report,
@@ -4919,6 +4966,7 @@ def main() -> int:
                     mesh_use_offset,
                     include_mesh_xml,
                     premultiply_alpha,
+                    alpha_hardness,
                     bool(args.dof_anchor_offset),
                     args.dof_anchor_center,
                     swap_anchor_report,

@@ -373,28 +373,49 @@ vec4 sample_bilinear_alpha(vec2 uv) {
     return vec4(premul, a);
 }
 
+vec3 to_straight(vec4 sample) {
+    return (sample.a > 0.0) ? (sample.rgb / sample.a) : vec3(0.0);
+}
+
 void main() {
     vec2 uv = gl_TexCoord[0].st;
-    vec4 center = sample_bilinear_alpha(uv);
-    float a0 = center.a;
+    vec4 s0 = sample_bilinear_alpha(uv);
+    float a0 = s0.a;
     vec2 texel = vec2(1.0 / max(1.0, u_texSize.x), 1.0 / max(1.0, u_texSize.y));
 
-    float a_n = sample_bilinear_alpha(uv + vec2(0.0, texel.y)).a;
-    float a_s = sample_bilinear_alpha(uv - vec2(0.0, texel.y)).a;
-    float a_e = sample_bilinear_alpha(uv + vec2(texel.x, 0.0)).a;
-    float a_w = sample_bilinear_alpha(uv - vec2(texel.x, 0.0)).a;
-    float a_ne = sample_bilinear_alpha(uv + vec2(texel.x, texel.y)).a;
-    float a_nw = sample_bilinear_alpha(uv + vec2(-texel.x, texel.y)).a;
-    float a_se = sample_bilinear_alpha(uv + vec2(texel.x, -texel.y)).a;
-    float a_sw = sample_bilinear_alpha(uv + vec2(-texel.x, -texel.y)).a;
-    float a_n2 = sample_bilinear_alpha(uv + vec2(0.0, texel.y * 2.0)).a;
-    float a_s2 = sample_bilinear_alpha(uv - vec2(0.0, texel.y * 2.0)).a;
-    float a_e2 = sample_bilinear_alpha(uv + vec2(texel.x * 2.0, 0.0)).a;
-    float a_w2 = sample_bilinear_alpha(uv - vec2(texel.x * 2.0, 0.0)).a;
-    float a_ne2 = sample_bilinear_alpha(uv + vec2(texel.x * 2.0, texel.y * 2.0)).a;
-    float a_nw2 = sample_bilinear_alpha(uv + vec2(-texel.x * 2.0, texel.y * 2.0)).a;
-    float a_se2 = sample_bilinear_alpha(uv + vec2(texel.x * 2.0, -texel.y * 2.0)).a;
-    float a_sw2 = sample_bilinear_alpha(uv + vec2(-texel.x * 2.0, -texel.y * 2.0)).a;
+    vec4 s_n = sample_bilinear_alpha(uv + vec2(0.0, texel.y));
+    vec4 s_s = sample_bilinear_alpha(uv - vec2(0.0, texel.y));
+    vec4 s_e = sample_bilinear_alpha(uv + vec2(texel.x, 0.0));
+    vec4 s_w = sample_bilinear_alpha(uv - vec2(texel.x, 0.0));
+    vec4 s_ne = sample_bilinear_alpha(uv + vec2(texel.x, texel.y));
+    vec4 s_nw = sample_bilinear_alpha(uv + vec2(-texel.x, texel.y));
+    vec4 s_se = sample_bilinear_alpha(uv + vec2(texel.x, -texel.y));
+    vec4 s_sw = sample_bilinear_alpha(uv + vec2(-texel.x, -texel.y));
+    vec4 s_n2 = sample_bilinear_alpha(uv + vec2(0.0, texel.y * 2.0));
+    vec4 s_s2 = sample_bilinear_alpha(uv - vec2(0.0, texel.y * 2.0));
+    vec4 s_e2 = sample_bilinear_alpha(uv + vec2(texel.x * 2.0, 0.0));
+    vec4 s_w2 = sample_bilinear_alpha(uv - vec2(texel.x * 2.0, 0.0));
+    vec4 s_ne2 = sample_bilinear_alpha(uv + vec2(texel.x * 2.0, texel.y * 2.0));
+    vec4 s_nw2 = sample_bilinear_alpha(uv + vec2(-texel.x * 2.0, texel.y * 2.0));
+    vec4 s_se2 = sample_bilinear_alpha(uv + vec2(texel.x * 2.0, -texel.y * 2.0));
+    vec4 s_sw2 = sample_bilinear_alpha(uv + vec2(-texel.x * 2.0, -texel.y * 2.0));
+
+    float a_n = s_n.a;
+    float a_s = s_s.a;
+    float a_e = s_e.a;
+    float a_w = s_w.a;
+    float a_ne = s_ne.a;
+    float a_nw = s_nw.a;
+    float a_se = s_se.a;
+    float a_sw = s_sw.a;
+    float a_n2 = s_n2.a;
+    float a_s2 = s_s2.a;
+    float a_e2 = s_e2.a;
+    float a_w2 = s_w2.a;
+    float a_ne2 = s_ne2.a;
+    float a_nw2 = s_nw2.a;
+    float a_se2 = s_se2.a;
+    float a_sw2 = s_sw2.a;
 
     // 3x3 blur keeps detail while softening stair-step corners.
     float blur1 = a0 * 0.40
@@ -415,8 +436,16 @@ void main() {
     float a_soft = mix(a0, smooth_target, strength * edge_factor);
     a_soft = clamp(a_soft, 0.0, 1.0);
 
-    vec3 rgb = (a0 > 0.0) ? (center.rgb / a0) : vec3(0.0);
-    vec3 premul = rgb * a_soft;
+    vec3 rgb0 = to_straight(s0);
+    vec3 rgb_blur1 = rgb0 * 0.40
+                   + (to_straight(s_n) + to_straight(s_s) + to_straight(s_e) + to_straight(s_w)) * 0.10
+                   + (to_straight(s_ne) + to_straight(s_nw) + to_straight(s_se) + to_straight(s_sw)) * 0.05;
+    vec3 rgb_blur2 = rgb_blur1 * 0.70
+                   + (to_straight(s_n2) + to_straight(s_s2) + to_straight(s_e2) + to_straight(s_w2)) * 0.05
+                   + (to_straight(s_ne2) + to_straight(s_nw2) + to_straight(s_se2) + to_straight(s_sw2)) * 0.025;
+    vec3 rgb_target = mix(rgb_blur1, rgb_blur2, strength);
+    vec3 rgb_soft = mix(rgb0, rgb_target, strength * edge_factor);
+    vec3 premul = rgb_soft * a_soft;
     gl_FragColor = vec4(premul, a_soft) * gl_Color;
 }
 """
@@ -448,32 +477,57 @@ vec4 sample_bilinear_alpha(vec2 uv) {
     return vec4(premul, a);
 }
 
+vec3 to_straight(vec4 sample) {
+    return (sample.a > 0.0) ? (sample.rgb / sample.a) : vec3(0.0);
+}
+
 void main() {
     vec2 uv = gl_TexCoord[0].st;
-    vec4 center = sample_bilinear_alpha(uv);
-    float a0 = center.a;
+    vec4 s0 = sample_bilinear_alpha(uv);
+    float a0 = s0.a;
     vec2 texel = vec2(1.0 / max(1.0, u_texSize.x), 1.0 / max(1.0, u_texSize.y));
 
-    float a_n = sample_bilinear_alpha(uv + vec2(0.0, texel.y)).a;
-    float a_s = sample_bilinear_alpha(uv - vec2(0.0, texel.y)).a;
-    float a_e = sample_bilinear_alpha(uv + vec2(texel.x, 0.0)).a;
-    float a_w = sample_bilinear_alpha(uv - vec2(texel.x, 0.0)).a;
-    float a_ne = sample_bilinear_alpha(uv + vec2(texel.x, texel.y)).a;
-    float a_nw = sample_bilinear_alpha(uv + vec2(-texel.x, texel.y)).a;
-    float a_se = sample_bilinear_alpha(uv + vec2(texel.x, -texel.y)).a;
-    float a_sw = sample_bilinear_alpha(uv + vec2(-texel.x, -texel.y)).a;
-    float a_n2 = sample_bilinear_alpha(uv + vec2(0.0, texel.y * 2.0)).a;
-    float a_s2 = sample_bilinear_alpha(uv - vec2(0.0, texel.y * 2.0)).a;
-    float a_e2 = sample_bilinear_alpha(uv + vec2(texel.x * 2.0, 0.0)).a;
-    float a_w2 = sample_bilinear_alpha(uv - vec2(texel.x * 2.0, 0.0)).a;
-    float a_ne2 = sample_bilinear_alpha(uv + vec2(texel.x * 2.0, texel.y * 2.0)).a;
-    float a_nw2 = sample_bilinear_alpha(uv + vec2(-texel.x * 2.0, texel.y * 2.0)).a;
-    float a_se2 = sample_bilinear_alpha(uv + vec2(texel.x * 2.0, -texel.y * 2.0)).a;
-    float a_sw2 = sample_bilinear_alpha(uv + vec2(-texel.x * 2.0, -texel.y * 2.0)).a;
-    float a_n3 = sample_bilinear_alpha(uv + vec2(0.0, texel.y * 3.0)).a;
-    float a_s3 = sample_bilinear_alpha(uv - vec2(0.0, texel.y * 3.0)).a;
-    float a_e3 = sample_bilinear_alpha(uv + vec2(texel.x * 3.0, 0.0)).a;
-    float a_w3 = sample_bilinear_alpha(uv - vec2(texel.x * 3.0, 0.0)).a;
+    vec4 s_n = sample_bilinear_alpha(uv + vec2(0.0, texel.y));
+    vec4 s_s = sample_bilinear_alpha(uv - vec2(0.0, texel.y));
+    vec4 s_e = sample_bilinear_alpha(uv + vec2(texel.x, 0.0));
+    vec4 s_w = sample_bilinear_alpha(uv - vec2(texel.x, 0.0));
+    vec4 s_ne = sample_bilinear_alpha(uv + vec2(texel.x, texel.y));
+    vec4 s_nw = sample_bilinear_alpha(uv + vec2(-texel.x, texel.y));
+    vec4 s_se = sample_bilinear_alpha(uv + vec2(texel.x, -texel.y));
+    vec4 s_sw = sample_bilinear_alpha(uv + vec2(-texel.x, -texel.y));
+    vec4 s_n2 = sample_bilinear_alpha(uv + vec2(0.0, texel.y * 2.0));
+    vec4 s_s2 = sample_bilinear_alpha(uv - vec2(0.0, texel.y * 2.0));
+    vec4 s_e2 = sample_bilinear_alpha(uv + vec2(texel.x * 2.0, 0.0));
+    vec4 s_w2 = sample_bilinear_alpha(uv - vec2(texel.x * 2.0, 0.0));
+    vec4 s_ne2 = sample_bilinear_alpha(uv + vec2(texel.x * 2.0, texel.y * 2.0));
+    vec4 s_nw2 = sample_bilinear_alpha(uv + vec2(-texel.x * 2.0, texel.y * 2.0));
+    vec4 s_se2 = sample_bilinear_alpha(uv + vec2(texel.x * 2.0, -texel.y * 2.0));
+    vec4 s_sw2 = sample_bilinear_alpha(uv + vec2(-texel.x * 2.0, -texel.y * 2.0));
+    vec4 s_n3 = sample_bilinear_alpha(uv + vec2(0.0, texel.y * 3.0));
+    vec4 s_s3 = sample_bilinear_alpha(uv - vec2(0.0, texel.y * 3.0));
+    vec4 s_e3 = sample_bilinear_alpha(uv + vec2(texel.x * 3.0, 0.0));
+    vec4 s_w3 = sample_bilinear_alpha(uv - vec2(texel.x * 3.0, 0.0));
+
+    float a_n = s_n.a;
+    float a_s = s_s.a;
+    float a_e = s_e.a;
+    float a_w = s_w.a;
+    float a_ne = s_ne.a;
+    float a_nw = s_nw.a;
+    float a_se = s_se.a;
+    float a_sw = s_sw.a;
+    float a_n2 = s_n2.a;
+    float a_s2 = s_s2.a;
+    float a_e2 = s_e2.a;
+    float a_w2 = s_w2.a;
+    float a_ne2 = s_ne2.a;
+    float a_nw2 = s_nw2.a;
+    float a_se2 = s_se2.a;
+    float a_sw2 = s_sw2.a;
+    float a_n3 = s_n3.a;
+    float a_s3 = s_s3.a;
+    float a_e3 = s_e3.a;
+    float a_w3 = s_w3.a;
 
     float blur1 = a0 * 0.30
                 + (a_n + a_s + a_e + a_w) * 0.10
@@ -493,9 +547,177 @@ void main() {
     float a_soft = mix(a0, smooth_target, strength * edge_factor);
     a_soft = clamp(a_soft, 0.0, 1.0);
 
-    vec3 rgb = (a0 > 0.0) ? (center.rgb / a0) : vec3(0.0);
-    vec3 premul = rgb * a_soft;
+    vec3 rgb0 = to_straight(s0);
+    vec3 rgb_blur1 = rgb0 * 0.30
+                   + (to_straight(s_n) + to_straight(s_s) + to_straight(s_e) + to_straight(s_w)) * 0.10
+                   + (to_straight(s_ne) + to_straight(s_nw) + to_straight(s_se) + to_straight(s_sw)) * 0.05;
+    vec3 rgb_blur2 = rgb_blur1 * 0.65
+                   + (to_straight(s_n2) + to_straight(s_s2) + to_straight(s_e2) + to_straight(s_w2)) * 0.05
+                   + (to_straight(s_ne2) + to_straight(s_nw2) + to_straight(s_se2) + to_straight(s_sw2)) * 0.01875;
+    vec3 rgb_blur3 = rgb_blur2 * 0.75
+                   + (to_straight(s_n3) + to_straight(s_s3) + to_straight(s_e3) + to_straight(s_w3)) * 0.0625;
+    vec3 rgb_target = mix(rgb_blur2, rgb_blur3, strength);
+    vec3 rgb_soft = mix(rgb0, rgb_target, strength * edge_factor);
+    vec3 premul = rgb_soft * a_soft;
     gl_FragColor = vec4(premul, a_soft) * gl_Color;
+}
+"""
+
+_DOF_SMOOTH_MASK_ALPHA_FRAGMENT_SHADER = """
+#version 120
+uniform sampler2D u_overlay;
+uniform sampler2D u_mask;
+uniform vec2 u_overlaySize;
+uniform vec2 u_maskSize;
+uniform float u_strength;
+
+vec4 sample_bilinear_alpha(sampler2D tex, vec2 size, vec2 uv) {
+    vec2 texel = uv * size - 0.5;
+    vec2 base = floor(texel);
+    vec2 f = texel - base;
+    vec2 coord00 = (base + vec2(0.0, 0.0) + 0.5) / size;
+    vec2 coord10 = (base + vec2(1.0, 0.0) + 0.5) / size;
+    vec2 coord01 = (base + vec2(0.0, 1.0) + 0.5) / size;
+    vec2 coord11 = (base + vec2(1.0, 1.0) + 0.5) / size;
+    vec4 c00 = texture2D(tex, coord00);
+    vec4 c10 = texture2D(tex, coord10);
+    vec4 c01 = texture2D(tex, coord01);
+    vec4 c11 = texture2D(tex, coord11);
+    vec4 cx0 = mix(c00, c10, f.x);
+    vec4 cx1 = mix(c01, c11, f.x);
+    vec4 sample = mix(cx0, cx1, f.y);
+    float a = sample.a;
+    vec3 rgb = (a > 0.0) ? (sample.rgb / a) : vec3(0.0);
+    vec3 premul = rgb * a;
+    return vec4(premul, a);
+}
+
+float smooth_mask_alpha(vec2 uv) {
+    float a0 = sample_bilinear_alpha(u_mask, u_maskSize, uv).a;
+    vec2 texel = vec2(1.0 / max(1.0, u_maskSize.x), 1.0 / max(1.0, u_maskSize.y));
+
+    float a_n = sample_bilinear_alpha(u_mask, u_maskSize, uv + vec2(0.0, texel.y)).a;
+    float a_s = sample_bilinear_alpha(u_mask, u_maskSize, uv - vec2(0.0, texel.y)).a;
+    float a_e = sample_bilinear_alpha(u_mask, u_maskSize, uv + vec2(texel.x, 0.0)).a;
+    float a_w = sample_bilinear_alpha(u_mask, u_maskSize, uv - vec2(texel.x, 0.0)).a;
+    float a_ne = sample_bilinear_alpha(u_mask, u_maskSize, uv + vec2(texel.x, texel.y)).a;
+    float a_nw = sample_bilinear_alpha(u_mask, u_maskSize, uv + vec2(-texel.x, texel.y)).a;
+    float a_se = sample_bilinear_alpha(u_mask, u_maskSize, uv + vec2(texel.x, -texel.y)).a;
+    float a_sw = sample_bilinear_alpha(u_mask, u_maskSize, uv + vec2(-texel.x, -texel.y)).a;
+    float a_n2 = sample_bilinear_alpha(u_mask, u_maskSize, uv + vec2(0.0, texel.y * 2.0)).a;
+    float a_s2 = sample_bilinear_alpha(u_mask, u_maskSize, uv - vec2(0.0, texel.y * 2.0)).a;
+    float a_e2 = sample_bilinear_alpha(u_mask, u_maskSize, uv + vec2(texel.x * 2.0, 0.0)).a;
+    float a_w2 = sample_bilinear_alpha(u_mask, u_maskSize, uv - vec2(texel.x * 2.0, 0.0)).a;
+    float a_ne2 = sample_bilinear_alpha(u_mask, u_maskSize, uv + vec2(texel.x * 2.0, texel.y * 2.0)).a;
+    float a_nw2 = sample_bilinear_alpha(u_mask, u_maskSize, uv + vec2(-texel.x * 2.0, texel.y * 2.0)).a;
+    float a_se2 = sample_bilinear_alpha(u_mask, u_maskSize, uv + vec2(texel.x * 2.0, -texel.y * 2.0)).a;
+    float a_sw2 = sample_bilinear_alpha(u_mask, u_maskSize, uv + vec2(-texel.x * 2.0, -texel.y * 2.0)).a;
+
+    float blur1 = a0 * 0.40
+                + (a_n + a_s + a_e + a_w) * 0.10
+                + (a_ne + a_nw + a_se + a_sw) * 0.05;
+    float blur2 = blur1 * 0.70
+                + (a_n2 + a_s2 + a_e2 + a_w2) * 0.05
+                + (a_ne2 + a_nw2 + a_se2 + a_sw2) * 0.025;
+
+    float a_min = min(a0, min(min(min(a_n, a_s), min(a_e, a_w)), min(min(a_ne, a_nw), min(a_se, a_sw))));
+    float a_max = max(a0, max(max(max(a_n, a_s), max(a_e, a_w)), max(max(a_ne, a_nw), max(a_se, a_sw))));
+    float contrast = a_max - a_min;
+    float edge_factor = smoothstep(0.03, 0.40, contrast);
+    float strength = clamp(u_strength, 0.0, 1.0);
+    float smooth_target = mix(blur1, blur2, strength);
+    float a_soft = mix(a0, smooth_target, strength * edge_factor);
+    return clamp(a_soft, 0.0, 1.0);
+}
+
+void main() {
+    vec4 overlay = sample_bilinear_alpha(u_overlay, u_overlaySize, gl_TexCoord[0].st);
+    float mask_a = smooth_mask_alpha(gl_TexCoord[1].st);
+    vec3 rgb = overlay.rgb * gl_Color.rgb * mask_a;
+    float out_alpha = clamp(overlay.a * mask_a, 0.0, 1.0);
+    gl_FragColor = vec4(rgb, out_alpha);
+}
+"""
+
+_DOF_SMOOTH_MASK_ALPHA_STRONG_FRAGMENT_SHADER = """
+#version 120
+uniform sampler2D u_overlay;
+uniform sampler2D u_mask;
+uniform vec2 u_overlaySize;
+uniform vec2 u_maskSize;
+uniform float u_strength;
+
+vec4 sample_bilinear_alpha(sampler2D tex, vec2 size, vec2 uv) {
+    vec2 texel = uv * size - 0.5;
+    vec2 base = floor(texel);
+    vec2 f = texel - base;
+    vec2 coord00 = (base + vec2(0.0, 0.0) + 0.5) / size;
+    vec2 coord10 = (base + vec2(1.0, 0.0) + 0.5) / size;
+    vec2 coord01 = (base + vec2(0.0, 1.0) + 0.5) / size;
+    vec2 coord11 = (base + vec2(1.0, 1.0) + 0.5) / size;
+    vec4 c00 = texture2D(tex, coord00);
+    vec4 c10 = texture2D(tex, coord10);
+    vec4 c01 = texture2D(tex, coord01);
+    vec4 c11 = texture2D(tex, coord11);
+    vec4 cx0 = mix(c00, c10, f.x);
+    vec4 cx1 = mix(c01, c11, f.x);
+    vec4 sample = mix(cx0, cx1, f.y);
+    float a = sample.a;
+    vec3 rgb = (a > 0.0) ? (sample.rgb / a) : vec3(0.0);
+    vec3 premul = rgb * a;
+    return vec4(premul, a);
+}
+
+float smooth_mask_alpha(vec2 uv) {
+    float a0 = sample_bilinear_alpha(u_mask, u_maskSize, uv).a;
+    vec2 texel = vec2(1.0 / max(1.0, u_maskSize.x), 1.0 / max(1.0, u_maskSize.y));
+
+    float a_n = sample_bilinear_alpha(u_mask, u_maskSize, uv + vec2(0.0, texel.y)).a;
+    float a_s = sample_bilinear_alpha(u_mask, u_maskSize, uv - vec2(0.0, texel.y)).a;
+    float a_e = sample_bilinear_alpha(u_mask, u_maskSize, uv + vec2(texel.x, 0.0)).a;
+    float a_w = sample_bilinear_alpha(u_mask, u_maskSize, uv - vec2(texel.x, 0.0)).a;
+    float a_ne = sample_bilinear_alpha(u_mask, u_maskSize, uv + vec2(texel.x, texel.y)).a;
+    float a_nw = sample_bilinear_alpha(u_mask, u_maskSize, uv + vec2(-texel.x, texel.y)).a;
+    float a_se = sample_bilinear_alpha(u_mask, u_maskSize, uv + vec2(texel.x, -texel.y)).a;
+    float a_sw = sample_bilinear_alpha(u_mask, u_maskSize, uv + vec2(-texel.x, -texel.y)).a;
+    float a_n2 = sample_bilinear_alpha(u_mask, u_maskSize, uv + vec2(0.0, texel.y * 2.0)).a;
+    float a_s2 = sample_bilinear_alpha(u_mask, u_maskSize, uv - vec2(0.0, texel.y * 2.0)).a;
+    float a_e2 = sample_bilinear_alpha(u_mask, u_maskSize, uv + vec2(texel.x * 2.0, 0.0)).a;
+    float a_w2 = sample_bilinear_alpha(u_mask, u_maskSize, uv - vec2(texel.x * 2.0, 0.0)).a;
+    float a_ne2 = sample_bilinear_alpha(u_mask, u_maskSize, uv + vec2(texel.x * 2.0, texel.y * 2.0)).a;
+    float a_nw2 = sample_bilinear_alpha(u_mask, u_maskSize, uv + vec2(-texel.x * 2.0, texel.y * 2.0)).a;
+    float a_se2 = sample_bilinear_alpha(u_mask, u_maskSize, uv + vec2(texel.x * 2.0, -texel.y * 2.0)).a;
+    float a_sw2 = sample_bilinear_alpha(u_mask, u_maskSize, uv + vec2(-texel.x * 2.0, -texel.y * 2.0)).a;
+    float a_n3 = sample_bilinear_alpha(u_mask, u_maskSize, uv + vec2(0.0, texel.y * 3.0)).a;
+    float a_s3 = sample_bilinear_alpha(u_mask, u_maskSize, uv - vec2(0.0, texel.y * 3.0)).a;
+    float a_e3 = sample_bilinear_alpha(u_mask, u_maskSize, uv + vec2(texel.x * 3.0, 0.0)).a;
+    float a_w3 = sample_bilinear_alpha(u_mask, u_maskSize, uv - vec2(texel.x * 3.0, 0.0)).a;
+
+    float blur1 = a0 * 0.30
+                + (a_n + a_s + a_e + a_w) * 0.10
+                + (a_ne + a_nw + a_se + a_sw) * 0.05;
+    float blur2 = blur1 * 0.65
+                + (a_n2 + a_s2 + a_e2 + a_w2) * 0.05
+                + (a_ne2 + a_nw2 + a_se2 + a_sw2) * 0.01875;
+    float blur3 = blur2 * 0.75
+                + (a_n3 + a_s3 + a_e3 + a_w3) * 0.0625;
+
+    float a_min = min(a0, min(min(min(a_n, a_s), min(a_e, a_w)), min(min(a_ne, a_nw), min(a_se, a_sw))));
+    float a_max = max(a0, max(max(max(a_n, a_s), max(a_e, a_w)), max(max(a_ne, a_nw), max(a_se, a_sw))));
+    float contrast = a_max - a_min;
+    float edge_factor = smoothstep(0.02, 0.30, contrast);
+    float strength = clamp(u_strength, 0.0, 1.0);
+    float smooth_target = mix(blur2, blur3, strength);
+    float a_soft = mix(a0, smooth_target, strength * edge_factor);
+    return clamp(a_soft, 0.0, 1.0);
+}
+
+void main() {
+    vec4 overlay = sample_bilinear_alpha(u_overlay, u_overlaySize, gl_TexCoord[0].st);
+    float mask_a = smooth_mask_alpha(gl_TexCoord[1].st);
+    vec3 rgb = overlay.rgb * gl_Color.rgb * mask_a;
+    float out_alpha = clamp(overlay.a * mask_a, 0.0, 1.0);
+    gl_FragColor = vec4(rgb, out_alpha);
 }
 """
 
@@ -867,6 +1089,7 @@ class BlendMode:
     INHERIT = 5
     MULTIPLY = 6
     SCREEN = 7
+    STRAIGHT_ALPHA = 8
 
 
 def set_blend_mode(blend_mode: int):
@@ -892,6 +1115,8 @@ def set_blend_mode(blend_mode: int):
         glBlendFunc(GL_DST_COLOR, GL_ONE)
     elif blend_mode == BlendMode.SCREEN:
         glBlendFunc(GL_DST_COLOR, GL_ONE_MINUS_SRC_ALPHA)
+    elif blend_mode == BlendMode.STRAIGHT_ALPHA:
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
     elif blend_mode == BlendMode.INHERIT:
         return
     else:
@@ -992,6 +1217,7 @@ class SpriteRenderer:
         self.dof_alpha_smoothing_enabled: bool = False
         self.dof_alpha_smoothing_strength: float = 0.5
         self.dof_alpha_smoothing_mode: str = "normal"
+        self.dof_sprite_shader_mode: str = "auto"
         self._texture_filter_cache: Dict[int, str] = {}
         self._texture_mipmap_cache: Set[int] = set()
         self._anisotropy_supported: Optional[bool] = None
@@ -1072,6 +1298,50 @@ class SpriteRenderer:
             normalized = "normal"
         self.dof_alpha_smoothing_mode = normalized
         return self.dof_alpha_smoothing_mode
+
+    def set_dof_sprite_shader_mode(self, mode: Optional[str]) -> str:
+        normalized = (mode or "").strip().lower()
+        if normalized not in {
+            "auto",
+            "anim2d",
+            "dawnoffire_unlit",
+            "sprites_default",
+            "unlit_transparent",
+            "unlit_transparent_masked",
+        }:
+            normalized = "auto"
+        self.dof_sprite_shader_mode = normalized
+        return self.dof_sprite_shader_mode
+
+    def _resolve_effective_shader_name(
+        self,
+        state: Optional[Dict[str, Any]],
+        atlases: Optional[List[TextureAtlas]],
+        default_shader_name: Optional[str] = None,
+    ) -> Optional[str]:
+        shader_name = default_shader_name
+        if shader_name is None and state:
+            shader_name = state.get("shader")
+
+        mode = self.dof_sprite_shader_mode
+        if mode == "auto" or not state or not atlases:
+            return shader_name
+
+        sprite_name = state.get("sprite_name")
+        if not sprite_name:
+            return shader_name
+        _, atlas, _ = self._find_sprite_in_atlases(sprite_name, atlases)
+        if not atlas or getattr(atlas, "pivot_mode", None) != "dof":
+            return shader_name
+
+        forced_shader = {
+            "anim2d": "Anim2D/Normal+Alpha",
+            "dawnoffire_unlit": "DawnOfFire/UnlitShader",
+            "sprites_default": "Sprites/Default",
+            "unlit_transparent": "Unlit/Transparent",
+            "unlit_transparent_masked": "Unlit/Transparent Masked",
+        }.get(mode)
+        return forced_shader or shader_name
 
     def _resolve_anisotropy_support(self) -> None:
         if self._anisotropy_supported is not None:
@@ -1210,6 +1480,10 @@ class SpriteRenderer:
             program = self._compile_filter_program(_DOF_SMOOTH_ALPHA_FRAGMENT_SHADER)
         elif mode == "dof_smooth_alpha_strong":
             program = self._compile_filter_program(_DOF_SMOOTH_ALPHA_STRONG_FRAGMENT_SHADER)
+        elif mode == "dof_smooth_alpha_mask":
+            program = self._compile_filter_program(_DOF_SMOOTH_MASK_ALPHA_FRAGMENT_SHADER)
+        elif mode == "dof_smooth_alpha_strong_mask":
+            program = self._compile_filter_program(_DOF_SMOOTH_MASK_ALPHA_STRONG_FRAGMENT_SHADER)
         elif mode == "bicubic_mask":
             program = self._compile_filter_program(_BICUBIC_MASK_FRAGMENT_SHADER)
         elif mode == "bicubic_mask_alpha":
@@ -1278,7 +1552,12 @@ class SpriteRenderer:
         mask_size: Tuple[int, int],
         alpha_aware: bool = False,
     ) -> bool:
-        key = f"{mode}_mask_alpha" if alpha_aware else f"{mode}_mask"
+        if mode == "dof_smooth_alpha":
+            key = "dof_smooth_alpha_mask"
+        elif mode == "dof_smooth_alpha_strong":
+            key = "dof_smooth_alpha_strong_mask"
+        else:
+            key = f"{mode}_mask_alpha" if alpha_aware else f"{mode}_mask"
         program = self._get_filter_program(key)
         if not program:
             return False
@@ -1300,7 +1579,12 @@ class SpriteRenderer:
             glUniform2f(loc_mask_size, max(1.0, float(mw)), max(1.0, float(mh)))
         loc_strength = uniforms.get("strength", -1)
         if loc_strength is not None and loc_strength >= 0:
-            glUniform1f(loc_strength, float(self.texture_filter_strength))
+            strength_value = (
+                float(self.dof_alpha_smoothing_strength)
+                if mode in {"dof_smooth_alpha", "dof_smooth_alpha_strong"}
+                else float(self.texture_filter_strength)
+            )
+            glUniform1f(loc_strength, strength_value)
         return True
 
     def _stop_filter_program(self) -> None:
@@ -2142,7 +2426,12 @@ class SpriteRenderer:
             layer_offsets: User-applied offsets for interactive dragging
         """
         if self.fast_preview_enabled:
-            set_blend_mode(layer.blend_mode)
+            shader_name = self._resolve_effective_shader_name(world_state, atlases)
+            shader_preset = self._get_shader_preset(shader_name)
+            blend_override = self._blend_value_from_preset(shader_preset)
+            effective_blend = self._resolve_effective_layer_blend(layer.blend_mode, blend_override)
+            premultiply_color = effective_blend != BlendMode.STRAIGHT_ALPHA
+            set_blend_mode(effective_blend)
             glPushMatrix()
             offset_x, offset_y = layer_offsets.get(layer.layer_id, (0, 0))
             if offset_x != 0 or offset_y != 0:
@@ -2161,6 +2450,8 @@ class SpriteRenderer:
                 layer,
                 render=True,
                 shader_behavior=None,
+                shader_name_override=shader_name,
+                premultiply_color=premultiply_color,
             )
             glPopMatrix()
             reset_blend_mode()
@@ -2172,7 +2463,7 @@ class SpriteRenderer:
             self._render_mask_source_layer(layer, world_state, atlases, layer_offsets, mask_key)
             return
 
-        shader_name = world_state.get('shader')
+        shader_name = self._resolve_effective_shader_name(world_state, atlases)
         shader_preset = self._get_shader_preset(shader_name)
         shader_behavior = self._get_shader_behavior(shader_name)
         blend_override = self._blend_value_from_preset(shader_preset)
@@ -2186,6 +2477,7 @@ class SpriteRenderer:
         # - 0: Normal (premultiplied alpha)
         # - 1: Additive (for glows - adds light without darkening)
         effective_blend = self._resolve_effective_layer_blend(layer.blend_mode, blend_override)
+        premultiply_color = effective_blend != BlendMode.STRAIGHT_ALPHA
         set_blend_mode(effective_blend)
         
         glPushMatrix()
@@ -2218,6 +2510,8 @@ class SpriteRenderer:
             layer,
             render=not (shader_behavior and shader_behavior.replace_base_sprite),
             shader_behavior=shader_behavior,
+            shader_name_override=shader_name,
+            premultiply_color=premultiply_color,
         )
         if shader_behavior and draw_info:
             self._render_shader_overlay(draw_info, shader_behavior, shader_preset)
@@ -2236,7 +2530,9 @@ class SpriteRenderer:
         atlases: List[TextureAtlas],
         layer: LayerData = None,
         render: bool = True,
-        shader_behavior: Optional[ShaderBehavior] = None
+        shader_behavior: Optional[ShaderBehavior] = None,
+        shader_name_override: Optional[str] = None,
+        premultiply_color: bool = True,
     ) -> Optional[SpriteDrawInfo]:
         """
         Render just the sprite at origin (transforms already applied)
@@ -2260,26 +2556,39 @@ class SpriteRenderer:
         if not sprite or not atlas or not atlas.texture_id:
             return None
         
-        # Apply opacity and color with premultiplied alpha
-        # Since we're using glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA),
-        # the color values need to be premultiplied by alpha
-        r = state['r'] / 255.0 * opacity
-        g = state['g'] / 255.0 * opacity
-        b = state['b'] / 255.0 * opacity
-        preset = self._get_shader_preset(state.get('shader'))
+        # Apply opacity and color.
+        # Most viewer paths use premultiplied alpha blending; STRAIGHT_ALPHA mode keeps
+        # RGB un-premultiplied so shader experiments can match Unity-style alpha blend.
+        base_r = state['r'] / 255.0
+        base_g = state['g'] / 255.0
+        base_b = state['b'] / 255.0
+        effective_shader_name = self._resolve_effective_shader_name(
+            state,
+            atlases,
+            default_shader_name=shader_name_override,
+        )
+        preset = self._get_shader_preset(effective_shader_name)
         if preset:
-            r = min(1.0, r * preset.color_scale[0])
-            g = min(1.0, g * preset.color_scale[1])
-            b = min(1.0, b * preset.color_scale[2])
+            base_r = min(1.0, base_r * preset.color_scale[0])
+            base_g = min(1.0, base_g * preset.color_scale[1])
+            base_b = min(1.0, base_b * preset.color_scale[2])
             opacity = max(0.0, min(1.0, opacity * preset.alpha_scale))
         if shader_behavior:
             wave = shader_behavior.color_wave_multiplier(self.current_time)
             if wave:
-                r = max(0.0, min(1.0, r * wave[0]))
-                g = max(0.0, min(1.0, g * wave[1]))
-                b = max(0.0, min(1.0, b * wave[2]))
+                base_r = max(0.0, min(1.0, base_r * wave[0]))
+                base_g = max(0.0, min(1.0, base_g * wave[1]))
+                base_b = max(0.0, min(1.0, base_b * wave[2]))
                 if wave[3] != 1.0:
                     opacity = max(0.0, min(1.0, opacity * wave[3]))
+        if premultiply_color:
+            r = base_r * opacity
+            g = base_g * opacity
+            b = base_b * opacity
+        else:
+            r = base_r
+            g = base_g
+            b = base_b
         glColor4f(r, g, b, opacity)
         
         # Bind texture
@@ -2603,6 +2912,21 @@ class SpriteRenderer:
         lowered = shader_name.strip().lower()
         if not lowered:
             return None
+        if "transparent masked" in lowered:
+            return {
+                "display_name": shader_name,
+                "blend_override": "STRAIGHT_ALPHA",
+                "color_scale": [1.0, 1.0, 1.0],
+                "alpha_scale": 1.0,
+                "metadata": {
+                    "mask_source": "base",
+                    "use_base_alpha_mask": True,
+                },
+                "notes": (
+                    "Unity transparent masked sprite approximation "
+                    "(straight alpha + base alpha mask)."
+                ),
+            }
         blend_override: Optional[str] = None
         if "additive" in lowered or "/add" in lowered or " add" in lowered:
             blend_override = "ADDITIVE"
@@ -2640,6 +2964,7 @@ class SpriteRenderer:
             "PREMULT_ALPHA": BlendMode.PREMULT_ALPHA,
             "PREMULT_ALPHA_ALT": BlendMode.PREMULT_ALPHA_ALT,
             "PREMULT_ALPHA_ALT2": BlendMode.PREMULT_ALPHA_ALT2,
+            "STRAIGHT_ALPHA": BlendMode.STRAIGHT_ALPHA,
             "ADDITIVE": BlendMode.ADDITIVE,
             "MULTIPLY": BlendMode.MULTIPLY,
             "SCREEN": BlendMode.SCREEN,
@@ -2827,8 +3152,15 @@ class SpriteRenderer:
             if mask_uv_mode in ("overlay", "sequence", "shader"):
                 mask_uvs = list(transformed_uvs)
 
-        shader_mode = self.texture_filter_mode if self.texture_filter_mode in ("bicubic", "lanczos") else None
         alpha_aware = bool(getattr(draw_info.atlas, "pivot_mode", None) == "dof")
+        if alpha_aware and self.dof_alpha_smoothing_enabled:
+            shader_mode = (
+                "dof_smooth_alpha_strong"
+                if self.dof_alpha_smoothing_mode == "strong"
+                else "dof_smooth_alpha"
+            )
+        else:
+            shader_mode = self.texture_filter_mode if self.texture_filter_mode in ("bicubic", "lanczos") else None
         stencil_active = self._apply_overlay_stencil(draw_info)
         try:
             glColor4f(*draw_info.color)
