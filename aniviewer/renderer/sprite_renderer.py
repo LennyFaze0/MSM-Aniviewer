@@ -1306,8 +1306,8 @@ class SpriteRenderer:
         self.mask_stencil_alpha_threshold: float = 0.06
         # Small prefilter radius (in texel units) for alpha->stencil conversion.
         self.mask_stencil_alpha_softness: float = 0.45
-        # Temporary mask diagnostics. Defaults to tracing GJLM to keep output bounded.
-        debug_flag = os.environ.get("ANIVIEWER_MASK_DEBUG", "1").strip().lower()
+        # Temporary mask diagnostics (off by default).
+        debug_flag = os.environ.get("ANIVIEWER_MASK_DEBUG", "0").strip().lower()
         self.mask_debug_enabled: bool = debug_flag not in {"0", "false", "off", "no"}
         self.mask_debug_target: str = (
             os.environ.get("ANIVIEWER_MASK_DEBUG_TARGET", "monster_gjlm").strip().lower()

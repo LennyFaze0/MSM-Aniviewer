@@ -8975,7 +8975,7 @@ class MSMAnimationViewer(QMainWindow):
             self._stop_hang_watchdog()
 
     def _mask_debug_enabled(self) -> bool:
-        raw = os.environ.get("ANIVIEWER_MASK_DEBUG", "1").strip().lower()
+        raw = os.environ.get("ANIVIEWER_MASK_DEBUG", "0").strip().lower()
         return raw not in {"0", "false", "off", "no"}
 
     def _mask_debug_target(self) -> str:
