@@ -34,6 +34,67 @@ void main() {
 }
 """
 
+_ALPHA_STENCIL_FRAGMENT_SHADER = """
+#version 120
+uniform sampler2D u_texture;
+uniform float u_alphaThreshold;
+uniform float u_alphaSoftness;
+uniform vec2 u_texelSize;
+uniform vec2 u_uvMin;
+uniform vec2 u_uvMax;
+
+vec2 clamp_uv(vec2 uv) {
+    return clamp(uv, u_uvMin, u_uvMax);
+}
+
+float alpha_at(vec2 uv) {
+    return texture2D(u_texture, clamp_uv(uv)).a;
+}
+
+void main() {
+    vec2 uv = clamp_uv(gl_TexCoord[0].xy);
+    float alpha = alpha_at(uv);
+    float radius = max(0.0, u_alphaSoftness);
+    if (radius > 0.0) {
+        vec2 o = u_texelSize * radius;
+        float a0 = alpha_at(uv + vec2( o.x, 0.0));
+        float a1 = alpha_at(uv + vec2(-o.x, 0.0));
+        float a2 = alpha_at(uv + vec2(0.0,  o.y));
+        float a3 = alpha_at(uv + vec2(0.0, -o.y));
+        float a4 = alpha_at(uv + vec2( o.x,  o.y));
+        float a5 = alpha_at(uv + vec2( o.x, -o.y));
+        float a6 = alpha_at(uv + vec2(-o.x,  o.y));
+        float a7 = alpha_at(uv + vec2(-o.x, -o.y));
+        float maxA = max(alpha, max(max(max(a0, a1), max(a2, a3)), max(max(a4, a5), max(a6, a7))));
+        float blend = clamp(radius * 2.2, 0.0, 1.0);
+        alpha = mix(alpha, maxA, blend);
+    }
+    if (alpha <= u_alphaThreshold) {
+        discard;
+    }
+    gl_FragColor = vec4(1.0);
+}
+"""
+
+_MASK_CONSUMER_FRAGMENT_SHADER = """
+#version 120
+uniform sampler2D u_texture;
+uniform sampler2D u_maskTexture;
+uniform vec2 u_viewSize;
+void main() {
+    vec4 base = texture2D(u_texture, gl_TexCoord[0].xy) * gl_Color;
+    vec2 uv = gl_FragCoord.xy / max(u_viewSize, vec2(1.0));
+    float mask_alpha = texture2D(u_maskTexture, uv).a;
+    float keep = clamp(1.0 - mask_alpha, 0.0, 1.0);
+    base.rgb *= keep;
+    base.a *= keep;
+    if (base.a <= 0.0001) {
+        discard;
+    }
+    gl_FragColor = base;
+}
+"""
+
 _BICUBIC_FRAGMENT_SHADER = """
 #version 120
 uniform sampler2D u_texture;
@@ -1224,6 +1285,36 @@ class SpriteRenderer:
         self._max_anisotropy: float = 1.0
         self._filter_programs: Dict[str, int] = {}
         self._filter_uniforms: Dict[str, Dict[str, int]] = {}
+        self._alpha_stencil_program: int = 0
+        self._alpha_stencil_uniform_texture: int = -1
+        self._alpha_stencil_uniform_threshold: int = -1
+        self._alpha_stencil_uniform_softness: int = -1
+        self._alpha_stencil_uniform_texel_size: int = -1
+        self._alpha_stencil_uniform_uv_min: int = -1
+        self._alpha_stencil_uniform_uv_max: int = -1
+        self._mask_consumer_program: int = 0
+        self._mask_consumer_uniform_texture: int = -1
+        self._mask_consumer_uniform_mask: int = -1
+        self._mask_consumer_uniform_view_size: int = -1
+        self._mask_fbo: Optional[int] = None
+        self._mask_texture: Optional[int] = None
+        self._mask_size: Tuple[int, int] = (0, 0)
+        self._mask_capture_mode: str = "none"
+        self.viewport_size_hint: Tuple[int, int] = (1, 1)
+        self.framebuffer_binding_hint: int = 0
+        # Ignore ultra-low alpha texels when stamping stencil to reduce AVIF fringe artifacts.
+        self.mask_stencil_alpha_threshold: float = 0.06
+        # Small prefilter radius (in texel units) for alpha->stencil conversion.
+        self.mask_stencil_alpha_softness: float = 0.45
+        # Temporary mask diagnostics. Defaults to tracing GJLM to keep output bounded.
+        debug_flag = os.environ.get("ANIVIEWER_MASK_DEBUG", "1").strip().lower()
+        self.mask_debug_enabled: bool = debug_flag not in {"0", "false", "off", "no"}
+        self.mask_debug_target: str = (
+            os.environ.get("ANIVIEWER_MASK_DEBUG_TARGET", "monster_gjlm").strip().lower()
+        )
+        self._mask_debug_frame_index: int = 0
+        self._mask_debug_draw_order: int = 0
+        self._mask_debug_frame_active: bool = False
         self.fast_preview_enabled: bool = False
 
     def set_fast_preview_enabled(self, enabled: bool) -> None:
@@ -1590,9 +1681,255 @@ class SpriteRenderer:
     def _stop_filter_program(self) -> None:
         glUseProgram(0)
 
+    def _get_alpha_stencil_program(self) -> int:
+        if self._alpha_stencil_program:
+            return self._alpha_stencil_program
+        program = self._compile_filter_program(_ALPHA_STENCIL_FRAGMENT_SHADER)
+        self._alpha_stencil_program = int(program or 0)
+        if self._alpha_stencil_program:
+            self._alpha_stencil_uniform_texture = glGetUniformLocation(
+                self._alpha_stencil_program, "u_texture"
+            )
+            self._alpha_stencil_uniform_threshold = glGetUniformLocation(
+                self._alpha_stencil_program, "u_alphaThreshold"
+            )
+            self._alpha_stencil_uniform_softness = glGetUniformLocation(
+                self._alpha_stencil_program, "u_alphaSoftness"
+            )
+            self._alpha_stencil_uniform_texel_size = glGetUniformLocation(
+                self._alpha_stencil_program, "u_texelSize"
+            )
+            self._alpha_stencil_uniform_uv_min = glGetUniformLocation(
+                self._alpha_stencil_program, "u_uvMin"
+            )
+            self._alpha_stencil_uniform_uv_max = glGetUniformLocation(
+                self._alpha_stencil_program, "u_uvMax"
+            )
+        return self._alpha_stencil_program
+
+    def _use_alpha_stencil_program(
+        self,
+        threshold: float,
+        softness: float = 0.0,
+        texel_size: Tuple[float, float] = (0.0, 0.0),
+        uv_min: Tuple[float, float] = (0.0, 0.0),
+        uv_max: Tuple[float, float] = (1.0, 1.0),
+    ) -> bool:
+        program = self._get_alpha_stencil_program()
+        if not program:
+            return False
+        glUseProgram(program)
+        if self._alpha_stencil_uniform_texture is not None and self._alpha_stencil_uniform_texture >= 0:
+            glUniform1i(self._alpha_stencil_uniform_texture, 0)
+        if self._alpha_stencil_uniform_threshold is not None and self._alpha_stencil_uniform_threshold >= 0:
+            glUniform1f(self._alpha_stencil_uniform_threshold, float(threshold))
+        if self._alpha_stencil_uniform_softness is not None and self._alpha_stencil_uniform_softness >= 0:
+            glUniform1f(self._alpha_stencil_uniform_softness, float(max(0.0, softness)))
+        if self._alpha_stencil_uniform_texel_size is not None and self._alpha_stencil_uniform_texel_size >= 0:
+            glUniform2f(self._alpha_stencil_uniform_texel_size, float(texel_size[0]), float(texel_size[1]))
+        if self._alpha_stencil_uniform_uv_min is not None and self._alpha_stencil_uniform_uv_min >= 0:
+            glUniform2f(self._alpha_stencil_uniform_uv_min, float(uv_min[0]), float(uv_min[1]))
+        if self._alpha_stencil_uniform_uv_max is not None and self._alpha_stencil_uniform_uv_max >= 0:
+            glUniform2f(self._alpha_stencil_uniform_uv_max, float(uv_max[0]), float(uv_max[1]))
+        return True
+
+    def _get_mask_consumer_program(self) -> int:
+        if self._mask_consumer_program:
+            return self._mask_consumer_program
+        program = self._compile_filter_program(_MASK_CONSUMER_FRAGMENT_SHADER)
+        self._mask_consumer_program = int(program or 0)
+        if self._mask_consumer_program:
+            self._mask_consumer_uniform_texture = glGetUniformLocation(
+                self._mask_consumer_program, "u_texture"
+            )
+            self._mask_consumer_uniform_mask = glGetUniformLocation(
+                self._mask_consumer_program, "u_maskTexture"
+            )
+            self._mask_consumer_uniform_view_size = glGetUniformLocation(
+                self._mask_consumer_program, "u_viewSize"
+            )
+        return self._mask_consumer_program
+
+    def _ensure_mask_resources(self, width: int, height: int) -> bool:
+        w = max(1, int(width))
+        h = max(1, int(height))
+        if (
+            self._mask_fbo
+            and self._mask_texture
+            and self._mask_size == (w, h)
+        ):
+            return True
+        self._destroy_mask_resources()
+        try:
+            tex = glGenTextures(1)
+            glBindTexture(GL_TEXTURE_2D, int(tex))
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+            glTexImage2D(
+                GL_TEXTURE_2D,
+                0,
+                GL_RGBA,
+                w,
+                h,
+                0,
+                GL_RGBA,
+                GL_UNSIGNED_BYTE,
+                None,
+            )
+            fbo = glGenFramebuffers(1)
+            glBindFramebuffer(GL_FRAMEBUFFER, int(fbo))
+            glFramebufferTexture2D(
+                GL_FRAMEBUFFER,
+                GL_COLOR_ATTACHMENT0,
+                GL_TEXTURE_2D,
+                int(tex),
+                0,
+            )
+            complete = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE
+            glBindFramebuffer(GL_FRAMEBUFFER, 0)
+            if not complete:
+                try:
+                    glDeleteFramebuffers(1, [int(fbo)])
+                except Exception:
+                    pass
+                try:
+                    glDeleteTextures(1, [int(tex)])
+                except Exception:
+                    pass
+                return False
+            self._mask_fbo = int(fbo)
+            self._mask_texture = int(tex)
+            self._mask_size = (w, h)
+            return True
+        except Exception:
+            self._destroy_mask_resources()
+            return False
+
+    def _destroy_mask_resources(self) -> None:
+        if self._mask_fbo:
+            try:
+                glDeleteFramebuffers(1, [int(self._mask_fbo)])
+            except Exception:
+                pass
+        if self._mask_texture:
+            try:
+                glDeleteTextures(1, [int(self._mask_texture)])
+            except Exception:
+                pass
+        self._mask_fbo = None
+        self._mask_texture = None
+        self._mask_size = (0, 0)
+
+    def _current_viewport(self) -> Tuple[int, int, int, int]:
+        hint_w = max(1, int(self.viewport_size_hint[0] if self.viewport_size_hint else 1))
+        hint_h = max(1, int(self.viewport_size_hint[1] if self.viewport_size_hint else 1))
+        # Prefer explicit renderer hints first; they are set by both live viewport
+        # and export paths and avoid fragile GL_VIEWPORT queries on some drivers.
+        if hint_w > 1 or hint_h > 1:
+            return 0, 0, hint_w, hint_h
+        try:
+            vp = glGetIntegerv(GL_VIEWPORT)
+            if vp is not None and len(vp) >= 4:
+                w = int(vp[2])
+                h = int(vp[3])
+                if w > 0 and h > 0:
+                    return int(vp[0]), int(vp[1]), w, h
+        except Exception:
+            pass
+        return 0, 0, hint_w, hint_h
+
     def reset_layer_masks(self) -> None:
         """Clear any pending layer mask state before a new frame renders."""
         self.pending_mask_key = None
+        self._mask_capture_mode = "none"
+        self._mask_debug_draw_order = 0
+        if self.mask_debug_enabled:
+            self._mask_debug_frame_index += 1
+            self._mask_debug_frame_active = False
+
+    def _next_mask_debug_draw_order(self) -> int:
+        self._mask_debug_draw_order += 1
+        return self._mask_debug_draw_order
+
+    def _mask_debug_matches_target(
+        self,
+        layer: LayerData,
+        world_state: Dict,
+        atlases: List[TextureAtlas],
+    ) -> bool:
+        target = (self.mask_debug_target or "").strip().lower()
+        if not target:
+            return True
+
+        probes: List[str] = []
+        probes.append((layer.name or "").lower())
+        probes.append((getattr(layer, "shader_name", "") or "").lower())
+        probes.append((world_state.get("sprite_name") or "").lower())
+
+        for atlas in atlases or []:
+            source_name = (getattr(atlas, "source_name", "") or "").lower()
+            image_name = os.path.basename(getattr(atlas, "image_path", "") or "").lower()
+            xml_name = os.path.basename(getattr(atlas, "xml_path", "") or "").lower()
+            probes.extend([source_name, image_name, xml_name])
+
+        return any(target in probe for probe in probes if probe)
+
+    def _mask_debug_should_log_layer(
+        self,
+        layer: LayerData,
+        world_state: Dict,
+        atlases: List[TextureAtlas],
+    ) -> bool:
+        if not self.mask_debug_enabled:
+            return False
+        if self._mask_debug_frame_active:
+            return True
+        if self._mask_debug_matches_target(layer, world_state, atlases):
+            self._mask_debug_frame_active = True
+            return True
+        return False
+
+    def _log_mask_debug_layer(
+        self,
+        *,
+        active: bool,
+        draw_order: int,
+        layer: LayerData,
+        world_state: Dict,
+        shader_name: Optional[str],
+        effective_blend: int,
+        mask_role: Optional[str],
+        mask_key: Optional[str],
+        stencil_write: bool,
+        stencil_read: bool,
+        stencil_read_attempted: bool,
+    ) -> None:
+        if not active:
+            return
+
+        layer_name = (layer.name or "").replace("'", "\\'")
+        sprite_name = str(world_state.get("sprite_name") or "-").replace("'", "\\'")
+        shader = (shader_name or "-").replace("'", "\\'")
+        role = mask_role or "-"
+        key = mask_key or "-"
+        print(
+            "[MaskDebug] "
+            f"frame={self._mask_debug_frame_index} "
+            f"time={self.current_time:.4f} "
+            f"order={draw_order} "
+            f"layer='{layer_name}' "
+            f"id={layer.layer_id} "
+            f"sprite='{sprite_name}' "
+            f"shader='{shader}' "
+            f"blend={effective_blend} "
+            f"mask_role={role} "
+            f"mask_key={key} "
+            f"stencil_write={int(bool(stencil_write))} "
+            f"stencil_read_attempted={int(bool(stencil_read_attempted))} "
+            f"stencil_read_active={int(bool(stencil_read))}"
+        )
 
     def _atlas_cache_key(self, atlas: Optional[TextureAtlas]) -> str:
         """Return a stable cache key for atlas-scoped lookups."""
@@ -2425,6 +2762,9 @@ class SpriteRenderer:
             atlases: List of texture atlases to search for sprites
             layer_offsets: User-applied offsets for interactive dragging
         """
+        draw_order = self._next_mask_debug_draw_order()
+        mask_debug_active = self._mask_debug_should_log_layer(layer, world_state, atlases)
+
         if self.fast_preview_enabled:
             shader_name = self._resolve_effective_shader_name(world_state, atlases)
             shader_preset = self._get_shader_preset(shader_name)
@@ -2455,28 +2795,63 @@ class SpriteRenderer:
             )
             glPopMatrix()
             reset_blend_mode()
+            self._log_mask_debug_layer(
+                active=mask_debug_active,
+                draw_order=draw_order,
+                layer=layer,
+                world_state=world_state,
+                shader_name=shader_name,
+                effective_blend=effective_blend,
+                mask_role=getattr(layer, "mask_role", None),
+                mask_key=getattr(layer, "mask_key", None),
+                stencil_write=False,
+                stencil_read=False,
+                stencil_read_attempted=False,
+            )
             return
 
         mask_role = getattr(layer, "mask_role", None)
         mask_key = getattr(layer, "mask_key", None)
-        if mask_role == "mask_source" and mask_key:
-            self._render_mask_source_layer(layer, world_state, atlases, layer_offsets, mask_key)
-            return
-
         shader_name = self._resolve_effective_shader_name(world_state, atlases)
         shader_preset = self._get_shader_preset(shader_name)
         shader_behavior = self._get_shader_behavior(shader_name)
         blend_override = self._blend_value_from_preset(shader_preset)
-        stencil_mask_active = False
+        effective_blend = self._resolve_effective_layer_blend(layer.blend_mode, blend_override)
+
+        if mask_role in {"mask_source", "mask_source_visible"} and mask_key:
+            mask_written = self._render_mask_source_layer(
+                layer,
+                world_state,
+                atlases,
+                layer_offsets,
+                mask_key,
+                render_visible=(mask_role == "mask_source_visible"),
+            )
+            self._log_mask_debug_layer(
+                active=mask_debug_active,
+                draw_order=draw_order,
+                layer=layer,
+                world_state=world_state,
+                shader_name=shader_name,
+                effective_blend=effective_blend,
+                mask_role=mask_role,
+                mask_key=mask_key,
+                stencil_write=mask_written,
+                stencil_read=False,
+                stencil_read_attempted=False,
+            )
+            return
+
+        mask_consumer_mode = "none"
+        stencil_read_attempted = bool(mask_role == "mask_consumer" and mask_key)
         if mask_role == "mask_consumer" and mask_key:
-            stencil_mask_active = self._activate_mask_consumer(mask_key)
+            mask_consumer_mode = self._activate_mask_consumer(mask_key)
 
         # Apply blend mode for this layer
         # The blend mode determines how this layer's pixels combine with the background
         # Common modes:
         # - 0: Normal (premultiplied alpha)
         # - 1: Additive (for glows - adds light without darkening)
-        effective_blend = self._resolve_effective_layer_blend(layer.blend_mode, blend_override)
         premultiply_color = effective_blend != BlendMode.STRAIGHT_ALPHA
         set_blend_mode(effective_blend)
         
@@ -2503,25 +2878,52 @@ class SpriteRenderer:
         glMultMatrixf(matrix)
         
         # Render sprite - NO texture flipping needed, matrix handles mirroring!
-        draw_info = self.render_sprite(
-            world_state,
-            world_state['world_opacity'],
-            atlases,
-            layer,
-            render=not (shader_behavior and shader_behavior.replace_base_sprite),
-            shader_behavior=shader_behavior,
-            shader_name_override=shader_name,
-            premultiply_color=premultiply_color,
-        )
+        if mask_consumer_mode == "alpha":
+            draw_info = self.render_sprite(
+                world_state,
+                world_state['world_opacity'],
+                atlases,
+                layer,
+                render=False,
+                shader_behavior=shader_behavior,
+                shader_name_override=shader_name,
+                premultiply_color=premultiply_color,
+            )
+            if draw_info:
+                self._render_sprite_with_alpha_mask(draw_info)
+        else:
+            draw_info = self.render_sprite(
+                world_state,
+                world_state['world_opacity'],
+                atlases,
+                layer,
+                render=not (shader_behavior and shader_behavior.replace_base_sprite),
+                shader_behavior=shader_behavior,
+                shader_name_override=shader_name,
+                premultiply_color=premultiply_color,
+            )
         if shader_behavior and draw_info:
             self._render_shader_overlay(draw_info, shader_behavior, shader_preset)
         
         glPopMatrix()
-        self._deactivate_mask_consumer(stencil_mask_active)
+        self._deactivate_mask_consumer(mask_consumer_mode)
         
         # Reset blend mode to default after rendering this layer
         # This ensures subsequent layers start with the correct blend state
         reset_blend_mode()
+        self._log_mask_debug_layer(
+            active=mask_debug_active,
+            draw_order=draw_order,
+            layer=layer,
+            world_state=world_state,
+            shader_name=shader_name,
+            effective_blend=effective_blend,
+            mask_role=mask_role,
+            mask_key=mask_key,
+            stencil_write=False,
+            stencil_read=bool(mask_consumer_mode != "none"),
+            stencil_read_attempted=stencil_read_attempted,
+        )
     
     def render_sprite(
         self,
@@ -3384,14 +3786,48 @@ class SpriteRenderer:
             glEnd()
         self._end_overlay_textures(use_mask)
 
+    @staticmethod
+    def _draw_sprite_draw_info(draw_info: SpriteDrawInfo) -> None:
+        triangles = draw_info.triangles or []
+        if triangles:
+            glBegin(GL_TRIANGLES)
+            vert_count = len(draw_info.vertices)
+            for i in range(0, len(triangles), 3):
+                idx0 = triangles[i]
+                idx1 = triangles[i + 1] if i + 1 < len(triangles) else None
+                idx2 = triangles[i + 2] if i + 2 < len(triangles) else None
+                if idx1 is None or idx2 is None:
+                    break
+                if idx0 >= vert_count or idx1 >= vert_count or idx2 >= vert_count:
+                    continue
+                u0, v0 = draw_info.texcoords[idx0]
+                u1, v1 = draw_info.texcoords[idx1]
+                u2, v2 = draw_info.texcoords[idx2]
+                x0, y0 = draw_info.vertices[idx0]
+                x1, y1 = draw_info.vertices[idx1]
+                x2, y2 = draw_info.vertices[idx2]
+                glTexCoord2f(u0, v0); glVertex2f(x0, y0)
+                glTexCoord2f(u1, v1); glVertex2f(x1, y1)
+                glTexCoord2f(u2, v2); glVertex2f(x2, y2)
+            glEnd()
+            return
+        primitive = GL_QUADS if len(draw_info.vertices) == 4 else GL_TRIANGLE_FAN
+        glBegin(primitive)
+        for (u, v), (vx, vy) in zip(draw_info.texcoords, draw_info.vertices):
+            glTexCoord2f(u, v)
+            glVertex2f(vx, vy)
+        glEnd()
+
     def _render_mask_source_layer(
         self,
         layer: LayerData,
         world_state: Dict,
         atlases: List[TextureAtlas],
         layer_offsets: Dict[int, Tuple[float, float]],
-        mask_key: str
-    ) -> None:
+        mask_key: str,
+        *,
+        render_visible: bool = False,
+    ) -> bool:
         glPushMatrix()
         offset_x, offset_y = layer_offsets.get(layer.layer_id, (0, 0))
         if offset_x or offset_y:
@@ -3404,6 +3840,27 @@ class SpriteRenderer:
         ]
         glMultMatrixf(matrix)
         mask_written = self._write_mask_to_stencil(world_state, atlases, layer)
+        if render_visible:
+            shader_name = self._resolve_effective_shader_name(world_state, atlases)
+            shader_preset = self._get_shader_preset(shader_name)
+            shader_behavior = self._get_shader_behavior(shader_name)
+            blend_override = self._blend_value_from_preset(shader_preset)
+            effective_blend = self._resolve_effective_layer_blend(layer.blend_mode, blend_override)
+            premultiply_color = effective_blend != BlendMode.STRAIGHT_ALPHA
+            set_blend_mode(effective_blend)
+            draw_info = self.render_sprite(
+                world_state,
+                world_state.get('world_opacity', 1.0),
+                atlases,
+                layer,
+                render=True,
+                shader_behavior=shader_behavior,
+                shader_name_override=shader_name,
+                premultiply_color=premultiply_color,
+            )
+            if shader_behavior and draw_info:
+                self._render_shader_overlay(draw_info, shader_behavior, shader_preset)
+            reset_blend_mode()
         glPopMatrix()
         reset_blend_mode()
         if mask_written:
@@ -3414,6 +3871,7 @@ class SpriteRenderer:
                 f"{mask_key}:source",
                 f"Failed to capture mask geometry for layer '{layer.name}' (key {mask_key})."
             )
+        return mask_written
 
     def _write_mask_to_stencil(
         self,
@@ -3421,46 +3879,214 @@ class SpriteRenderer:
         atlases: List[TextureAtlas],
         layer: LayerData
     ) -> bool:
+        # Preferred path: capture source alpha into a screen-space mask texture.
+        try:
+            vx, vy, vw, vh = self._current_viewport()
+            if self._ensure_mask_resources(vw, vh) and self._mask_fbo and self._mask_texture:
+                prev_fbo = int(self.framebuffer_binding_hint or 0)
+                try:
+                    glBindFramebuffer(GL_FRAMEBUFFER, int(self._mask_fbo))
+                    glViewport(0, 0, int(vw), int(vh))
+                    glClearColor(0.0, 0.0, 0.0, 0.0)
+                    glClear(GL_COLOR_BUFFER_BIT)
+                    glDisable(GL_BLEND)
+                    try:
+                        glDisable(GL_DITHER)
+                    except Exception:
+                        pass
+                    # Write only alpha to the mask target. Keeps RGB untouched.
+                    glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_TRUE)
+                    draw_info = self.render_sprite(
+                        state,
+                        state.get('world_opacity', 1.0),
+                        atlases,
+                        layer,
+                        render=True,
+                    )
+                    if draw_info is not None:
+                        self._mask_capture_mode = "alpha"
+                        return True
+                finally:
+                    try:
+                        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE)
+                    except Exception:
+                        pass
+                    glBindFramebuffer(GL_FRAMEBUFFER, prev_fbo)
+                    glViewport(int(vx), int(vy), int(vw), int(vh))
+                    # Keep post-mask state deterministic for downstream layer draws.
+                    glEnable(GL_BLEND)
+                    glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA)
+        except Exception as exc:
+            self._log_mask_warning(
+                "alpha-mask-capture",
+                f"Alpha mask capture failed ({exc}); falling back to stencil masking.",
+            )
+            # Fall through to stencil fallback path below.
+            pass
+
+        # Fallback path: binary stencil cutout.
         glPushAttrib(GL_STENCIL_BUFFER_BIT | GL_COLOR_BUFFER_BIT | GL_ENABLE_BIT)
         try:
+            draw_info = self.render_sprite(
+                state,
+                state.get('world_opacity', 1.0),
+                atlases,
+                layer,
+                render=False,
+            )
+            if draw_info is None or draw_info.atlas is None or not draw_info.atlas.texture_id:
+                return False
+
             glEnable(GL_STENCIL_TEST)
             glClearStencil(0)
             glClear(GL_STENCIL_BUFFER_BIT)
             glStencilFunc(GL_ALWAYS, 1, 0xFF)
             glStencilOp(GL_REPLACE, GL_REPLACE, GL_REPLACE)
             glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE)
-            draw_info = self.render_sprite(
-                state,
-                state.get('world_opacity', 1.0),
-                atlases,
-                layer,
-                render=True
+            glDisable(GL_BLEND)
+            try:
+                glDisable(GL_DITHER)
+            except Exception:
+                pass
+
+            glBindTexture(GL_TEXTURE_2D, draw_info.atlas.texture_id)
+            # Bilinear improves cutout stability; UV clamp below prevents atlas bleed.
+            self._apply_texture_filter(draw_info.atlas.texture_id, "bilinear")
+            glColor4f(1.0, 1.0, 1.0, 1.0)
+
+            threshold = max(0.0, min(1.0, float(self.mask_stencil_alpha_threshold)))
+            softness = max(0.0, min(0.5, float(self.mask_stencil_alpha_softness)))
+            atlas_w = int(
+                max(
+                    1,
+                    getattr(draw_info.atlas, "image_width", 0)
+                    or getattr(draw_info.atlas, "logical_width", 0)
+                    or 1,
+                )
             )
-            return draw_info is not None
+            atlas_h = int(
+                max(
+                    1,
+                    getattr(draw_info.atlas, "image_height", 0)
+                    or getattr(draw_info.atlas, "logical_height", 0)
+                    or 1,
+                )
+            )
+            texel_size = (1.0 / float(atlas_w), 1.0 / float(atlas_h))
+            uv_coords = draw_info.texcoords or []
+            if uv_coords:
+                u_vals = [uv[0] for uv in uv_coords]
+                v_vals = [uv[1] for uv in uv_coords]
+                u_min = max(0.0, min(1.0, min(u_vals)))
+                u_max = max(0.0, min(1.0, max(u_vals)))
+                v_min = max(0.0, min(1.0, min(v_vals)))
+                v_max = max(0.0, min(1.0, max(v_vals)))
+                # Clamp sampling inside the sprite UV rectangle to avoid bleeding adjacent
+                # packed atlas sprites into mask generation.
+                eps_u = 0.5 / float(atlas_w)
+                eps_v = 0.5 / float(atlas_h)
+                if (u_max - u_min) > (eps_u * 2.0):
+                    u_min += eps_u
+                    u_max -= eps_u
+                if (v_max - v_min) > (eps_v * 2.0):
+                    v_min += eps_v
+                    v_max -= eps_v
+                uv_min = (u_min, v_min)
+                uv_max = (u_max, v_max)
+            else:
+                uv_min = (0.0, 0.0)
+                uv_max = (1.0, 1.0)
+
+            if self._use_alpha_stencil_program(
+                threshold,
+                softness,
+                texel_size=texel_size,
+                uv_min=uv_min,
+                uv_max=uv_max,
+            ):
+                self._draw_sprite_draw_info(draw_info)
+                self._stop_filter_program()
+                self._mask_capture_mode = "stencil"
+                return True
+
+            # Fallback for contexts that fail shader compile/link.
+            alpha_test_enabled = False
+            try:
+                glEnable(GL_ALPHA_TEST)
+                glAlphaFunc(GL_GREATER, threshold)
+                alpha_test_enabled = True
+            except Exception:
+                alpha_test_enabled = False
+            self._draw_sprite_draw_info(draw_info)
+            if alpha_test_enabled:
+                glDisable(GL_ALPHA_TEST)
+            self._mask_capture_mode = "stencil"
+            return True
         finally:
+            self._stop_filter_program()
             glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE)
             glDisable(GL_STENCIL_TEST)
             glPopAttrib()
 
-    def _activate_mask_consumer(self, mask_key: str) -> bool:
+    def _activate_mask_consumer(self, mask_key: str) -> str:
         if self.pending_mask_key != mask_key:
             self._log_mask_warning(
                 f"{mask_key}:missing",
                 f"Mask '{mask_key}' was not initialized before its consumer layer rendered."
             )
-            return False
+            return "none"
+        if self._mask_capture_mode == "alpha" and self._mask_texture:
+            return "alpha"
+        if self._mask_capture_mode != "stencil":
+            return "none"
         glPushAttrib(GL_STENCIL_BUFFER_BIT | GL_ENABLE_BIT)
         glEnable(GL_STENCIL_TEST)
         glStencilFunc(GL_EQUAL, 0, 0xFF)
         glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP)
-        return True
+        return "stencil"
 
-    def _deactivate_mask_consumer(self, active: bool) -> None:
-        if not active:
+    def _deactivate_mask_consumer(self, mode: str) -> None:
+        if mode == "none":
             return
-        glDisable(GL_STENCIL_TEST)
-        glPopAttrib()
+        if mode == "stencil":
+            glDisable(GL_STENCIL_TEST)
+            glPopAttrib()
         self.pending_mask_key = None
+        self._mask_capture_mode = "none"
+
+    def _render_sprite_with_alpha_mask(self, draw_info: SpriteDrawInfo) -> None:
+        if draw_info.atlas is None or not draw_info.atlas.texture_id or not self._mask_texture:
+            return
+        program = self._get_mask_consumer_program()
+        if not program:
+            # If shader compilation fails, fall back to regular draw.
+            self._draw_sprite_draw_info(draw_info)
+            return
+
+        _, _, vw, vh = self._current_viewport()
+        glUseProgram(program)
+        if self._mask_consumer_uniform_texture is not None and self._mask_consumer_uniform_texture >= 0:
+            glUniform1i(self._mask_consumer_uniform_texture, 0)
+        if self._mask_consumer_uniform_mask is not None and self._mask_consumer_uniform_mask >= 0:
+            glUniform1i(self._mask_consumer_uniform_mask, 1)
+        if self._mask_consumer_uniform_view_size is not None and self._mask_consumer_uniform_view_size >= 0:
+            glUniform2f(self._mask_consumer_uniform_view_size, float(max(1, vw)), float(max(1, vh)))
+
+        glActiveTexture(GL_TEXTURE0)
+        glBindTexture(GL_TEXTURE_2D, int(draw_info.atlas.texture_id))
+        glActiveTexture(GL_TEXTURE1)
+        glBindTexture(GL_TEXTURE_2D, int(self._mask_texture))
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+        glActiveTexture(GL_TEXTURE0)
+
+        self._draw_sprite_draw_info(draw_info)
+        glUseProgram(0)
+        glActiveTexture(GL_TEXTURE1)
+        glBindTexture(GL_TEXTURE_2D, 0)
+        glActiveTexture(GL_TEXTURE0)
 
     def _log_mask_warning(self, key: str, message: str) -> None:
         if key in self._mask_warning_messages:

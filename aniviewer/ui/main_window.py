@@ -6289,36 +6289,70 @@ class MSMAnimationViewer(QMainWindow):
         resource_dict: Optional[Dict[str, Any]],
         source_path: Optional[str]
     ) -> None:
-        """Inject per-monster layer tweaks that the stock JSON export omits."""
-        if not layers or not source_token:
+        """Inject data-driven layer tweaks that the stock JSON export omits."""
+        if not layers:
             return
-        token = source_token.lower()
-        if token == "gjlm":
-            self._apply_gjlm_mouth_overrides(layers, token, resource_dict, source_path)
+        self._apply_auto_shadow_cutout_masks(layers)
 
-    def _apply_gjlm_mouth_overrides(
+    def _apply_auto_shadow_cutout_masks(
         self,
         layers: List[LayerData],
-        token: str,
-        resource_dict: Optional[Dict[str, Any]],
-        source_path: Optional[str]
+        *,
+        log_changes: bool = True,
     ) -> None:
-        """Fallback handling for the GJLM mouth layer when no special shader is active."""
-        mouth_layers = [
-            layer for layer in layers
-            if (layer.name or "").strip().lower() == "mouth"
-        ]
-        if not mouth_layers:
+        """
+        Infer missing cutout masks from layer relationships.
+
+        Observed pattern in game assets:
+        - a child layer uses additive blend (blend=2)
+        - its parent is a shadow layer
+        - no explicit mask metadata is present
+
+        In that case, treat the additive child as stencil source and its shadow parent as
+        stencil consumer, then enforce source-before-consumer render order.
+        """
+        if any(getattr(layer, "mask_role", None) for layer in layers):
+            # Respect explicit metadata if present.
             return
-        for layer in mouth_layers:
-            layer.color_tint = (1.0, 1.0, 1.0, 1.0)
-            layer.mask_role = None
-            layer.mask_key = None
-        lookup = {layer.name.lower(): layer for layer in layers if layer.name}
-        shadow_layer = lookup.get("shadow")
-        if shadow_layer:
-            shadow_layer.mask_role = None
-            shadow_layer.mask_key = None
+
+        layer_by_id = {layer.layer_id: layer for layer in layers}
+        pairs: List[Tuple[LayerData, LayerData]] = []
+        for layer in layers:
+            if layer.blend_mode != BlendMode.ADDITIVE:
+                continue
+            parent = layer_by_id.get(layer.parent_id)
+            if parent is None:
+                continue
+            parent_name = (parent.name or "").strip().lower()
+            if "shadow" not in parent_name:
+                continue
+            pairs.append((layer, parent))
+
+        if not pairs:
+            return
+
+        for source_layer, shadow_layer in pairs:
+            mask_key = f"auto_shadow_cutout_{source_layer.layer_id}_{shadow_layer.layer_id}"
+            source_layer.mask_role = "mask_source"
+            source_layer.mask_key = mask_key
+            shadow_layer.mask_role = "mask_consumer"
+            shadow_layer.mask_key = mask_key
+
+            source_idx = next((idx for idx, item in enumerate(layers) if item.layer_id == source_layer.layer_id), -1)
+            shadow_idx = next((idx for idx, item in enumerate(layers) if item.layer_id == shadow_layer.layer_id), -1)
+
+            # Runtime renderer iterates reversed(animation.layers). Ensure source appears
+            # before consumer in that reversed order by keeping source at a higher index.
+            if source_idx >= 0 and shadow_idx >= 0 and source_idx < shadow_idx:
+                layers[source_idx], layers[shadow_idx] = layers[shadow_idx], layers[source_idx]
+
+            if log_changes:
+                self.log_widget.log(
+                    f"Auto-applied shadow cutout mask: source '{source_layer.name}' "
+                    f"(id {source_layer.layer_id}) -> consumer '{shadow_layer.name}' "
+                    f"(id {shadow_layer.layer_id}).",
+                    "INFO",
+                )
 
     def _load_rev6_animation_module(self):
         """Dynamically import the rev6-2-json converter so we can parse BIN files."""
@@ -8861,6 +8895,7 @@ class MSMAnimationViewer(QMainWindow):
                 resource_dict=self.current_json_data
             )
             layers = animation.layers
+            self._dump_mask_debug_raw_layers(raw_layers, animation)
             self._load_keyframe_layers_sidecar(self.current_json_path, animation)
 
             self.canonical_layer_names = set()
@@ -8875,6 +8910,7 @@ class MSMAnimationViewer(QMainWindow):
             self._configure_costume_shaders(None, None)
 
             self.gl_widget.player.load_animation(animation)
+            self._dump_mask_debug_layer_layout(animation)
             self.gl_widget.invalidate_animation_cache()
             self._record_layer_defaults(animation.layers)
             self.gl_widget.set_layer_atlas_overrides({})
@@ -8937,6 +8973,156 @@ class MSMAnimationViewer(QMainWindow):
             self._update_terrain_tile_index_range()
         finally:
             self._stop_hang_watchdog()
+
+    def _mask_debug_enabled(self) -> bool:
+        raw = os.environ.get("ANIVIEWER_MASK_DEBUG", "1").strip().lower()
+        return raw not in {"0", "false", "off", "no"}
+
+    def _mask_debug_target(self) -> str:
+        return os.environ.get("ANIVIEWER_MASK_DEBUG_TARGET", "gjlm").strip().lower()
+
+    def _should_emit_mask_debug_layout(self, animation: Optional[AnimationData]) -> bool:
+        if not self._mask_debug_enabled():
+            return False
+        if animation is None:
+            return False
+        if any(getattr(layer, "mask_role", None) or getattr(layer, "mask_key", None) for layer in (animation.layers or [])):
+            return True
+
+        target = self._mask_debug_target()
+        if not target:
+            return True
+
+        probes = [
+            (self.current_json_path or "").lower(),
+            (self.current_animation_name or "").lower(),
+            (animation.name or "").lower(),
+        ]
+        if any(target in probe for probe in probes if probe):
+            return True
+
+        for layer in animation.layers or []:
+            layer_name = (layer.name or "").lower()
+            shader_name = (layer.shader_name or "").lower()
+            if target in layer_name or target in shader_name:
+                return True
+            for keyframe in layer.keyframes[:2]:
+                sprite_name = (keyframe.sprite_name or "").lower()
+                if target in sprite_name:
+                    return True
+        return False
+
+    def _dump_mask_debug_layer_layout(self, animation: Optional[AnimationData]) -> None:
+        """
+        Emit a one-shot runtime layer order + shader assignment dump for mask debugging.
+        """
+        if not self._should_emit_mask_debug_layout(animation):
+            return
+        if animation is None:
+            return
+
+        try:
+            layer_world_states = self.gl_widget._build_layer_world_states_base(
+                self.gl_widget.player.current_time,
+                apply_global=True,
+            )
+            render_layers = self.gl_widget._get_render_layers(layer_world_states)
+            src_index = {
+                layer.layer_id: idx
+                for idx, layer in enumerate(animation.layers or [])
+            }
+            print(
+                "[MaskDebugLayout] "
+                f"begin animation='{animation.name}' "
+                f"layers={len(animation.layers or [])} render_layers={len(render_layers)}"
+            )
+            for draw_idx, layer in enumerate(render_layers, start=1):
+                state = layer_world_states.get(layer.layer_id, {})
+                sprite_name = str(state.get("sprite_name") or "-").replace("'", "\\'")
+                shader_name = str(state.get("shader") or layer.shader_name or "-").replace("'", "\\'")
+                layer_name = (layer.name or "").replace("'", "\\'")
+                role = layer.mask_role or "-"
+                key = layer.mask_key or "-"
+                print(
+                    "[MaskDebugLayout] "
+                    f"draw_order={draw_idx} "
+                    f"src_index={src_index.get(layer.layer_id, -1)} "
+                    f"layer='{layer_name}' "
+                    f"id={layer.layer_id} "
+                    f"parent={layer.parent_id} "
+                    f"sprite='{sprite_name}' "
+                    f"shader='{shader_name}' "
+                    f"blend={layer.blend_mode} "
+                    f"mask_role={role} "
+                    f"mask_key={key}"
+                )
+            print("[MaskDebugLayout] end")
+        except Exception as exc:
+            print(f"[MaskDebugLayout] failed: {exc}")
+
+    def _dump_mask_debug_raw_layers(
+        self,
+        raw_layers: Optional[List[Dict[str, Any]]],
+        animation: Optional[AnimationData],
+    ) -> None:
+        """
+        Dump raw layer fields for mask-relevant layers to mine hidden metadata from BIN->JSON output.
+        """
+        if not self._should_emit_mask_debug_layout(animation):
+            return
+        if not raw_layers or animation is None:
+            return
+
+        try:
+            mask_ids = {
+                layer.layer_id
+                for layer in (animation.layers or [])
+                if getattr(layer, "mask_role", None) or getattr(layer, "mask_key", None)
+            }
+            if not mask_ids:
+                return
+
+            common_keys = {
+                "name", "id", "parent", "anchor_x", "anchor_y", "blend", "visible",
+                "shader", "keyframes", "color_tint", "color_tint_hdr", "color_gradient",
+                "color_animator", "color_metadata", "render_tags", "mask_role", "mask_key",
+                "sprite_anchor_map",
+            }
+            for payload in raw_layers:
+                if not isinstance(payload, dict):
+                    continue
+                layer_id = payload.get("id")
+                if layer_id not in mask_ids:
+                    continue
+                layer_name = str(payload.get("name") or "")
+                shader_name = str(payload.get("shader") or "-")
+                blend_value = payload.get("blend", "-")
+                parent_id = payload.get("parent", "-")
+                keyframe_count = len(payload.get("keyframes") or [])
+                keys = sorted(payload.keys())
+                extra_keys = [key for key in keys if key not in common_keys]
+                print(
+                    "[MaskDebugRaw] "
+                    f"id={layer_id} name='{layer_name}' parent={parent_id} "
+                    f"blend={blend_value} shader='{shader_name}' keyframes={keyframe_count} "
+                    f"keys={keys}"
+                )
+                if extra_keys:
+                    print(
+                        "[MaskDebugRaw] "
+                        f"id={layer_id} extra_keys={extra_keys}"
+                    )
+                    for key in extra_keys:
+                        value = payload.get(key)
+                        if isinstance(value, dict):
+                            summary = f"dict(keys={sorted(value.keys())})"
+                        elif isinstance(value, list):
+                            summary = f"list(len={len(value)})"
+                        else:
+                            summary = repr(value)
+                        print(f"[MaskDebugRaw] id={layer_id} {key}={summary}")
+        except Exception as exc:
+            print(f"[MaskDebugRaw] failed: {exc}")
 
     def _dump_anchor_debug(self, attempt: int = 0):
         """Attempt to dump renderer anchor logs; retry briefly if empty."""
@@ -17448,7 +17634,19 @@ class MSMAnimationViewer(QMainWindow):
         try:
             self.gl_widget.makeCurrent()
             default_fbo = self.gl_widget.defaultFramebufferObject()
-            viewport_before = glGetIntegerv(GL_VIEWPORT)
+            try:
+                viewport_vec = glGetIntegerv(GL_VIEWPORT)
+                if viewport_vec is not None and len(viewport_vec) >= 4:
+                    viewport_before = (
+                        int(viewport_vec[0]),
+                        int(viewport_vec[1]),
+                        int(viewport_vec[2]),
+                        int(viewport_vec[3]),
+                    )
+                else:
+                    viewport_before = (0, 0, self.gl_widget.width(), self.gl_widget.height())
+            except Exception:
+                viewport_before = (0, 0, self.gl_widget.width(), self.gl_widget.height())
             fbo = glGenFramebuffers(1)
             glBindFramebuffer(GL_FRAMEBUFFER, fbo)
             texture = glGenTextures(1)
@@ -17481,6 +17679,10 @@ class MSMAnimationViewer(QMainWindow):
             def _render_export_scene(sample_time: float) -> None:
                 glBindFramebuffer(GL_FRAMEBUFFER, int(fbo))
                 glViewport(0, 0, width, height)
+                # Keep renderer-side mask passes bound to this export FBO instead of
+                # falling back to the default window framebuffer.
+                self.gl_widget.renderer.viewport_size_hint = (max(1, int(width)), max(1, int(height)))
+                self.gl_widget.renderer.framebuffer_binding_hint = int(fbo)
                 glClearColor(0.0, 0.0, 0.0, 0.0)
                 glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
                 glEnable(GL_BLEND)

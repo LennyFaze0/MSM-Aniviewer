@@ -805,7 +805,11 @@ class OpenGLAnimationWidget(QOpenGLWidget):
             else:
                 glBindFramebuffer(GL_FRAMEBUFFER, int(self._post_aa_scene_fbo))
                 glViewport(0, 0, view_w, view_h)
-                self._render_scene_contents(view_w, view_h)
+                self._render_scene_contents(
+                    view_w,
+                    view_h,
+                    framebuffer_binding_hint=int(self._post_aa_scene_fbo),
+                )
             glBindFramebuffer(GL_FRAMEBUFFER, default_fbo)
             glViewport(0, 0, view_w, view_h)
             pass_ok = self._draw_post_aa_pass(
@@ -816,10 +820,18 @@ class OpenGLAnimationWidget(QOpenGLWidget):
             if pass_ok:
                 return
             # Graceful fallback: if the post pass fails, draw scene directly.
-            self._render_scene_contents(view_w, view_h)
+            self._render_scene_contents(
+                view_w,
+                view_h,
+                framebuffer_binding_hint=int(default_fbo),
+            )
             return
 
-        self._render_scene_contents(view_w, view_h)
+        self._render_scene_contents(
+            view_w,
+            view_h,
+            framebuffer_binding_hint=int(self.defaultFramebufferObject()),
+        )
 
     def _current_framebuffer_size(self) -> Tuple[int, int]:
         """Return current framebuffer pixel size (handles HiDPI correctly)."""
@@ -956,7 +968,11 @@ class OpenGLAnimationWidget(QOpenGLWidget):
         if shutter_span <= 1e-5 or sample_count <= 1:
             glBindFramebuffer(GL_FRAMEBUFFER, int(self._post_aa_scene_fbo))
             glViewport(0, 0, view_w, view_h)
-            self._render_scene_contents(view_w, view_h)
+            self._render_scene_contents(
+                view_w,
+                view_h,
+                framebuffer_binding_hint=int(self._post_aa_scene_fbo),
+            )
             return int(self._post_aa_scene_texture)
 
         base_time = float(self.player.current_time)
@@ -980,6 +996,7 @@ class OpenGLAnimationWidget(QOpenGLWidget):
                 view_h,
                 main_time=sample_time,
                 extra_time_offset=(sample_time - base_time),
+                framebuffer_binding_hint=int(self._post_aa_scene_fbo),
             )
             glBindFramebuffer(GL_FRAMEBUFFER, int(self._post_aa_history_fbo))
             glViewport(0, 0, view_w, view_h)
@@ -1000,8 +1017,12 @@ class OpenGLAnimationWidget(QOpenGLWidget):
         *,
         main_time: Optional[float] = None,
         extra_time_offset: float = 0.0,
+        framebuffer_binding_hint: Optional[int] = None,
     ) -> None:
         """Render the current scene into the currently bound framebuffer."""
+        self.renderer.viewport_size_hint = (max(1, int(view_w)), max(1, int(view_h)))
+        if framebuffer_binding_hint is not None:
+            self.renderer.framebuffer_binding_hint = int(framebuffer_binding_hint)
         if self.viewport_background_enabled:
             glClearColor(*self.background_color)
         else:
