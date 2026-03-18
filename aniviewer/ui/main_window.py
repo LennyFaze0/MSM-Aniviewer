@@ -6292,6 +6292,9 @@ class MSMAnimationViewer(QMainWindow):
         """Inject data-driven layer tweaks that the stock JSON export omits."""
         if not layers:
             return
+        token = (source_token or self._current_monster_token() or "").strip().lower()
+        if token != "gjlm":
+            return
         self._apply_auto_shadow_cutout_masks(layers)
 
     def _apply_auto_shadow_cutout_masks(
@@ -6305,6 +6308,7 @@ class MSMAnimationViewer(QMainWindow):
 
         Observed pattern in game assets:
         - a child layer uses additive blend (blend=2)
+        - the child is a mouth layer
         - its parent is a shadow layer
         - no explicit mask metadata is present
 
@@ -6319,6 +6323,11 @@ class MSMAnimationViewer(QMainWindow):
         pairs: List[Tuple[LayerData, LayerData]] = []
         for layer in layers:
             if layer.blend_mode != BlendMode.ADDITIVE:
+                continue
+            layer_name = (layer.name or "").strip().lower()
+            # Keep this heuristic narrow to avoid affecting unrelated additive layers
+            # in custom animations.
+            if "mouth" not in layer_name:
                 continue
             parent = layer_by_id.get(layer.parent_id)
             if parent is None:
