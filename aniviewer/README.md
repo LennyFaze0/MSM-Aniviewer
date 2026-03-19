@@ -50,20 +50,6 @@ https://www.python.org/ftp/python/3.13.9/python-3.13.9-amd64.exe
 Open the viewer, go to **Settings > Application > FFmpeg Tools** and click **Install FFmpeg**.  
 The viewer will download a verified Windows build, place it inside your AppData folder, and add it to PATH automatically so MOV exports work immediately.
 
-## Building a standalone EXE
-
-If you want to share the viewer with users that do not have Python installed, bundle it using the provided build helper:
-
-1. Install the project dependencies as described above (the script will grab PyInstaller automatically if needed).
-2. From the repository root run:
-   ```
-   python build_exe.py
-   ```
-3. After a short build step you will find `MSMAnimationViewer.exe` inside `aniviewer/dist/MSMAnimationViewer/`.
-
-Distribute the *entire* folder created in step 3 — it contains the executable plus the Python runtime, Qt plugins, and the bin2json scripts the viewer launches in the background.  
-The helper accepts a few optional flags (run `python build_exe.py -h` for details) so you can change the executable name, provide a custom icon, or keep the generated `.spec` file for further customization.
-
 ## Usage
 
 1. **Run the application**:
