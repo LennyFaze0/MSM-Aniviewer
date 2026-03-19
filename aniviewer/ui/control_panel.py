@@ -398,42 +398,44 @@ class ControlPanel(QWidget):
         )
         anim_layout.addWidget(self.preserve_children_on_record_checkbox)
 
-        pose_actions = QHBoxLayout()
-        pose_actions.setSpacing(6)
+        pose_actions = QGridLayout()
+        pose_actions.setHorizontalSpacing(6)
+        pose_actions.setVerticalSpacing(6)
         self.reset_pose_btn = QPushButton("Reset Pose")
         self.reset_pose_btn.setToolTip("Revert selected keyframes to their default animation values")
         self.reset_pose_btn.clicked.connect(self.pose_reset_clicked.emit)
-        pose_actions.addWidget(self.reset_pose_btn)
+        pose_actions.addWidget(self.reset_pose_btn, 0, 0)
         self.undo_keyframe_btn = QPushButton("Undo Keyframe")
         self.undo_keyframe_btn.setToolTip("Undo the most recent keyframe edit")
         self.undo_keyframe_btn.clicked.connect(self.keyframe_undo_clicked.emit)
-        pose_actions.addWidget(self.undo_keyframe_btn)
+        pose_actions.addWidget(self.undo_keyframe_btn, 0, 1)
         self.redo_keyframe_btn = QPushButton("Redo Keyframe")
         self.redo_keyframe_btn.setToolTip("Redo the last undone keyframe edit")
         self.redo_keyframe_btn.clicked.connect(self.keyframe_redo_clicked.emit)
-        pose_actions.addWidget(self.redo_keyframe_btn)
+        pose_actions.addWidget(self.redo_keyframe_btn, 1, 0)
         self.delete_other_keyframes_btn = QPushButton("Delete Other Keyframes")
         self.delete_other_keyframes_btn.setToolTip("Remove all keyframes except those at the current time for selected layers")
         self.delete_other_keyframes_btn.clicked.connect(self.keyframe_delete_others_clicked.emit)
-        pose_actions.addWidget(self.delete_other_keyframes_btn)
+        pose_actions.addWidget(self.delete_other_keyframes_btn, 1, 1)
         self.extend_duration_btn = QPushButton("Set Duration…")
         self.extend_duration_btn.setToolTip("Adjust total animation length")
         self.extend_duration_btn.clicked.connect(self.extend_duration_clicked.emit)
-        pose_actions.addWidget(self.extend_duration_btn)
-        io_row = QHBoxLayout()
-        io_row.setSpacing(6)
+        pose_actions.addWidget(self.extend_duration_btn, 2, 0, 1, 2)
+        io_row = QGridLayout()
+        io_row.setHorizontalSpacing(6)
+        io_row.setVerticalSpacing(6)
         self.load_animation_btn = QPushButton("Load Animation…")
         self.load_animation_btn.setToolTip("Load a previously saved animation JSON file")
         self.load_animation_btn.clicked.connect(self.load_animation_clicked.emit)
-        io_row.addWidget(self.load_animation_btn)
+        io_row.addWidget(self.load_animation_btn, 0, 0)
         self.save_animation_btn = QPushButton("Save Animation…")
         self.save_animation_btn.setToolTip("Save the current animation (layers + keyframes) to a JSON file")
         self.save_animation_btn.clicked.connect(self.save_animation_clicked.emit)
-        io_row.addWidget(self.save_animation_btn)
+        io_row.addWidget(self.save_animation_btn, 0, 1)
         self.export_bin_btn = QPushButton("Export Animation BIN…")
         self.export_bin_btn.setToolTip("Package the current animation into a BIN file usable by the game")
         self.export_bin_btn.clicked.connect(self.export_animation_bin_clicked.emit)
-        io_row.addWidget(self.export_bin_btn)
+        io_row.addWidget(self.export_bin_btn, 1, 0, 1, 2)
         anim_layout.addLayout(io_row)
         anim_layout.addLayout(pose_actions)
         
@@ -488,6 +490,8 @@ class ControlPanel(QWidget):
         
         pos_scale_help = QLabel("Adjusts spacing between sprite segments")
         pos_scale_help.setStyleSheet("color: gray; font-size: 8pt; font-style: italic;")
+        pos_scale_help.setWordWrap(True)
+        pos_scale_help.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
         render_layout.addWidget(pos_scale_help)
         
         # Base World Scale slider (from Ghidra analysis)
@@ -512,6 +516,8 @@ class ControlPanel(QWidget):
         
         base_scale_help = QLabel("Converts JSON coordinates to screen space (from Ghidra analysis)")
         base_scale_help.setStyleSheet("color: gray; font-size: 8pt; font-style: italic;")
+        base_scale_help.setWordWrap(True)
+        base_scale_help.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
         render_layout.addWidget(base_scale_help)
 
         placement_label = QLabel("Sprite Placement Adjustments")
@@ -578,6 +584,8 @@ class ControlPanel(QWidget):
 
         rotation_help = QLabel("Use the overlay ring to rotate sprites after selecting them.")
         rotation_help.setStyleSheet("color: gray; font-size: 8pt; font-style: italic;")
+        rotation_help.setWordWrap(True)
+        rotation_help.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
         render_layout.addWidget(rotation_help)
 
         bpm_header = QLabel("Animation BPM")
@@ -641,6 +649,8 @@ class ControlPanel(QWidget):
 
         bpm_help = QLabel("Derived from the island MIDI tempo. Adjust to fine-tune playback speed.")
         bpm_help.setStyleSheet("color: gray; font-size: 8pt; font-style: italic;")
+        bpm_help.setWordWrap(True)
+        bpm_help.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
         render_layout.addWidget(bpm_help)
 
         bpm_toggle_layout = QHBoxLayout()
@@ -674,6 +684,8 @@ class ControlPanel(QWidget):
 
         scale_help = QLabel("Uniform scales evenly; Per-Axis lets you stretch horizontally/vertically.")
         scale_help.setStyleSheet("color: gray; font-size: 8pt; font-style: italic;")
+        scale_help.setWordWrap(True)
+        scale_help.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
         render_layout.addWidget(scale_help)
 
         overlay_header = QLabel("Anchor & Parent Controls")
@@ -707,6 +719,8 @@ class ControlPanel(QWidget):
 
         anchor_precision_help = QLabel("Smaller values move anchors in finer increments while dragging.")
         anchor_precision_help.setStyleSheet("color: gray; font-size: 8pt; font-style: italic;")
+        anchor_precision_help.setWordWrap(True)
+        anchor_precision_help.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
         render_layout.addWidget(anchor_precision_help)
 
         # Advanced placement bias controls
@@ -1012,6 +1026,8 @@ class ControlPanel(QWidget):
 
         nudge_help = QLabel("Adjust selected sprite segments by exact pixel amounts")
         nudge_help.setStyleSheet("color: gray; font-size: 8pt; font-style: italic;")
+        nudge_help.setWordWrap(True)
+        nudge_help.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
         drag_layout.addWidget(nudge_help)
 
         # Nudge step size
@@ -1173,6 +1189,8 @@ class ControlPanel(QWidget):
 
         viewport_hint = QLabel("Set viewport background color and optional image fill.")
         viewport_hint.setStyleSheet("color: gray; font-size: 8pt;")
+        viewport_hint.setWordWrap(True)
+        viewport_hint.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
         viewport_bg_layout.addWidget(viewport_hint)
 
         self.viewport_bg_enabled_checkbox = QCheckBox("Enable viewport background")
@@ -1482,6 +1500,8 @@ class ControlPanel(QWidget):
 
         terrain_hint = QLabel("Adjust island terrain rendering and alignment.")
         terrain_hint.setStyleSheet("color: gray; font-size: 8pt;")
+        terrain_hint.setWordWrap(True)
+        terrain_hint.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
         terrain_layout.addWidget(terrain_hint)
 
         terrain_render_group = QGroupBox("Render Settings")
@@ -1741,6 +1761,8 @@ class ControlPanel(QWidget):
 
         diag_hint = QLabel("Configure advanced logging in Settings → Diagnostics.")
         diag_hint.setStyleSheet("color: gray; font-size: 8pt;")
+        diag_hint.setWordWrap(True)
+        diag_hint.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
         diag_layout.addWidget(diag_hint)
 
         diag_group.setLayout(diag_layout)
