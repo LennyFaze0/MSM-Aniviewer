@@ -9229,6 +9229,7 @@ class MSMAnimationViewer(QMainWindow):
             return None, False, None, []
 
         is_dof = self._is_active_dof_audio_context() if force_dof is None else bool(force_dof)
+        is_muppet = self._is_muppet_payload() and not is_dof
 
         if not is_dof:
             if self._should_use_monster_f_activate_sfx(animation_name):
@@ -9260,9 +9261,6 @@ class MSMAnimationViewer(QMainWindow):
             return buddy_override, True, None, []
         buddy_blocked = self._is_buddy_audio_blocked(animation_name) and not is_dof
 
-        if self._is_muppet_payload():
-            return None, False, None, []
-
         monster_token = self._current_monster_token()
         dof_asset_name: Optional[str] = None
         if is_dof and self.current_json_path:
@@ -9275,10 +9273,13 @@ class MSMAnimationViewer(QMainWindow):
             if dof_token:
                 monster_token = dof_token
         audio_base = dof_asset_name or animation_name
+        candidate_monster_token = None if is_muppet else monster_token
         raw_candidates = self._build_audio_name_candidates(
             audio_base,
-            monster_token=monster_token
+            monster_token=candidate_monster_token
         )
+        if is_muppet:
+            raw_candidates.extend(self._build_muppet_audio_candidates(animation_name))
         if is_dof and not dof_asset_name:
             dof_token = self._derive_dof_audio_token(animation_name)
             if dof_token:
@@ -11255,6 +11256,118 @@ class MSMAnimationViewer(QMainWindow):
             )
         else:
             candidates.extend([f"{island}-{token}", f"{island}_{token}"])
+        return candidates
+
+    def _build_muppet_audio_candidates(self, animation_name: str) -> List[str]:
+        """
+        Build extra filename guesses for My Muppets Show (rev2-style) payloads.
+
+        Muppet assets frequently use small naming variants between animation names
+        and music clips (for example: rowlf/rawlf, drteeth/dr_teeth, *_whatnot).
+        """
+        if not animation_name or not self.current_json_path:
+            return []
+        if not self._is_muppet_payload():
+            return []
+
+        candidates: List[str] = []
+        seen: Set[str] = set()
+
+        def add(value: str) -> None:
+            value = (value or "").strip()
+            if not value or value in seen:
+                return
+            seen.add(value)
+            candidates.append(value)
+
+        def expand_aliases(base: str) -> List[str]:
+            normalized = self._normalize_audio_key(base)
+            if not normalized:
+                return []
+            alias_map = {
+                "rowlf": ["rawlf"],
+                "rawlf": ["rowlf"],
+                "drteeth": ["dr_teeth"],
+                "dr_teeth": ["drteeth"],
+                "swedishchef": ["swedish_chef"],
+                "swedish_chef": ["swedishchef"],
+                "sam_eagle": ["sam"],
+                "lew_zealand": ["lou"],
+                "mahnamahna": ["mahna"],
+                "marvinsuggs": ["suggs"],
+                "crazy_harry": ["harry"],
+                "tamborine": ["tambourine"],
+                "tambourine": ["tamborine"],
+                "guitar_whatnot": ["accoustic", "acoustic"],
+                "muppetman": ["man"],
+                "man": ["muppetman"],
+            }
+            values = [normalized]
+            values.extend(alias_map.get(normalized, []))
+            if normalized.endswith("_whatnot"):
+                values.append(normalized[: -len("_whatnot")])
+            values = [v.strip("_") for v in values if v and v.strip("_")]
+            unique: List[str] = []
+            for value in values:
+                if value not in unique:
+                    unique.append(value)
+            return unique
+
+        animation_norm = self._normalize_audio_key(animation_name)
+        if animation_norm:
+            add(animation_name)
+
+        stage_id: Optional[str] = None
+        stem = Path(self.current_json_path).stem.lower()
+        stem_match = re.match(r"^muppet_(.+?)(?:_stage(\d+))?$", stem)
+        stem_base = ""
+        if stem_match:
+            stem_base = (stem_match.group(1) or "").strip("_")
+            if stem_match.group(2):
+                stage_id = f"{int(stem_match.group(2)):02d}"
+        if animation_norm and stage_id is None:
+            lead = re.match(r"^(\d+)[_-]", animation_norm)
+            if lead:
+                stage_id = f"{int(lead.group(1)):02d}"
+
+        track_id: Optional[str] = None
+        if animation_norm:
+            tail = re.search(r"(?:_|-)(\d+)$", animation_norm)
+            if tail:
+                track_id = f"{int(tail.group(1)):02d}"
+
+        bases: List[str] = []
+        if animation_norm:
+            core = animation_norm
+            core = re.sub(r"^\d+[_-]*", "", core)
+            core = re.sub(r"(?:_|-)\d+$", "", core)
+            core = core.strip("_")
+            if core:
+                bases.append(core)
+        if stem_base:
+            bases.append(stem_base)
+
+        expanded_bases: List[str] = []
+        for base in bases:
+            for alias in expand_aliases(base):
+                if alias not in expanded_bases:
+                    expanded_bases.append(alias)
+
+        for base in expanded_bases:
+            add(base)
+            if track_id:
+                add(f"{base}_{track_id}")
+            if stage_id:
+                add(f"{stage_id}-{base}")
+                add(f"{stage_id}_{base}")
+                if track_id:
+                    add(f"{stage_id}-{base}_{track_id}")
+                    add(f"{stage_id}_{base}_{track_id}")
+                    add(f"{stage_id}-{base}-{track_id}")
+                else:
+                    add(f"{stage_id}-{base}_01")
+                    add(f"{stage_id}_{base}_01")
+
         return candidates
 
     def _expand_audio_key_variants(self, base_key: str) -> List[str]:
