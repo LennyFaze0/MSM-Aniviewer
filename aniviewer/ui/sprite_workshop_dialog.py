@@ -299,9 +299,100 @@ class SpriteWorkshopDialog(QDialog):
         )
         if not file_path:
             return
-        success, message = self.main_window.replace_sprite_from_file(atlas, sprites[0], file_path)
+        sprite = sprites[0]
+        success, message = self.main_window.replace_sprite_from_file(atlas, sprite, file_path)
+        if success:
+            self._update_sprite_list()
+            return
+
+        if not self.main_window.is_sprite_replacement_size_mismatch(message):
+            QMessageBox.warning(self, "Sprite Workshop", message)
+            self._update_sprite_list()
+            return
+
+        prompt = QMessageBox(self)
+        prompt.setIcon(QMessageBox.Icon.Question)
+        prompt.setWindowTitle("Sprite Workshop")
+        prompt.setText(
+            "The imported segment does not match the existing atlas slot size."
+        )
+        prompt.setInformativeText(
+            "Choose whether to update the current monster atlas/XML in place, "
+            "or export a new spritesheet/XML pair with the expanded layout."
+        )
+        modify_button = prompt.addButton(
+            "Modify Current XML",
+            QMessageBox.ButtonRole.AcceptRole,
+        )
+        create_button = prompt.addButton(
+            "Create New XML",
+            QMessageBox.ButtonRole.ActionRole,
+        )
+        prompt.addButton(QMessageBox.StandardButton.Cancel)
+        prompt.exec()
+        clicked = prompt.clickedButton()
+        if clicked is None:
+            self._update_sprite_list()
+            return
+        if prompt.standardButton(clicked) == QMessageBox.StandardButton.Cancel:
+            self._update_sprite_list()
+            return
+
+        output_path: Optional[str] = None
+        if clicked == create_button:
+            default_name = f"{sprite.name}_expanded.png"
+            output_path, _ = QFileDialog.getSaveFileName(
+                self,
+                "Export expanded spritesheet",
+                default_name,
+                "PNG Images (*.png)",
+            )
+            if not output_path:
+                self._update_sprite_list()
+                return
+            if not output_path.lower().endswith(".png"):
+                output_path += ".png"
+
+        success, message = self.main_window.replace_sprite_from_file_with_expanded_layout(
+            atlas,
+            sprite,
+            file_path,
+        )
         if not success:
             QMessageBox.warning(self, "Sprite Workshop", message)
+            self._update_sprite_list()
+            return
+
+        if clicked == modify_button:
+            saved, save_message = self.main_window.save_modified_atlas_in_place(
+                atlas,
+                bake_recolor=self.bake_recolor_checkbox.isChecked(),
+                premultiply_alpha=self.premultiply_checkbox.isChecked(),
+            )
+            if not saved:
+                QMessageBox.warning(self, "Sprite Workshop", save_message)
+            else:
+                QMessageBox.information(
+                    self,
+                    "Sprite Workshop",
+                    f"Updated atlas XML in place:\n{save_message}",
+                )
+        elif clicked == create_button and output_path:
+            saved, save_message = self.main_window.export_modified_spritesheet(
+                atlas,
+                output_path,
+                bake_recolor=self.bake_recolor_checkbox.isChecked(),
+                premultiply_alpha=self.premultiply_checkbox.isChecked(),
+                rewrite_manifest=True,
+            )
+            if not saved:
+                QMessageBox.warning(self, "Sprite Workshop", save_message)
+            else:
+                QMessageBox.information(
+                    self,
+                    "Sprite Workshop",
+                    f"Exported expanded spritesheet and XML:\n{save_message}",
+                )
         self._update_sprite_list()
 
     def _on_remove_clicked(self):

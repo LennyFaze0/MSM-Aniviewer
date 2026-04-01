@@ -39,6 +39,12 @@ from utils.ffmpeg_installer import (
 )
 from utils.shader_registry import ShaderRegistry, ShaderPreset
 from utils.keybinds import keybind_actions, default_keybinds, normalize_keybind_sequence
+from utils.bin_revision_detection import (
+    build_auto_converter_order,
+    collect_bin_detection_hints,
+    converter_display_name,
+    infer_revision_hint,
+)
 
 
 class ExportSettings:
@@ -630,6 +636,10 @@ class SettingsDialog(QDialog):
         self.anim_transfer_source_path: Optional[str] = None
         self.anim_transfer_target_path: Optional[str] = None
         self._reset_viewport_bg_to_default_on_save: bool = False
+        self._path_profiles: List[Dict[str, str]] = []
+        self._active_path_profile_index: int = 0
+        self._path_profile_ui_updating: bool = False
+        self._load_path_profiles_from_settings()
         self.setWindowTitle("Settings")
         self.setMinimumWidth(500)
         self.setMinimumHeight(450)
@@ -639,6 +649,285 @@ class SettingsDialog(QDialog):
         
         self.init_ui()
         self.load_current_settings()
+
+    @staticmethod
+    def _sanitize_path_value(value: Any) -> str:
+        if value is None:
+            return ""
+        return str(value).strip()
+
+    def _default_path_profile(self) -> Dict[str, str]:
+        legacy_game = self._sanitize_path_value(
+            self.app_settings.value("game_path", self._game_path_str or "", type=str)
+        )
+        legacy_downloads = self._sanitize_path_value(
+            self.app_settings.value("downloads_path", "", type=str)
+        )
+        legacy_dof = self._sanitize_path_value(
+            self.app_settings.value("dof_path", "", type=str)
+        )
+        return {
+            "name": "Default",
+            "game_path": legacy_game,
+            "downloads_path": legacy_downloads,
+            "dof_path": legacy_dof,
+        }
+
+    def _normalize_path_profile(self, raw: Any, fallback_name: str) -> Dict[str, str]:
+        if isinstance(raw, dict):
+            name = self._sanitize_path_value(raw.get("name")) or fallback_name
+            game_path = self._sanitize_path_value(raw.get("game_path"))
+            downloads_path = self._sanitize_path_value(raw.get("downloads_path"))
+            dof_path = self._sanitize_path_value(raw.get("dof_path"))
+        else:
+            name = fallback_name
+            game_path = ""
+            downloads_path = ""
+            dof_path = ""
+        return {
+            "name": name,
+            "game_path": game_path,
+            "downloads_path": downloads_path,
+            "dof_path": dof_path,
+        }
+
+    def _load_path_profiles_from_settings(self) -> None:
+        profiles: List[Dict[str, str]] = []
+        raw_profiles = self.app_settings.value("paths/profiles_json", "", type=str) or ""
+        if raw_profiles:
+            try:
+                parsed = json.loads(raw_profiles)
+            except Exception:
+                parsed = []
+            if isinstance(parsed, list):
+                for idx, entry in enumerate(parsed):
+                    profile = self._normalize_path_profile(entry, f"Profile {idx + 1}")
+                    profiles.append(profile)
+
+        if not profiles:
+            profiles = [self._default_path_profile()]
+
+        active_index = self.app_settings.value("paths/active_profile_index", 0, type=int)
+        try:
+            active_index = int(active_index)
+        except (TypeError, ValueError):
+            active_index = 0
+        if active_index < 0:
+            active_index = 0
+        if active_index >= len(profiles):
+            active_index = len(profiles) - 1
+
+        self._path_profiles = profiles
+        self._active_path_profile_index = active_index
+
+    def _refresh_paths_profile_widgets(self, *, selected_index: Optional[int] = None) -> None:
+        if not hasattr(self, "paths_profile_list"):
+            return
+
+        if not self._path_profiles:
+            self._path_profiles = [self._default_path_profile()]
+            self._active_path_profile_index = 0
+
+        if self._active_path_profile_index < 0:
+            self._active_path_profile_index = 0
+        if self._active_path_profile_index >= len(self._path_profiles):
+            self._active_path_profile_index = len(self._path_profiles) - 1
+
+        if selected_index is None:
+            current_row = self.paths_profile_list.currentRow()
+            selected_index = current_row if current_row >= 0 else self._active_path_profile_index
+        if selected_index < 0:
+            selected_index = 0
+        if selected_index >= len(self._path_profiles):
+            selected_index = len(self._path_profiles) - 1
+
+        self._path_profile_ui_updating = True
+        try:
+            self.paths_profile_list.blockSignals(True)
+            self.paths_profile_list.clear()
+            for idx, profile in enumerate(self._path_profiles):
+                name = profile.get("name") or f"Profile {idx + 1}"
+                if idx == self._active_path_profile_index:
+                    name = f"{name} (Active)"
+                self.paths_profile_list.addItem(name)
+            self.paths_profile_list.setCurrentRow(selected_index)
+            self.paths_profile_list.blockSignals(False)
+
+            self.paths_active_profile_combo.blockSignals(True)
+            self.paths_active_profile_combo.clear()
+            for idx, profile in enumerate(self._path_profiles):
+                name = profile.get("name") or f"Profile {idx + 1}"
+                self.paths_active_profile_combo.addItem(name, idx)
+            self.paths_active_profile_combo.setCurrentIndex(self._active_path_profile_index)
+            self.paths_active_profile_combo.blockSignals(False)
+
+            self._load_selected_path_profile_into_fields(selected_index)
+        finally:
+            self._path_profile_ui_updating = False
+
+    def _set_paths_profile_editor_enabled(self, enabled: bool) -> None:
+        for widget in (
+            getattr(self, "paths_profile_name_edit", None),
+            getattr(self, "paths_game_path_edit", None),
+            getattr(self, "paths_game_path_browse_btn", None),
+            getattr(self, "paths_downloads_path_edit", None),
+            getattr(self, "paths_downloads_path_browse_btn", None),
+            getattr(self, "paths_dof_path_edit", None),
+            getattr(self, "paths_dof_path_browse_btn", None),
+            getattr(self, "paths_remove_profile_btn", None),
+        ):
+            if widget is not None:
+                widget.setEnabled(enabled)
+
+    def _load_selected_path_profile_into_fields(self, index: int) -> None:
+        if not hasattr(self, "paths_profile_name_edit"):
+            return
+        if index < 0 or index >= len(self._path_profiles):
+            self._set_paths_profile_editor_enabled(False)
+            self.paths_profile_name_edit.clear()
+            self.paths_game_path_edit.clear()
+            self.paths_downloads_path_edit.clear()
+            self.paths_dof_path_edit.clear()
+            return
+
+        profile = self._path_profiles[index]
+        self._set_paths_profile_editor_enabled(True)
+
+        self.paths_profile_name_edit.setText(profile.get("name", ""))
+        self.paths_game_path_edit.setText(profile.get("game_path", ""))
+        self.paths_downloads_path_edit.setText(profile.get("downloads_path", ""))
+        self.paths_dof_path_edit.setText(profile.get("dof_path", ""))
+
+    def _commit_selected_path_profile_fields(self) -> None:
+        if self._path_profile_ui_updating:
+            return
+        if not hasattr(self, "paths_profile_list"):
+            return
+        row = self.paths_profile_list.currentRow()
+        if row < 0 or row >= len(self._path_profiles):
+            return
+        profile = self._path_profiles[row]
+        profile["name"] = self._sanitize_path_value(self.paths_profile_name_edit.text()) or f"Profile {row + 1}"
+        profile["game_path"] = self._sanitize_path_value(self.paths_game_path_edit.text())
+        profile["downloads_path"] = self._sanitize_path_value(self.paths_downloads_path_edit.text())
+        profile["dof_path"] = self._sanitize_path_value(self.paths_dof_path_edit.text())
+
+    def _on_paths_profile_selected(self, row: int) -> None:
+        if self._path_profile_ui_updating:
+            return
+        self._commit_selected_path_profile_fields()
+        self._path_profile_ui_updating = True
+        try:
+            self._load_selected_path_profile_into_fields(row)
+        finally:
+            self._path_profile_ui_updating = False
+
+    def _on_paths_active_profile_changed(self, index: int) -> None:
+        if self._path_profile_ui_updating:
+            return
+        if index < 0 or index >= len(self._path_profiles):
+            return
+        self._active_path_profile_index = index
+        selected_row = self.paths_profile_list.currentRow()
+        self._refresh_paths_profile_widgets(selected_index=selected_row)
+
+    def _on_paths_profile_fields_changed(self) -> None:
+        if self._path_profile_ui_updating:
+            return
+        self._commit_selected_path_profile_fields()
+        selected_row = self.paths_profile_list.currentRow()
+        self._refresh_paths_profile_widgets(selected_index=selected_row)
+
+    def _add_path_profile(self) -> None:
+        self._commit_selected_path_profile_fields()
+        count = len(self._path_profiles)
+        if count <= 0:
+            new_profile = self._default_path_profile()
+        else:
+            current_row = self.paths_profile_list.currentRow()
+            if current_row < 0 or current_row >= count:
+                current_row = self._active_path_profile_index
+            source = self._path_profiles[current_row]
+            new_profile = {
+                "name": f"Profile {count + 1}",
+                "game_path": source.get("game_path", ""),
+                "downloads_path": source.get("downloads_path", ""),
+                "dof_path": source.get("dof_path", ""),
+            }
+        self._path_profiles.append(new_profile)
+        self._refresh_paths_profile_widgets(selected_index=len(self._path_profiles) - 1)
+
+    def _remove_path_profile(self) -> None:
+        if len(self._path_profiles) <= 1:
+            QMessageBox.information(
+                self,
+                "Profile Required",
+                "At least one path profile must remain.",
+            )
+            return
+        row = self.paths_profile_list.currentRow()
+        if row < 0 or row >= len(self._path_profiles):
+            return
+        del self._path_profiles[row]
+        if self._active_path_profile_index >= len(self._path_profiles):
+            self._active_path_profile_index = len(self._path_profiles) - 1
+        elif row < self._active_path_profile_index:
+            self._active_path_profile_index -= 1
+        selected_index = min(row, len(self._path_profiles) - 1)
+        self._refresh_paths_profile_widgets(selected_index=selected_index)
+
+    def _browse_path_profile_game_path(self) -> None:
+        start_dir = self.paths_game_path_edit.text().strip() or self._game_path_str or str(Path.home())
+        folder = QFileDialog.getExistingDirectory(self, "Select Game Folder", start_dir)
+        if not folder:
+            return
+        self.paths_game_path_edit.setText(folder)
+
+    def _browse_path_profile_downloads_path(self) -> None:
+        start_dir = self.paths_downloads_path_edit.text().strip() or str(Path.home())
+        folder = QFileDialog.getExistingDirectory(self, "Select Downloads Folder", start_dir)
+        if not folder:
+            return
+        self.paths_downloads_path_edit.setText(folder)
+
+    def _browse_path_profile_dof_path(self) -> None:
+        start_dir = (
+            self.paths_dof_path_edit.text().strip()
+            or self.app_settings.value("dof_path", "", type=str)
+            or str(Path.home())
+        )
+        folder = QFileDialog.getExistingDirectory(self, "Select DOF Folder", start_dir)
+        if not folder:
+            return
+        self.paths_dof_path_edit.setText(folder)
+
+    def _save_path_profiles_to_settings(self) -> None:
+        self._commit_selected_path_profile_fields()
+        if not self._path_profiles:
+            self._path_profiles = [self._default_path_profile()]
+            self._active_path_profile_index = 0
+
+        if self._active_path_profile_index < 0:
+            self._active_path_profile_index = 0
+        if self._active_path_profile_index >= len(self._path_profiles):
+            self._active_path_profile_index = len(self._path_profiles) - 1
+
+        payload: List[Dict[str, str]] = []
+        for idx, entry in enumerate(self._path_profiles):
+            payload.append(self._normalize_path_profile(entry, f"Profile {idx + 1}"))
+
+        self._path_profiles = payload
+        active = payload[self._active_path_profile_index]
+
+        self.app_settings.setValue("paths/profiles_json", json.dumps(payload, ensure_ascii=True))
+        self.app_settings.setValue("paths/active_profile_index", int(self._active_path_profile_index))
+        self.app_settings.setValue("game_path", active.get("game_path", ""))
+        self.app_settings.setValue("downloads_path", active.get("downloads_path", ""))
+        self.app_settings.setValue("dof_path", active.get("dof_path", ""))
+
+        active_game = self._sanitize_path_value(active.get("game_path", ""))
+        self._game_path_str = active_game
+        self.game_path = Path(active_game) if active_game else None
 
     def _sync_dof_particle_cap_slider(self, value: int) -> None:
         if not hasattr(self, "dof_particle_cap_slider"):
@@ -1296,18 +1585,22 @@ class SettingsDialog(QDialog):
         self.bin_source_combo = QComboBox()
         self.bin_source_combo.addItem("Auto (recommended)", "auto")
         self.bin_source_combo.addItem("Rev6", "rev6")
+        self.bin_source_combo.addItem("Rev5", "rev5")
         self.bin_source_combo.addItem("Rev4", "rev4")
+        self.bin_source_combo.addItem("Rev3", "choir")
         self.bin_source_combo.addItem("Rev2", "rev2")
-        self.bin_source_combo.addItem("Legacy (early mobile)", "legacy")
-        self.bin_source_combo.addItem("Choir (Monster Choir)", "choir")
-        self.bin_source_combo.addItem("Muppets", "muppets")
-        self.bin_source_combo.addItem("Oldest (launch build)", "oldest")
+        self.bin_source_combo.addItem("Rev2 (My Muppets Show)", "muppets")
+        self.bin_source_combo.addItem("Rev1", "rev1_classic")
+        self.bin_source_combo.addItem("Rev1 (Legacy Mobile)", "legacy")
         converter_form.addRow("BIN Source Converter:", self.bin_source_combo)
 
         self.bin_target_combo = QComboBox()
         self.bin_target_combo.addItem("Rev6", 6)
+        self.bin_target_combo.addItem("Rev5", 5)
         self.bin_target_combo.addItem("Rev4", 4)
+        self.bin_target_combo.addItem("Rev3", 3)
         self.bin_target_combo.addItem("Rev2", 2)
+        self.bin_target_combo.addItem("Rev1 (Legacy Mobile)", 1)
         self.bin_target_combo.currentIndexChanged.connect(self._update_bin_convert_controls)
         converter_form.addRow("Target BIN Revision:", self.bin_target_combo)
 
@@ -1760,6 +2053,9 @@ class SettingsDialog(QDialog):
 
         anim_layout.addStretch()
         self.tab_widget.addTab(self._wrap_scrollable_tab(anim_tab), "Anim Transfer")
+
+        paths_tab = self._build_paths_tab()
+        self.tab_widget.addTab(self._wrap_scrollable_tab(paths_tab), "Paths")
 
         keybind_tab = self._build_keybinds_tab()
         self.tab_widget.addTab(self._wrap_scrollable_tab(keybind_tab), "Keybinds")
@@ -2381,6 +2677,91 @@ class SettingsDialog(QDialog):
         
         layout.addLayout(button_layout)
 
+    def _build_paths_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        hint = QLabel(
+            "Create reusable path profiles for Game, Downloads, and DOF roots. "
+            "The active profile is used by the viewer and toolbar path buttons."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: gray; font-size: 9pt;")
+        layout.addWidget(hint)
+
+        profile_group = QGroupBox("Path Profiles")
+        profile_layout = QVBoxLayout()
+
+        active_row = QHBoxLayout()
+        active_row.addWidget(QLabel("Active Profile:"))
+        self.paths_active_profile_combo = QComboBox()
+        self.paths_active_profile_combo.currentIndexChanged.connect(
+            self._on_paths_active_profile_changed
+        )
+        active_row.addWidget(self.paths_active_profile_combo, 1)
+        profile_layout.addLayout(active_row)
+
+        list_row = QHBoxLayout()
+        self.paths_profile_list = QListWidget()
+        self.paths_profile_list.setMinimumHeight(130)
+        self.paths_profile_list.currentRowChanged.connect(self._on_paths_profile_selected)
+        list_row.addWidget(self.paths_profile_list, 1)
+
+        side_buttons = QVBoxLayout()
+        self.paths_add_profile_btn = QPushButton("Add")
+        self.paths_add_profile_btn.clicked.connect(self._add_path_profile)
+        side_buttons.addWidget(self.paths_add_profile_btn)
+        self.paths_remove_profile_btn = QPushButton("Remove")
+        self.paths_remove_profile_btn.clicked.connect(self._remove_path_profile)
+        side_buttons.addWidget(self.paths_remove_profile_btn)
+        side_buttons.addStretch()
+        list_row.addLayout(side_buttons)
+
+        profile_layout.addLayout(list_row)
+
+        details_form = QFormLayout()
+        self.paths_profile_name_edit = QLineEdit()
+        self.paths_profile_name_edit.textChanged.connect(self._on_paths_profile_fields_changed)
+        details_form.addRow("Profile Name:", self.paths_profile_name_edit)
+
+        game_row = QHBoxLayout()
+        self.paths_game_path_edit = QLineEdit()
+        self.paths_game_path_edit.setPlaceholderText("/path/to/My Singing Monsters")
+        self.paths_game_path_edit.textChanged.connect(self._on_paths_profile_fields_changed)
+        game_row.addWidget(self.paths_game_path_edit, 1)
+        self.paths_game_path_browse_btn = QPushButton("Browse…")
+        self.paths_game_path_browse_btn.clicked.connect(self._browse_path_profile_game_path)
+        game_row.addWidget(self.paths_game_path_browse_btn)
+        details_form.addRow("Game Path:", game_row)
+
+        downloads_row = QHBoxLayout()
+        self.paths_downloads_path_edit = QLineEdit()
+        self.paths_downloads_path_edit.setPlaceholderText("/path/to/downloads root")
+        self.paths_downloads_path_edit.textChanged.connect(self._on_paths_profile_fields_changed)
+        downloads_row.addWidget(self.paths_downloads_path_edit, 1)
+        self.paths_downloads_path_browse_btn = QPushButton("Browse…")
+        self.paths_downloads_path_browse_btn.clicked.connect(self._browse_path_profile_downloads_path)
+        downloads_row.addWidget(self.paths_downloads_path_browse_btn)
+        details_form.addRow("Downloads Path:", downloads_row)
+
+        dof_row = QHBoxLayout()
+        self.paths_dof_path_edit = QLineEdit()
+        self.paths_dof_path_edit.setPlaceholderText("/path/to/DOF assets")
+        self.paths_dof_path_edit.textChanged.connect(self._on_paths_profile_fields_changed)
+        dof_row.addWidget(self.paths_dof_path_edit, 1)
+        self.paths_dof_path_browse_btn = QPushButton("Browse…")
+        self.paths_dof_path_browse_btn.clicked.connect(self._browse_path_profile_dof_path)
+        dof_row.addWidget(self.paths_dof_path_browse_btn)
+        details_form.addRow("DOF Path:", dof_row)
+
+        profile_layout.addLayout(details_form)
+        profile_group.setLayout(profile_layout)
+        layout.addWidget(profile_group)
+
+        layout.addStretch()
+        self._refresh_paths_profile_widgets(selected_index=self._active_path_profile_index)
+        return tab
+
     def _build_keybinds_tab(self) -> QWidget:
         tab = QWidget()
         layout = QVBoxLayout(tab)
@@ -2530,6 +2911,9 @@ class SettingsDialog(QDialog):
     
     def load_current_settings(self):
         """Load current settings into UI"""
+        if hasattr(self, "paths_profile_list"):
+            self._refresh_paths_profile_widgets(selected_index=self._active_path_profile_index)
+
         # PNG
         self.png_compression_spin.setValue(self.export_settings.png_compression)
         self.png_full_res_check.setChecked(self.export_settings.png_full_resolution)
@@ -3859,6 +4243,7 @@ class SettingsDialog(QDialog):
         self.app_settings.setValue("shaders/overrides", overrides_blob)
         self.shader_registry.set_user_overrides(shader_overrides)
 
+        self._save_path_profiles_to_settings()
         self._save_keybind_settings()
         self.export_settings.save()
         self._save_diagnostics_settings()
@@ -4002,11 +4387,17 @@ class SettingsDialog(QDialog):
         bin_dir = root / "Resources" / "bin2json"
         converters = {
             "rev6": bin_dir / "rev6-2-json.py",
+            "rev5": bin_dir / "rev5-2-json.py",
             "rev4": bin_dir / "rev4-2-json.py",
+            "rev3": bin_dir / "choir_bin_to_json.py",
             "rev2": bin_dir / "rev2-2-json.py",
+            "rev1": bin_dir / "legacy_bin_to_json.py",
+            "rev1_classic": bin_dir / "oldest_bin_to_json.py",
+            "rev1_launch": bin_dir / "oldest_bin_to_json.py",
             "legacy": bin_dir / "legacy_bin_to_json.py",
             "choir": bin_dir / "choir_bin_to_json.py",
             "muppets": bin_dir / "muppets_bin_to_json.py",
+            # Backward-compatible alias.
             "oldest": bin_dir / "oldest_bin_to_json.py",
         }
         resolved: Dict[str, Optional[str]] = {}
@@ -4020,8 +4411,30 @@ class SettingsDialog(QDialog):
         return str(script) if script.exists() else None
 
     def _bin_converter_availability_text(self) -> str:
-        available = [key for key, path in self._bin_converter_paths.items() if path]
-        missing = [key for key, path in self._bin_converter_paths.items() if not path]
+        def dedupe_preserve_order(values: List[str]) -> List[str]:
+            seen = set()
+            unique: List[str] = []
+            for value in values:
+                if value in seen:
+                    continue
+                seen.add(value)
+                unique.append(value)
+            return unique
+
+        available = dedupe_preserve_order(
+            [
+                converter_display_name(key)
+                for key, path in self._bin_converter_paths.items()
+                if path
+            ]
+        )
+        missing = dedupe_preserve_order(
+            [
+                converter_display_name(key)
+                for key, path in self._bin_converter_paths.items()
+                if not path
+            ]
+        )
         available_label = ", ".join(available) if available else "none"
         missing_label = ", ".join(missing) if missing else "none"
         dof_status = "available" if self._dof_converter_path else "missing"
@@ -4244,6 +4657,7 @@ class SettingsDialog(QDialog):
                 output_path,
                 target_rev,
                 self.bin_upgrade_blend_check.isChecked(),
+                self.bin_source_combo.currentData(),
             )
             if success:
                 if getattr(self, "bin_copy_xml_check", None) and self.bin_copy_xml_check.isChecked():
@@ -4272,6 +4686,7 @@ class SettingsDialog(QDialog):
                 output_path,
                 target_rev,
                 self.bin_upgrade_blend_check.isChecked(),
+                converter_key,
             )
             if success:
                 if getattr(self, "bin_copy_xml_check", None) and self.bin_copy_xml_check.isChecked():
@@ -4287,12 +4702,13 @@ class SettingsDialog(QDialog):
             return self._convert_bin_to_json_auto(bin_path, json_path)
         script_path = self._bin_converter_paths.get(converter_key)
         if not script_path:
-            self._log_bin_convert(f"Converter '{converter_key}' is not available.", "ERROR")
-            QMessageBox.warning(self, "Missing Converter", f"Converter '{converter_key}' is not available.")
+            friendly = converter_display_name(converter_key)
+            self._log_bin_convert(f"Converter {friendly} is not available.", "ERROR")
+            QMessageBox.warning(self, "Missing Converter", f"Converter {friendly} is not available.")
             return False
         cmd, cwd = self._build_bin_to_json_command(converter_key, script_path, bin_path, json_path)
         produced_json = json_path
-        if converter_key in ("rev2", "rev4", "rev6"):
+        if converter_key in ("rev2", "rev4", "rev5", "rev6"):
             produced_json = str(Path(bin_path).with_suffix(".json"))
         if not self._run_converter(cmd, cwd, produced_json):
             return False
@@ -4302,70 +4718,79 @@ class SettingsDialog(QDialog):
             except Exception as exc:
                 self._log_bin_convert(f"Failed to move JSON output: {exc}", "ERROR")
                 return False
+        expected_rev = self._expected_converter_output_rev(converter_key)
+        valid, reason = self._validate_converted_animation_json(json_path, expected_rev)
+        if not valid:
+            self._log_bin_convert(f"Rejected converter output: {reason}", "ERROR")
+            QMessageBox.warning(
+                self,
+                "Invalid Conversion Output",
+                f"Converter output failed validation:\n{reason}",
+            )
+            return False
         return True
 
     def _convert_bin_to_json_auto(self, bin_path: str, json_path: str) -> bool:
-        bin_name = os.path.basename(bin_path).lower()
-        normalized_path = os.path.normcase(os.path.normpath(bin_path))
-        is_muppet_bin = bin_name.startswith("muppet_")
-        is_my_singing_muppets = "my singing muppets.app" in normalized_path
-        is_composer_bin = "_composer" in bin_name
+        detection_hints = collect_bin_detection_hints(bin_path)
+        revision_hint = detection_hints.revision_hint
+        hint_parts: List[str] = []
+        if revision_hint is not None:
+            hint_parts.append(f"rev {revision_hint}")
+        if detection_hints.family_hint:
+            hint_parts.append(f"{detection_hints.family_hint} family")
+        if hint_parts:
+            self._log_bin_convert(f"Auto-detect hints: {', '.join(hint_parts)}.", "INFO")
 
-        if is_muppet_bin and not is_my_singing_muppets and self._bin_converter_paths.get("muppets"):
-            self._log_bin_convert("Detected muppet_* BIN; using muppets converter.", "INFO")
-            script = self._bin_converter_paths["muppets"]
-            cmd, cwd = self._build_bin_to_json_command("muppets", script, bin_path, json_path)
-            if self._run_converter(cmd, cwd, json_path):
-                self._log_bin_convert("Converted using muppets converter.", "SUCCESS")
-                return True
-            self._log_bin_convert("Muppets converter failed; stopping auto-detect.", "ERROR")
-            QMessageBox.warning(self, "Conversion Failed", "Muppets converter failed for this BIN.")
-            return False
-
-        attempts: List[Tuple[str, List[str], Optional[str]]] = []
+        attempts: List[Tuple[str, List[str], Optional[str], str]] = []
+        queued: set = set()
 
         def queue(key: str) -> None:
+            if key in queued:
+                return
             script = self._bin_converter_paths.get(key)
+            friendly = converter_display_name(key)
             if not script:
-                self._log_bin_convert(f"Converter '{key}' is missing; skipping.", "WARNING")
+                self._log_bin_convert(f"Converter {friendly} is missing; skipping.", "WARNING")
                 return
             cmd, cwd = self._build_bin_to_json_command(key, script, bin_path, json_path)
-            attempts.append((key, cmd, cwd))
+            produced_json = json_path
+            if key in ("rev2", "rev4", "rev5", "rev6"):
+                produced_json = str(Path(bin_path).with_suffix(".json"))
+            attempts.append((key, cmd, cwd, produced_json))
+            queued.add(key)
 
-        if is_muppet_bin and is_my_singing_muppets:
-            queue("rev2")
-        if is_muppet_bin and not is_my_singing_muppets:
-            queue("muppets")
-        if is_composer_bin:
-            queue("rev4")
-        queue("legacy")
-        queue("choir")
-        if not (is_muppet_bin and is_my_singing_muppets):
-            queue("rev2")
-        if not is_composer_bin:
-            queue("rev4")
-        queue("oldest")
-        queue("rev6")
+        for key in build_auto_converter_order(detection_hints):
+            queue(key)
 
         if not attempts:
             self._log_bin_convert("No BIN converters available for auto-detect.", "ERROR")
             QMessageBox.warning(self, "Missing Converters", "No BIN converters are available.")
             return False
 
-        for key, cmd, cwd in attempts:
-            self._log_bin_convert(f"Trying {key} converter...", "INFO")
-            expected_json = json_path
-            if key in ("rev2", "rev4", "rev6"):
-                expected_json = str(Path(bin_path).with_suffix(".json"))
+        for key, cmd, cwd, expected_json in attempts:
+            friendly = converter_display_name(key)
+            self._log_bin_convert(f"Trying {friendly} converter...", "INFO")
             if self._run_converter(cmd, cwd, expected_json, show_success=False):
                 if os.path.normcase(os.path.normpath(expected_json)) != os.path.normcase(os.path.normpath(json_path)):
                     with contextlib.suppress(Exception):
                         shutil.move(expected_json, json_path)
-                self._log_bin_convert(f"Converted using {key}.", "SUCCESS")
+                expected_rev = self._expected_converter_output_rev(key)
+                valid, reason = self._validate_converted_animation_json(json_path, expected_rev)
+                if not valid:
+                    self._log_bin_convert(
+                        f"Rejected {friendly} output: {reason}",
+                        "WARNING",
+                    )
+                    continue
+                self._log_bin_convert(f"Converted using {friendly}.", "SUCCESS")
                 return True
         self._log_bin_convert("All converters failed. See log for details.", "ERROR")
         QMessageBox.warning(self, "Conversion Failed", "Auto conversion failed for all converters.")
         return False
+
+    @staticmethod
+    def _infer_revision_hint(normalized_path: str) -> Optional[int]:
+        return infer_revision_hint(normalized_path)
 
     def _convert_dof_to_json(self, input_path: str, output_dir: str) -> bool:
         if not self._dof_converter_path or not os.path.exists(self._dof_converter_path):
@@ -4493,11 +4918,72 @@ class SettingsDialog(QDialog):
         bin_path: str,
         json_path: str,
     ) -> Tuple[List[str], Optional[str]]:
-        if converter_key in ("legacy", "choir", "muppets", "oldest"):
+        if converter_key in ("legacy", "choir", "muppets", "rev1_classic", "rev1_launch", "oldest"):
             cmd = self._build_python_command(script_path) + [bin_path, "-o", json_path]
         else:
             cmd = self._build_python_command(script_path) + ["d", bin_path]
         return cmd, os.path.dirname(script_path)
+
+    @staticmethod
+    def _expected_converter_output_rev(converter_key: str) -> Optional[int]:
+        if converter_key == "rev2":
+            return 2
+        if converter_key == "rev4":
+            return 4
+        if converter_key == "rev3":
+            return 6
+        if converter_key in ("rev6", "rev5", "legacy", "choir", "muppets", "rev1_classic", "rev1_launch", "oldest"):
+            return 6
+        return None
+
+    def _validate_converted_animation_json(
+        self,
+        json_path: str,
+        expected_rev: Optional[int] = None,
+    ) -> Tuple[bool, str]:
+        try:
+            with open(json_path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except Exception as exc:
+            return False, f"output JSON is unreadable ({exc})"
+
+        if not isinstance(payload, dict):
+            return False, "output JSON root is not an object"
+
+        if expected_rev is not None:
+            rev_value = payload.get("rev")
+            try:
+                rev_int = int(rev_value)
+            except (TypeError, ValueError):
+                return False, f"missing/invalid rev value ({rev_value!r})"
+            if rev_int != expected_rev:
+                return False, f"rev {rev_int} does not match expected rev {expected_rev}"
+
+        anims = payload.get("anims")
+        if not isinstance(anims, list) or not anims:
+            return False, "no animations were produced"
+
+        valid_anims = 0
+        layer_total = 0
+        for anim in anims:
+            if not isinstance(anim, dict):
+                continue
+            layers = anim.get("layers")
+            if not isinstance(layers, list) or not layers:
+                continue
+            layer_count = 0
+            for layer in layers:
+                if isinstance(layer, dict):
+                    frames = layer.get("frames")
+                    if isinstance(frames, list) and len(frames) > 0:
+                        layer_count += 1
+            if layer_count:
+                valid_anims += 1
+                layer_total += layer_count
+
+        if valid_anims <= 0 or layer_total <= 0:
+            return False, "animation payload has no valid layers/frames"
+        return True, f"{valid_anims} animation(s), {layer_total} layer(s)"
 
     def _convert_json_to_bin(
         self,
@@ -4505,14 +4991,8 @@ class SettingsDialog(QDialog):
         output_bin_path: str,
         target_rev: int,
         upgrade_blend: bool,
+        source_converter_hint: Optional[str] = None,
     ) -> bool:
-        script_key = f"rev{target_rev}"
-        script_path = self._bin_converter_paths.get(script_key)
-        if not script_path:
-            self._log_bin_convert(f"Converter '{script_key}' is not available.", "ERROR")
-            QMessageBox.warning(self, "Missing Converter", f"Converter '{script_key}' is not available.")
-            return False
-
         try:
             with open(json_path, "r", encoding="utf-8") as handle:
                 payload = json.load(handle)
@@ -4520,6 +5000,32 @@ class SettingsDialog(QDialog):
             self._log_bin_convert(f"Failed to read JSON: {exc}", "ERROR")
             QMessageBox.warning(self, "Invalid JSON", f"Could not read JSON:\n{exc}")
             return False
+
+        source_format = payload.get("source_format")
+        source_key = source_format.strip().lower() if isinstance(source_format, str) else ""
+        preferred_key = (source_converter_hint or "").strip().lower()
+
+        script_key = f"rev{target_rev}"
+        if target_rev == 2 and (preferred_key == "muppets" or source_key in ("muppets", "rev2_muppets")):
+            script_key = "muppets"
+        elif target_rev == 1 and (
+            preferred_key in ("rev1_classic", "rev1_launch", "oldest")
+            or source_key in ("rev1_classic", "rev1_launch", "rev1_launch_build", "oldest")
+        ):
+            script_key = "rev1_classic"
+
+        script_path = self._bin_converter_paths.get(script_key)
+        if not script_path:
+            friendly = converter_display_name(script_key)
+            self._log_bin_convert(f"Converter {friendly} is not available.", "ERROR")
+            QMessageBox.warning(self, "Missing Converter", f"Converter {friendly} is not available.")
+            return False
+
+        if script_key not in (f"rev{target_rev}",):
+            self._log_bin_convert(
+                f"Using {converter_display_name(script_key)} writer for rev{target_rev} export.",
+                "INFO",
+            )
 
         rev_value = payload.get("rev")
         rev_int = None
@@ -4530,51 +5036,44 @@ class SettingsDialog(QDialog):
                 rev_int = int(rev_value.strip())
             except (TypeError, ValueError):
                 rev_int = None
-        if target_rev in (2, 4) and rev_int != target_rev:
+        if target_rev in (1, 2, 3, 4, 5) and rev_int is not None and rev_int != target_rev:
             self._log_bin_convert(
-                f"JSON rev is {rev_value}; cannot export as rev{target_rev} without a proper down-conversion.",
-                "ERROR",
+                f"Down-converting JSON rev {rev_int} to rev{target_rev}.",
+                "WARNING",
             )
-            QMessageBox.warning(
-                self,
-                "Revision Mismatch",
-                f"JSON rev is {rev_value}. Exporting a rev{target_rev} BIN is not supported.",
-            )
-            return False
 
-        working_json = json_path
-        temp_json = None
+        prepared_payload: Dict[str, Any]
+        adjustment_count = 0
+        if target_rev == 6:
+            prepared_payload = self._upgrade_json_for_rev6(payload, upgrade_blend)
+        else:
+            prepared_payload, adjustment_count = self._normalize_payload_for_legacy_export(payload, target_rev)
+            if adjustment_count:
+                self._log_bin_convert(
+                    f"Adjusted {adjustment_count} legacy field value(s) for rev{target_rev} export.",
+                    "WARNING",
+                )
+
+        temp_root = Path(tempfile.mkdtemp(prefix="bin_export_"))
         try:
             target_stem = Path(output_bin_path).with_suffix("").name
-            target_dir = Path(output_bin_path).parent
-            target_json_path = str(target_dir / f"{target_stem}.json")
-
-            if target_rev == 6:
-                upgraded = self._upgrade_json_for_rev6(payload, upgrade_blend)
-                target_dir.mkdir(parents=True, exist_ok=True)
-                with open(target_json_path, "w", encoding="utf-8") as handle:
-                    json.dump(upgraded, handle, indent=2)
-                working_json = target_json_path
-                temp_json = target_json_path
-                self._log_bin_convert("Prepared JSON payload for rev6 export.", "INFO")
-            elif os.path.normcase(os.path.normpath(json_path)) != os.path.normcase(os.path.normpath(target_json_path)):
-                target_dir.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(json_path, target_json_path)
-                working_json = target_json_path
-                temp_json = target_json_path
+            working_json = str(temp_root / f"{target_stem or 'animation'}.json")
+            with open(working_json, "w", encoding="utf-8") as handle:
+                json.dump(prepared_payload, handle, indent=2)
+            self._log_bin_convert(f"Prepared JSON payload for rev{target_rev} export.", "INFO")
 
             cmd = self._build_python_command(script_path) + ["b", working_json]
             produced_bin = str(Path(working_json).with_suffix(".bin"))
             if not self._run_converter(cmd, os.path.dirname(script_path), produced_bin):
                 return False
+            output_dir = Path(output_bin_path).parent
+            output_dir.mkdir(parents=True, exist_ok=True)
             if os.path.normcase(os.path.normpath(produced_bin)) != os.path.normcase(os.path.normpath(output_bin_path)):
                 shutil.move(produced_bin, output_bin_path)
             self._log_bin_convert(f"Wrote BIN: {output_bin_path}", "SUCCESS")
             return True
         finally:
-            if temp_json and os.path.exists(temp_json):
-                with contextlib.suppress(Exception):
-                    os.remove(temp_json)
+            shutil.rmtree(temp_root, ignore_errors=True)
 
     def _upgrade_json_for_rev6(self, payload: Dict[str, Any], upgrade_blend: bool) -> Dict[str, Any]:
         updated = dict(payload)
@@ -4600,6 +5099,10 @@ class SettingsDialog(QDialog):
         adjustments = 0
         warnings: List[str] = []
 
+        def _warn(message: str) -> None:
+            if len(warnings) < 8:
+                warnings.append(message)
+
         def normalize_int16(value: Any, label: str) -> Any:
             nonlocal adjustments
             if value is None:
@@ -4610,8 +5113,7 @@ class SettingsDialog(QDialog):
                 try:
                     value = int(str(value).strip())
                 except (TypeError, ValueError):
-                    if len(warnings) < 5:
-                        warnings.append(f"{label} value '{value}' is not numeric; set to 0.")
+                    _warn(f"{label} value '{value}' is not numeric; set to 0.")
                     adjustments += 1
                     return 0
             if -32768 <= value <= 32767:
@@ -4620,20 +5122,357 @@ class SettingsDialog(QDialog):
                 adjustments += 1
                 return value - 65536
             adjustments += 1
-            if len(warnings) < 5:
-                warnings.append(f"{label} value {value} out of int16 range; clamped.")
+            _warn(f"{label} value {value} out of int16 range; clamped.")
             return max(-32768, min(32767, value))
 
+        def normalize_blend(value: Any, label: str) -> int:
+            nonlocal adjustments
+            blend = self._coerce_int_value(value, 0)
+            if 0 <= blend <= 7:
+                return blend
+            adjustments += 1
+            _warn(f"{label} value {blend} is unsupported for rev6; mapped to 2.")
+            return 2
+
+        def normalize_immediate(value: Any, label: str) -> int:
+            nonlocal adjustments
+            if value is None:
+                return -1
+            immediate = self._coerce_int_value(value, 0)
+            if immediate in (-1, 0, 1):
+                return immediate
+            if 0 <= immediate <= 255:
+                signed = immediate if immediate < 128 else immediate - 256
+                if signed in (-1, 0, 1):
+                    adjustments += 1
+                    _warn(
+                        f"{label} value {immediate} normalized to signed immediate {signed}."
+                    )
+                    return signed
+            adjustments += 1
+            _warn(f"{label} value {immediate} is invalid; defaulted to 0.")
+            return 0
+
+        def clamp_byte(value: Any, label: str) -> int:
+            nonlocal adjustments
+            channel = self._coerce_int_value(value, 255)
+            if 0 <= channel <= 255:
+                return channel
+            adjustments += 1
+            _warn(f"{label} value {channel} out of 0..255 range; clamped.")
+            return max(0, min(255, channel))
+
         for anim in updated.get("anims", []):
+            if not isinstance(anim, dict):
+                continue
             for layer in anim.get("layers", []):
-                if isinstance(layer, dict):
-                    layer["parent"] = normalize_int16(layer.get("parent"), "layer.parent")
-                    layer["id"] = normalize_int16(layer.get("id"), "layer.id")
-                    layer["src"] = normalize_int16(layer.get("src"), "layer.src")
+                if not isinstance(layer, dict):
+                    continue
+                layer["parent"] = normalize_int16(layer.get("parent"), "layer.parent")
+                layer["id"] = normalize_int16(layer.get("id"), "layer.id")
+                layer["src"] = normalize_int16(layer.get("src"), "layer.src")
+                layer["blend"] = normalize_blend(layer.get("blend", 0), "layer.blend")
+
+                frames = layer.get("frames")
+                if not isinstance(frames, list):
+                    continue
+                for frame_index, frame in enumerate(frames):
+                    if not isinstance(frame, dict):
+                        adjustments += 1
+                        continue
+                    for track_key in ("pos", "scale", "rotation", "opacity", "sprite", "rgb"):
+                        node = frame.get(track_key)
+                        if not isinstance(node, dict):
+                            continue
+                        node["immediate"] = normalize_immediate(
+                            node.get("immediate"),
+                            f"frame[{frame_index}].{track_key}.immediate",
+                        )
+                    rgb = frame.get("rgb")
+                    if isinstance(rgb, dict):
+                        rgb["red"] = clamp_byte(rgb.get("red", 255), f"frame[{frame_index}].rgb.red")
+                        rgb["green"] = clamp_byte(rgb.get("green", 255), f"frame[{frame_index}].rgb.green")
+                        rgb["blue"] = clamp_byte(rgb.get("blue", 255), f"frame[{frame_index}].rgb.blue")
 
         for warning in warnings:
             self._log_bin_convert(warning, "WARNING")
         return updated, adjustments
+
+    def _normalize_payload_for_legacy_export(
+        self,
+        payload: Dict[str, Any],
+        target_rev: int,
+    ) -> Tuple[Dict[str, Any], int]:
+        updated = copy.deepcopy(payload)
+        updated["rev"] = int(target_rev)
+        if "blend_version" not in updated:
+            updated["blend_version"] = 1
+
+        adjustments = 0
+
+        def parse_parent_index(value: Any) -> int:
+            if isinstance(value, str):
+                text = value.strip()
+                if not text:
+                    return -1
+                if ":" in text:
+                    text = text.split(":", 1)[0].strip()
+                try:
+                    return int(text)
+                except (TypeError, ValueError):
+                    return -1
+            return self._coerce_int_value(value, -1)
+
+        def normalize_int32(value: Any, default: int = 0) -> int:
+            nonlocal adjustments
+            number = self._coerce_int_value(value, default)
+            if -2147483648 <= number <= 2147483647:
+                return number
+            adjustments += 1
+            return max(-2147483648, min(2147483647, number))
+
+        def normalize_uint16(value: Any, default: int = 0) -> int:
+            nonlocal adjustments
+            number = self._coerce_int_value(value, default)
+            if 0 <= number <= 65535:
+                return number
+            if -32768 <= number < 0:
+                adjustments += 1
+                return (number + 65536) & 0xFFFF
+            if 65536 <= number <= 0xFFFFFFFF:
+                adjustments += 1
+                return number & 0xFFFF
+            adjustments += 1
+            return max(0, min(65535, number))
+
+        def normalize_uint32(value: Any, default: int = 0) -> int:
+            nonlocal adjustments
+            number = self._coerce_int_value(value, default)
+            if 0 <= number <= 0xFFFFFFFF:
+                return number
+            adjustments += 1
+            return max(0, min(0xFFFFFFFF, number))
+
+        anims = updated.get("anims")
+        if not isinstance(anims, list):
+            updated["anims"] = []
+            return updated, adjustments + 1
+
+        sources = updated.get("sources")
+        if isinstance(sources, list):
+            for source in sources:
+                if not isinstance(source, dict):
+                    adjustments += 1
+                    continue
+                source["src"] = str(source.get("src", "") or "")
+                source["id"] = normalize_uint16(source.get("id", 0), 0)
+                source["width"] = normalize_uint16(source.get("width", 0), 0)
+                source["height"] = normalize_uint16(source.get("height", 0), 0)
+        else:
+            updated["sources"] = []
+            adjustments += 1
+
+        for anim in anims:
+            if not isinstance(anim, dict):
+                adjustments += 1
+                continue
+            anim["name"] = str(anim.get("name", ""))
+            anim["width"] = normalize_uint16(anim.get("width", 0), 0)
+            anim["height"] = normalize_uint16(anim.get("height", 0), 0)
+            anim["centered"] = normalize_uint32(anim.get("centered", 0), 0)
+            anim["loop_offset"] = self._coerce_float_value(anim.get("loop_offset", 0.0), 0.0)
+
+            layers = anim.get("layers")
+            if not isinstance(layers, list):
+                anim["layers"] = []
+                adjustments += 1
+                continue
+
+            for layer in layers:
+                if not isinstance(layer, dict):
+                    adjustments += 1
+                    continue
+
+                blend = self._coerce_int_value(layer.get("blend", 0), 0)
+                if target_rev == 5:
+                    if 0 <= blend <= 7:
+                        layer["blend"] = blend
+                    elif blend in (3, 4):
+                        layer["blend"] = 1
+                        adjustments += 1
+                    else:
+                        layer["blend"] = 0
+                        if blend != 0:
+                            adjustments += 1
+                else:
+                    if blend in (0, 1, 2):
+                        layer["blend"] = blend
+                    elif blend in (3, 4):
+                        # Premult alpha variants map closest to additive in older revs.
+                        layer["blend"] = 1
+                        adjustments += 1
+                    else:
+                        layer["blend"] = 0
+                        if blend != 0:
+                            adjustments += 1
+
+                layer["name"] = str(layer.get("name", "") or "")
+                layer["type"] = normalize_int32(layer.get("type", 1), 1)
+
+                if target_rev in (3, 4, 5):
+                    parent_norm = self._normalize_int16(parse_parent_index(layer.get("parent", -1)))
+                    if parent_norm is None:
+                        parent_norm = -1
+                        adjustments += 1
+                    layer["parent"] = parent_norm
+                    if target_rev in (4, 5):
+                        layer["id"] = normalize_uint16(layer.get("id", 0), 0)
+                        layer["src"] = normalize_uint16(layer.get("src", 0), 0)
+                        rgb = layer.get("rgb")
+                        if not isinstance(rgb, dict):
+                            rgb = {}
+                        rgb["red"] = normalize_uint16(rgb.get("red", 255), 255)
+                        rgb["green"] = normalize_uint16(rgb.get("green", 255), 255)
+                        rgb["blue"] = normalize_uint16(rgb.get("blue", 255), 255)
+                        layer["rgb"] = rgb
+                    else:
+                        layer["id"] = normalize_uint32(layer.get("id", 0), 0)
+                        layer["src"] = normalize_uint32(layer.get("src", 0), 0)
+                else:
+                    parent_value = layer.get("parent", "-1")
+                    if isinstance(parent_value, str):
+                        parent_text = parent_value.strip()
+                        if not parent_text:
+                            parent_text = "-1"
+                            adjustments += 1
+                    else:
+                        parent_text = str(parse_parent_index(parent_value))
+                    layer["parent"] = parent_text
+                    layer["id"] = normalize_uint32(layer.get("id", 0), 0)
+                    layer["src"] = normalize_uint32(layer.get("src", 0), 0)
+
+                frames = layer.get("frames")
+                if not isinstance(frames, list):
+                    layer["frames"] = []
+                    adjustments += 1
+                    continue
+
+                default_anchor_x = self._coerce_float_value(layer.get("anchor_x", 0.0), 0.0)
+                default_anchor_y = self._coerce_float_value(layer.get("anchor_y", 0.0), 0.0)
+                for frame in frames:
+                    if not isinstance(frame, dict):
+                        adjustments += 1
+                        continue
+                    frame["time"] = self._coerce_float_value(frame.get("time", 0.0), 0.0)
+                    frame["mask"] = self._normalize_frame_track_dict(
+                        frame.get("mask"),
+                        ("x", "y", "w", "h"),
+                        (0.0, 0.0, 0.0, 0.0),
+                    )
+                    frame["anchor"] = self._normalize_frame_track_dict(
+                        frame.get("anchor"),
+                        ("x", "y"),
+                        (default_anchor_x, default_anchor_y),
+                    )
+                    frame["pos"] = self._normalize_frame_track_dict(frame.get("pos"), ("x", "y"), (0.0, 0.0))
+                    frame["scale"] = self._normalize_frame_track_dict(frame.get("scale"), ("x", "y"), (1.0, 1.0))
+                    frame["rotation"] = self._normalize_frame_track_dict(frame.get("rotation"), "value", 0.0)
+                    frame["opacity"] = self._normalize_frame_track_dict(frame.get("opacity"), "value", 1.0)
+                    frame["sprite"] = self._normalize_frame_string_dict(frame.get("sprite"), "string")
+                    if target_rev == 2:
+                        frame["cell"] = self._normalize_frame_track_dict(frame.get("cell"), ("x", "y"), (0.0, 0.0))
+                        frame["index"] = self._normalize_frame_track_dict(frame.get("index"), "value", 0.0)
+                        frame["depth"] = self._normalize_frame_track_dict(frame.get("depth"), "value", 0.0)
+                        frame["font"] = self._normalize_frame_font_dict(frame.get("font"))
+
+        return updated, adjustments
+
+    @staticmethod
+    def _coerce_int_value(value: Any, default: int = 0) -> int:
+        if value is None:
+            return int(default)
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, int):
+            return value
+        try:
+            return int(str(value).strip())
+        except (TypeError, ValueError):
+            try:
+                return int(float(str(value).strip()))
+            except (TypeError, ValueError):
+                return int(default)
+
+    @staticmethod
+    def _coerce_float_value(value: Any, default: float = 0.0) -> float:
+        if value is None:
+            return float(default)
+        if isinstance(value, bool):
+            return float(int(value))
+        if isinstance(value, (int, float)):
+            return float(value)
+        try:
+            return float(str(value).strip())
+        except (TypeError, ValueError):
+            return float(default)
+
+    def _normalize_frame_track_dict(
+        self,
+        node: Any,
+        value_keys: Any,
+        defaults: Any,
+    ) -> Dict[str, Any]:
+        out: Dict[str, Any] = dict(node) if isinstance(node, dict) else {}
+        immediate = self._coerce_int_value(out.get("immediate", 0), 0)
+        if immediate not in (-1, 0, 1):
+            if 0 <= immediate <= 255:
+                signed = immediate if immediate < 128 else immediate - 256
+                immediate = signed if signed in (-1, 0, 1) else 0
+            else:
+                immediate = 0
+        out["immediate"] = immediate
+        if isinstance(value_keys, tuple):
+            for key, default in zip(value_keys, defaults):
+                out[key] = self._coerce_float_value(out.get(key, default), default)
+        else:
+            out[str(value_keys)] = self._coerce_float_value(out.get(value_keys, defaults), defaults)
+        return out
+
+    def _normalize_frame_string_dict(self, node: Any, value_key: str) -> Dict[str, Any]:
+        out: Dict[str, Any] = dict(node) if isinstance(node, dict) else {}
+        immediate = self._coerce_int_value(out.get("immediate", 0), 0)
+        if immediate not in (-1, 0, 1):
+            if 0 <= immediate <= 255:
+                signed = immediate if immediate < 128 else immediate - 256
+                immediate = signed if signed in (-1, 0, 1) else 0
+            else:
+                immediate = 0
+        out["immediate"] = immediate
+        out[value_key] = str(out.get(value_key, "") or "")
+        return out
+
+    def _normalize_frame_font_dict(self, node: Any) -> Dict[str, Any]:
+        out: Dict[str, Any] = dict(node) if isinstance(node, dict) else {}
+        immediate = self._coerce_int_value(out.get("immediate", 0), 0)
+        if immediate not in (-1, 0, 1):
+            if 0 <= immediate <= 255:
+                signed = immediate if immediate < 128 else immediate - 256
+                immediate = signed if signed in (-1, 0, 1) else 0
+            else:
+                immediate = 0
+        out["immediate"] = immediate
+        size = self._coerce_int_value(out.get("size", 0), 0)
+        out["size"] = max(-2147483648, min(2147483647, size))
+        align = self._coerce_int_value(out.get("align", 0), 0)
+        out["align"] = max(0, min(0xFFFFFFFF, align))
+        out["r"] = max(0, min(255, self._coerce_int_value(out.get("r", 255), 255)))
+        out["g"] = max(0, min(255, self._coerce_int_value(out.get("g", 255), 255)))
+        out["b"] = max(0, min(255, self._coerce_int_value(out.get("b", 255), 255)))
+        out["type"] = max(0, min(255, self._coerce_int_value(out.get("type", 0), 0)))
+        out["name"] = str(out.get("name", "") or "")
+        out["width"] = self._coerce_float_value(out.get("width", 0.0), 0.0)
+        out["height"] = self._coerce_float_value(out.get("height", 0.0), 0.0)
+        return out
 
     def _run_converter(
         self,

@@ -3,8 +3,9 @@ Animation Player
 Handles animation playback, timing, and keyframe interpolation
 """
 
+import math
 import re
-from typing import Optional, Dict, Tuple
+from typing import Callable, Dict, Optional, Tuple
 from .data_structures import AnimationData, LayerData, KeyframeData
 
 
@@ -12,6 +13,7 @@ class AnimationPlayer:
     """Handles animation playback and interpolation"""
     
     _sprite_suffix_pattern = re.compile(r'^(.*?)(\d+)$')
+    _MAX_DURATION_SECONDS = 2147483647 / 1000.0
     
     def __init__(self):
         self.animation: Optional[AnimationData] = None
@@ -20,7 +22,30 @@ class AnimationPlayer:
         self.loop: bool = True
         self.duration: float = 0.0
         self.playback_speed: float = 1.0
-    
+        self._sprite_name_resolver: Optional[Callable[[str], Optional[str]]] = None
+
+    def set_sprite_name_resolver(
+        self, resolver: Optional[Callable[[str], Optional[str]]]
+    ) -> None:
+        """Inject a resolver that can validate/remap sprite names."""
+        self._sprite_name_resolver = resolver
+
+    def _resolve_sprite_name(self, sprite_name: Optional[str]) -> str:
+        """Resolve sprite names through atlas-aware lookup when available."""
+        if not sprite_name:
+            return ""
+        name = str(sprite_name)
+        resolver = self._sprite_name_resolver
+        if resolver is None:
+            return name
+        try:
+            resolved = resolver(name)
+        except Exception:
+            return name
+        if isinstance(resolved, str) and resolved:
+            return resolved
+        return ""
+
     def load_animation(self, anim_data: AnimationData):
         """
         Load animation data
@@ -37,23 +62,32 @@ class AnimationPlayer:
         if not self.animation:
             self.duration = 0.0
             return
-        
+
+        def _safe_time(raw_time) -> float:
+            try:
+                value = float(raw_time)
+            except (TypeError, ValueError):
+                return 0.0
+            if not math.isfinite(value) or value < 0.0:
+                return 0.0
+            return min(value, self._MAX_DURATION_SECONDS)
+
         max_time = 0.0
         global_lanes = getattr(self.animation, "global_keyframe_lanes", []) or []
         for lane in global_lanes:
             if lane and getattr(lane, "keyframes", None):
-                last_keyframe = max(lane.keyframes, key=lambda k: k.time)
-                max_time = max(max_time, last_keyframe.time)
+                for keyframe in lane.keyframes:
+                    max_time = max(max_time, _safe_time(getattr(keyframe, "time", 0.0)))
         for layer in self.animation.layers:
             if layer.keyframes:
-                last_keyframe = max(layer.keyframes, key=lambda k: k.time)
-                max_time = max(max_time, last_keyframe.time)
+                for keyframe in layer.keyframes:
+                    max_time = max(max_time, _safe_time(getattr(keyframe, "time", 0.0)))
             extra_lanes = getattr(layer, "extra_keyframe_lanes", []) or []
             for lane in extra_lanes:
                 if lane and getattr(lane, "keyframes", None):
-                    last_keyframe = max(lane.keyframes, key=lambda k: k.time)
-                    max_time = max(max_time, last_keyframe.time)
-        
+                    for keyframe in lane.keyframes:
+                        max_time = max(max_time, _safe_time(getattr(keyframe, "time", 0.0)))
+
         self.duration = max_time
     
     def update(self, delta_time: float):
@@ -150,14 +184,21 @@ class AnimationPlayer:
                     next_sprite = kf
                     break
             if prev_sprite:
-                sprite_name = prev_sprite.sprite_name
+                sprite_name = (
+                    self._resolve_sprite_name(prev_sprite.sprite_name)
+                    or prev_sprite.sprite_name
+                )
                 if prev_sprite.immediate_sprite == 0 and next_sprite:
                     interpolated = self._get_interpolated_sprite_name(prev_sprite, next_sprite, time)
                     if interpolated:
                         sprite_name = interpolated
                 return sprite_name
             if sprite_keyframes:
-                return sprite_keyframes[0].sprite_name
+                first_name = (
+                    self._resolve_sprite_name(sprite_keyframes[0].sprite_name)
+                    or sprite_keyframes[0].sprite_name
+                )
+                return first_name
             return None
 
         def lane_has_sprite(keyframes):
@@ -351,14 +392,21 @@ class AnimationPlayer:
                     next_sprite = kf
                     break
             if prev_sprite:
-                sprite_name = prev_sprite.sprite_name
+                sprite_name = (
+                    self._resolve_sprite_name(prev_sprite.sprite_name)
+                    or prev_sprite.sprite_name
+                )
                 if prev_sprite.immediate_sprite == 0 and next_sprite:
                     interpolated = self._get_interpolated_sprite_name(prev_sprite, next_sprite, time)
                     if interpolated:
                         sprite_name = interpolated
                 return sprite_name
             if sprite_keyframes:
-                return sprite_keyframes[0].sprite_name
+                first_name = (
+                    self._resolve_sprite_name(sprite_keyframes[0].sprite_name)
+                    or sprite_keyframes[0].sprite_name
+                )
+                return first_name
             return None
 
         def lane_has_sprite(keyframes):
@@ -480,11 +528,11 @@ class AnimationPlayer:
         start_idx = int(match_prev.group(2))
         end_idx = int(match_next.group(2))
         if start_idx == end_idx:
-            return prev_kf.sprite_name
+            return self._resolve_sprite_name(prev_kf.sprite_name) or prev_kf.sprite_name
         
         duration = next_kf.time - prev_kf.time
         if duration <= 0:
-            return prev_kf.sprite_name
+            return self._resolve_sprite_name(prev_kf.sprite_name) or prev_kf.sprite_name
         
         ratio = (time - prev_kf.time) / duration
         ratio = max(0.0, min(0.9999, ratio))
@@ -492,7 +540,7 @@ class AnimationPlayer:
         span = end_idx - start_idx
         steps = abs(span)
         if steps == 0:
-            return prev_kf.sprite_name
+            return self._resolve_sprite_name(prev_kf.sprite_name) or prev_kf.sprite_name
         
         advance = min(steps - 1, int(ratio * steps))
         if span > 0:
@@ -504,7 +552,12 @@ class AnimationPlayer:
         suffix_width = len(match_prev.group(2))
         formatted_idx = str(candidate_idx).zfill(suffix_width)
         prefix = match_prev.group(1)
-        return f"{prefix}{formatted_idx}"
+        interpolated_name = f"{prefix}{formatted_idx}"
+        resolved = self._resolve_sprite_name(interpolated_name)
+        if resolved:
+            return resolved
+        fallback = self._resolve_sprite_name(prev_kf.sprite_name)
+        return fallback or prev_kf.sprite_name
 
     def set_playback_speed(self, speed: float):
         """Adjust playback speed multiplier (>0)."""

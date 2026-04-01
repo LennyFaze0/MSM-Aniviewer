@@ -41,6 +41,10 @@ def _print_boot_progress(step: int, total: int, message: str) -> None:
 
 def main() -> int:
     """Main entry point"""
+    # Force desktop OpenGL before Qt creates the application/context.
+    # The renderer relies on compatibility fixed-function APIs.
+    os.environ.setdefault("QT_OPENGL", "desktop")
+
     steps = [
         "Initializing Qt",
         "Loading UI modules",
@@ -52,7 +56,23 @@ def main() -> int:
     total = len(steps)
     _print_boot_progress(1, total, steps[0])
 
+    from PyQt6.QtCore import QCoreApplication, Qt
+    from PyQt6.QtGui import QSurfaceFormat
     from PyQt6.QtWidgets import QApplication
+
+    try:
+        QCoreApplication.setAttribute(Qt.ApplicationAttribute.AA_UseDesktopOpenGL, True)
+    except Exception:
+        pass
+
+    fmt = QSurfaceFormat()
+    fmt.setRenderableType(QSurfaceFormat.RenderableType.OpenGL)
+    fmt.setVersion(2, 1)
+    if sys.platform == "darwin":
+        fmt.setProfile(QSurfaceFormat.OpenGLContextProfile.NoProfile)
+    else:
+        fmt.setProfile(QSurfaceFormat.OpenGLContextProfile.CompatibilityProfile)
+    QSurfaceFormat.setDefaultFormat(fmt)
 
     _print_boot_progress(2, total, steps[1])
     from ui.main_window import MSMAnimationViewer

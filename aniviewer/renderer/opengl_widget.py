@@ -4,8 +4,7 @@ Qt widget that handles OpenGL rendering, camera controls, and user interaction
 """
 
 import os
-os.environ.setdefault('QT_OPENGL', 'desktop')
-
+import sys
 import time
 import math
 import bisect
@@ -35,6 +34,64 @@ try:
 except Exception:  # pragma: no cover - optional dependency
     QSvgRenderer = None
 from utils.shader_registry import ShaderRegistry
+
+_TEXTURE_2D_CAPABILITY_WARNED: bool = False
+
+
+def _warn_texture_2d_capability_failure(action: str, exc: Optional[Exception] = None) -> None:
+    global _TEXTURE_2D_CAPABILITY_WARNED
+    if _TEXTURE_2D_CAPABILITY_WARNED:
+        return
+    _TEXTURE_2D_CAPABILITY_WARNED = True
+    detail = f" ({exc})" if exc else ""
+    print(
+        f"[WARNING] GL_TEXTURE_2D could not be {action} on this context; "
+        f"continuing without fixed-function texture state toggles{detail}."
+    )
+
+
+def _set_texture_2d_enabled(enabled: bool) -> None:
+    """Best-effort GL_TEXTURE_2D toggles on strict/core contexts."""
+    try:
+        if enabled:
+            glEnable(GL_TEXTURE_2D)
+        else:
+            glDisable(GL_TEXTURE_2D)
+    except Exception as exc:
+        _warn_texture_2d_capability_failure("enabled" if enabled else "disabled", exc)
+
+
+def _is_texture_2d_enabled() -> bool:
+    """Best-effort query for GL_TEXTURE_2D state."""
+    try:
+        return bool(glIsEnabled(GL_TEXTURE_2D))
+    except Exception as exc:
+        _warn_texture_2d_capability_failure("queried", exc)
+        return False
+
+
+def _rgb_to_hue(r: float, g: float, b: float) -> float:
+    """Return hue in [0, 1) for RGB values expected in [0, 1]."""
+    try:
+        rf = max(0.0, min(1.0, float(r)))
+        gf = max(0.0, min(1.0, float(g)))
+        bf = max(0.0, min(1.0, float(b)))
+    except (TypeError, ValueError):
+        return 2.0 / 3.0  # fallback to blue
+
+    cmax = max(rf, gf, bf)
+    cmin = min(rf, gf, bf)
+    delta = cmax - cmin
+    if delta <= 1e-8:
+        return 2.0 / 3.0
+    if cmax == rf:
+        hue = ((gf - bf) / delta) % 6.0
+    elif cmax == gf:
+        hue = ((bf - rf) / delta) + 2.0
+    else:
+        hue = ((rf - gf) / delta) + 4.0
+    return (hue / 6.0) % 1.0
+
 
 _POST_AA_VERTEX_SHADER = """
 #version 120
@@ -68,6 +125,9 @@ uniform int u_caEnabled;
 uniform float u_caStrength;
 uniform int u_motionBlurEnabled;
 uniform float u_motionBlurStrength;
+uniform int u_blueModeEnabled;
+uniform float u_blueModeStrength;
+uniform float u_blueModeHue;
 uniform float u_time;
 
 float luma(vec3 c)
@@ -232,6 +292,36 @@ vec3 apply_grain(vec2 uv, vec3 src)
     return src + vec3(g);
 }
 
+vec3 rgb_to_hsv(vec3 c)
+{
+    vec4 K = vec4(0.0, -1.0 / 3.0, 2.0 / 3.0, -1.0);
+    vec4 p = mix(vec4(c.bg, K.wz), vec4(c.gb, K.xy), step(c.b, c.g));
+    vec4 q = mix(vec4(p.xyw, c.r), vec4(c.r, p.yzx), step(p.x, c.r));
+    float d = q.x - min(q.w, q.y);
+    float e = 1.0e-10;
+    return vec3(abs(q.z + (q.w - q.y) / (6.0 * d + e)), d / (q.x + e), q.x);
+}
+
+vec3 hsv_to_rgb(vec3 c)
+{
+    vec4 K = vec4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
+    vec3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
+    return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);
+}
+
+vec3 apply_blue_mode_hue(vec3 src)
+{
+    if (u_blueModeEnabled == 0 || u_blueModeStrength <= 0.0001)
+        return src;
+    float strength = clamp(u_blueModeStrength, 0.0, 1.0);
+    vec3 hsv = rgb_to_hsv(clamp(src, 0.0, 1.0));
+    hsv.x = mix(hsv.x, fract(u_blueModeHue), strength);
+    float sat_target = max(hsv.y, 0.9);
+    hsv.y = mix(hsv.y, sat_target, min(1.0, strength * 1.2));
+    vec3 recolored = hsv_to_rgb(hsv);
+    return mix(src, recolored, strength);
+}
+
 void main()
 {
     vec2 uv = gl_TexCoord[0].xy;
@@ -250,6 +340,7 @@ void main()
         vec3 prev_rgb = texture2D(u_prevTexture, uv).rgb;
         out_rgb = mix(out_rgb, prev_rgb, clamp(u_motionBlurStrength, 0.0, 0.95));
     }
+    out_rgb = apply_blue_mode_hue(out_rgb);
     out_rgb = clamp(out_rgb, 0.0, 1.0);
 
     // Match Unity FinalPass "keep alpha" behavior for transparent workflows.
@@ -441,6 +532,7 @@ class OpenGLAnimationWidget(QOpenGLWidget):
     playback_state_changed = pyqtSignal(bool)
     transform_action_committed = pyqtSignal(dict)
     tile_render_stats = pyqtSignal(dict)
+    runtime_error = pyqtSignal(str)
     
     def __init__(self, parent: Optional[QWidget] = None, shader_registry: Optional[ShaderRegistry] = None):
         super().__init__(parent)
@@ -451,6 +543,7 @@ class OpenGLAnimationWidget(QOpenGLWidget):
         self.renderer = SpriteRenderer()
         self.renderer.set_shader_registry(shader_registry)
         self.renderer.set_costume_pivot_adjustment_enabled(False)
+        self.player.set_sprite_name_resolver(self._resolve_sprite_name_with_atlases)
         self.antialias_enabled: bool = True
         self.zoom_to_cursor: bool = True
         self.attachment_instances: List[AttachmentInstance] = []
@@ -508,6 +601,9 @@ class OpenGLAnimationWidget(QOpenGLWidget):
         self._tile_stats_last_emit: float = 0.0
         self._tile_last_signature: str = ""
         self._tile_last_stats: Dict[str, Any] = {"path": self.tile_render_path, "ms": 0.0, "tile_count": 0}
+        self._last_runtime_error: Optional[str] = None
+        self._last_texture_upload_failures: List[str] = []
+        self._gl_context_summary: str = ""
 
         # Optional extra animation entries to render in the same viewport.
         # Each entry: {"animation": AnimationData, "atlases": List[TextureAtlas],
@@ -551,6 +647,9 @@ class OpenGLAnimationWidget(QOpenGLWidget):
         self.post_grain_strength: float = 0.2
         self.post_ca_enabled: bool = False
         self.post_ca_strength: float = 0.25
+        self.blue_mode_enabled: bool = False
+        self.blue_mode_stretch_x: float = 1.65
+        self.blue_mode_overlay_rgba: Tuple[float, float, float, float] = (0.05, 0.25, 1.0, 0.45)
         self.post_motion_blur_enabled: bool = False
         self.post_motion_blur_strength: float = 0.35
         self._post_aa_program: int = 0
@@ -572,6 +671,9 @@ class OpenGLAnimationWidget(QOpenGLWidget):
         self._post_aa_uniform_ca_strength: int = -1
         self._post_aa_uniform_motion_blur_enabled: int = -1
         self._post_aa_uniform_motion_blur_strength: int = -1
+        self._post_aa_uniform_blue_mode_enabled: int = -1
+        self._post_aa_uniform_blue_mode_strength: int = -1
+        self._post_aa_uniform_blue_mode_hue: int = -1
         self._post_aa_uniform_time: int = -1
         self._post_aa_scene_fbo: Optional[int] = None
         self._post_aa_scene_texture: Optional[int] = None
@@ -694,10 +796,16 @@ class OpenGLAnimationWidget(QOpenGLWidget):
         
         # Set OpenGL format
         fmt = QSurfaceFormat()
+        # The renderer relies on desktop fixed-function calls (glBegin/glEnd).
+        # Explicitly request desktop OpenGL so Linux does not silently pick GLES.
+        fmt.setRenderableType(QSurfaceFormat.RenderableType.OpenGL)
         fmt.setVersion(2, 1)
-        # Request a compatibility profile so legacy OpenGL calls (glBegin/glEnd) work,
-        # especially on macOS where CoreProfile contexts forbid fixed-function APIs.
-        fmt.setProfile(QSurfaceFormat.OpenGLContextProfile.NoProfile)
+        # Request compatibility on Linux/Windows so fixed-function rendering remains available.
+        # macOS can reject explicit CompatibilityProfile requests, so keep NoProfile there.
+        if sys.platform == "darwin":
+            fmt.setProfile(QSurfaceFormat.OpenGLContextProfile.NoProfile)
+        else:
+            fmt.setProfile(QSurfaceFormat.OpenGLContextProfile.CompatibilityProfile)
         fmt.setSamples(4)
         self.setFormat(fmt)
         
@@ -728,53 +836,145 @@ class OpenGLAnimationWidget(QOpenGLWidget):
     def position_scale(self, value: float):
         """Set position scale in renderer"""
         self.renderer.position_scale = value
+
+    def _resolve_sprite_name_with_atlases(
+        self,
+        sprite_name: str,
+        atlases: Optional[List[TextureAtlas]] = None,
+    ) -> Optional[str]:
+        """Resolve a sprite against atlas data and return matched name."""
+        atlas_list = atlases if atlases is not None else self.texture_atlases
+        sprite, _atlas, resolved_name = self.renderer._find_sprite_in_atlases(
+            sprite_name,
+            atlas_list,
+            allow_alias=True,
+        )
+        if sprite and resolved_name:
+            return resolved_name
+        return None
+
+    def _emit_runtime_error(self, message: str) -> None:
+        text = str(message or "").strip()
+        if not text:
+            return
+        if text == self._last_runtime_error:
+            return
+        self._last_runtime_error = text
+        print(f"[OpenGL] {text}")
+        try:
+            self.runtime_error.emit(text)
+        except Exception:
+            pass
+
+    def _summarize_context(self) -> str:
+        ctx = self.context()
+        if not ctx or not ctx.isValid():
+            return "OpenGL context unavailable"
+        fmt = ctx.format()
+        profile = fmt.profile()
+        if profile == QSurfaceFormat.OpenGLContextProfile.CompatibilityProfile:
+            profile_name = "compatibility"
+        elif profile == QSurfaceFormat.OpenGLContextProfile.CoreProfile:
+            profile_name = "core"
+        else:
+            profile_name = "none"
+        renderable = fmt.renderableType()
+        if renderable == QSurfaceFormat.RenderableType.OpenGLES:
+            renderable_name = "gles"
+        else:
+            renderable_name = "desktop"
+        version_text = ""
+        renderer_text = ""
+        try:
+            gl_version = glGetString(GL_VERSION)
+            if gl_version:
+                version_text = bytes(gl_version).decode("utf-8", "ignore")
+        except Exception:
+            pass
+        try:
+            gl_renderer = glGetString(GL_RENDERER)
+            if gl_renderer:
+                renderer_text = bytes(gl_renderer).decode("utf-8", "ignore")
+        except Exception:
+            pass
+        details = []
+        if version_text:
+            details.append(version_text)
+        if renderer_text:
+            details.append(renderer_text)
+        suffix = f", gl={' | '.join(details)}" if details else ""
+        return (
+            f"OpenGL context {fmt.majorVersion()}.{fmt.minorVersion()} "
+            f"(profile={profile_name}, type={renderable_name}{suffix})"
+        )
     
     def initializeGL(self):
         """Initialize OpenGL"""
-        glEnable(GL_BLEND)
-        # Use premultiplied alpha blending like the MSM game engine
-        # The game uses glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA)
-        # This expects textures with premultiplied alpha (RGB * A)
-        glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA)
-        glEnable(GL_TEXTURE_2D)
+        self._last_texture_upload_failures = []
+        self._gl_context_summary = self._summarize_context()
+        print(f"[OpenGL] {self._gl_context_summary}")
         try:
-            self._gl_max_texture_size = int(glGetIntegerv(GL_MAX_TEXTURE_SIZE))
-        except Exception:
-            self._gl_max_texture_size = 8192
-        
-        # Load textures
-        for atlas in self.texture_atlases:
-            atlas.load_texture()
-        for batch in self.tile_batches:
-            if batch.atlas:
-                batch.atlas.load_texture()
-        self._upload_terrain_composite_texture()
-        self._upload_particle_textures()
-        self._upload_viewport_background_texture()
-        self._upload_default_viewport_background_texture()
-        self._clear_post_aa_resources()
-        self._post_aa_program = 0
-        self._post_aa_uniform_texture = -1
-        self._post_aa_uniform_prev_texture = -1
-        self._post_aa_uniform_texel_size = -1
-        self._post_aa_uniform_strength = -1
-        self._post_aa_uniform_mode = -1
-        self._post_aa_uniform_aa_enabled = -1
-        self._post_aa_uniform_bloom_enabled = -1
-        self._post_aa_uniform_bloom_strength = -1
-        self._post_aa_uniform_bloom_threshold = -1
-        self._post_aa_uniform_bloom_radius = -1
-        self._post_aa_uniform_vignette_enabled = -1
-        self._post_aa_uniform_vignette_strength = -1
-        self._post_aa_uniform_grain_enabled = -1
-        self._post_aa_uniform_grain_strength = -1
-        self._post_aa_uniform_ca_enabled = -1
-        self._post_aa_uniform_ca_strength = -1
-        self._post_aa_uniform_motion_blur_enabled = -1
-        self._post_aa_uniform_motion_blur_strength = -1
-        self._post_aa_uniform_time = -1
-        
-        self._apply_antialiasing_state()
+            glEnable(GL_BLEND)
+            # Use premultiplied alpha blending like the MSM game engine
+            # The game uses glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA)
+            # This expects textures with premultiplied alpha (RGB * A)
+            glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA)
+            _set_texture_2d_enabled(True)
+            try:
+                self._gl_max_texture_size = int(glGetIntegerv(GL_MAX_TEXTURE_SIZE))
+            except Exception:
+                self._gl_max_texture_size = 8192
+
+            # Load textures
+            for atlas in self.texture_atlases:
+                if not atlas.load_texture():
+                    label = (
+                        getattr(atlas, "source_name", None)
+                        or os.path.basename(getattr(atlas, "image_path", "") or "")
+                        or "<unknown atlas>"
+                    )
+                    self._last_texture_upload_failures.append(str(label))
+            for batch in self.tile_batches:
+                if batch.atlas and not batch.atlas.load_texture():
+                    label = (
+                        getattr(batch.atlas, "source_name", None)
+                        or os.path.basename(getattr(batch.atlas, "image_path", "") or "")
+                        or "<tile atlas>"
+                    )
+                    self._last_texture_upload_failures.append(str(label))
+            self._upload_terrain_composite_texture()
+            self._upload_particle_textures()
+            self._upload_viewport_background_texture()
+            self._upload_default_viewport_background_texture()
+            self._clear_post_aa_resources()
+            self._post_aa_program = 0
+            self._post_aa_uniform_texture = -1
+            self._post_aa_uniform_prev_texture = -1
+            self._post_aa_uniform_texel_size = -1
+            self._post_aa_uniform_strength = -1
+            self._post_aa_uniform_mode = -1
+            self._post_aa_uniform_aa_enabled = -1
+            self._post_aa_uniform_bloom_enabled = -1
+            self._post_aa_uniform_bloom_strength = -1
+            self._post_aa_uniform_bloom_threshold = -1
+            self._post_aa_uniform_bloom_radius = -1
+            self._post_aa_uniform_vignette_enabled = -1
+            self._post_aa_uniform_vignette_strength = -1
+            self._post_aa_uniform_grain_enabled = -1
+            self._post_aa_uniform_grain_strength = -1
+            self._post_aa_uniform_ca_enabled = -1
+            self._post_aa_uniform_ca_strength = -1
+            self._post_aa_uniform_motion_blur_enabled = -1
+            self._post_aa_uniform_motion_blur_strength = -1
+            self._post_aa_uniform_blue_mode_enabled = -1
+            self._post_aa_uniform_blue_mode_strength = -1
+            self._post_aa_uniform_blue_mode_hue = -1
+            self._post_aa_uniform_time = -1
+
+            self._apply_antialiasing_state()
+        except Exception as exc:
+            self._emit_runtime_error(f"initializeGL failed: {exc}")
+            raise
     
     def resizeGL(self, w: int, h: int):
         """Handle resize"""
@@ -788,71 +988,85 @@ class OpenGLAnimationWidget(QOpenGLWidget):
     
     def paintGL(self):
         """Render the animation"""
-        self._apply_antialiasing_state()
-        view_w, view_h = self._current_framebuffer_size()
+        try:
+            self._apply_antialiasing_state()
+            view_w, view_h = self._current_framebuffer_size()
+            glViewport(0, 0, view_w, view_h)
 
-        if (
-            self._is_post_pass_required()
-            and self._ensure_post_aa_program()
-            and self._ensure_post_aa_resources(view_w, view_h)
-            and self._post_aa_scene_fbo
-            and self._post_aa_scene_texture
-        ):
-            default_fbo = int(self.defaultFramebufferObject())
-            source_texture = int(self._post_aa_scene_texture)
-            if self._should_use_subframe_motion_blur():
-                source_texture = int(self._render_subframe_motion_blur(view_w, view_h))
-            else:
-                glBindFramebuffer(GL_FRAMEBUFFER, int(self._post_aa_scene_fbo))
+            if (
+                self._is_post_pass_required()
+                and self._ensure_post_aa_program()
+                and self._ensure_post_aa_resources(view_w, view_h)
+                and self._post_aa_scene_fbo
+                and self._post_aa_scene_texture
+            ):
+                default_fbo = int(self.defaultFramebufferObject())
+                source_texture = int(self._post_aa_scene_texture)
+                if self._should_use_subframe_motion_blur():
+                    source_texture = int(self._render_subframe_motion_blur(view_w, view_h))
+                else:
+                    glBindFramebuffer(GL_FRAMEBUFFER, int(self._post_aa_scene_fbo))
+                    glViewport(0, 0, view_w, view_h)
+                    self._render_scene_contents(
+                        view_w,
+                        view_h,
+                        framebuffer_binding_hint=int(self._post_aa_scene_fbo),
+                    )
+                glBindFramebuffer(GL_FRAMEBUFFER, default_fbo)
                 glViewport(0, 0, view_w, view_h)
+                pass_ok = self._draw_post_aa_pass(
+                    source_texture=source_texture,
+                    width=view_w,
+                    height=view_h,
+                )
+                if pass_ok:
+                    return
+                # Graceful fallback: if the post pass fails, draw scene directly.
                 self._render_scene_contents(
                     view_w,
                     view_h,
-                    framebuffer_binding_hint=int(self._post_aa_scene_fbo),
+                    framebuffer_binding_hint=int(default_fbo),
                 )
-            glBindFramebuffer(GL_FRAMEBUFFER, default_fbo)
-            glViewport(0, 0, view_w, view_h)
-            pass_ok = self._draw_post_aa_pass(
-                source_texture=source_texture,
-                width=view_w,
-                height=view_h,
-            )
-            if pass_ok:
                 return
-            # Graceful fallback: if the post pass fails, draw scene directly.
+
             self._render_scene_contents(
                 view_w,
                 view_h,
-                framebuffer_binding_hint=int(default_fbo),
+                framebuffer_binding_hint=int(self.defaultFramebufferObject()),
             )
-            return
-
-        self._render_scene_contents(
-            view_w,
-            view_h,
-            framebuffer_binding_hint=int(self.defaultFramebufferObject()),
-        )
+        except Exception as exc:
+            self._emit_runtime_error(f"paintGL failed: {exc}")
+            try:
+                glClearColor(0.0, 0.0, 0.0, 1.0)
+                glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+            except Exception:
+                pass
 
     def _current_framebuffer_size(self) -> Tuple[int, int]:
         """Return current framebuffer pixel size (handles HiDPI correctly)."""
-        try:
-            vp = glGetIntegerv(GL_VIEWPORT)
-            if vp is not None and len(vp) >= 4:
-                w = max(1, int(vp[2]))
-                h = max(1, int(vp[3]))
-                if w > 0 and h > 0:
-                    return w, h
-        except Exception:
-            pass
         try:
             dpr = float(self.devicePixelRatioF())
         except Exception:
             dpr = 1.0
         if dpr <= 0.0:
             dpr = 1.0
-        return max(1, int(round(float(self.width()) * dpr))), max(
-            1, int(round(float(self.height()) * dpr))
-        )
+
+        # Prefer widget geometry converted to framebuffer pixels. Some drivers can
+        # report a stale GL_VIEWPORT at paint start, which would collapse rendering.
+        width_px = max(1, int(round(float(self.width()) * dpr)))
+        height_px = max(1, int(round(float(self.height()) * dpr)))
+
+        try:
+            vp = glGetIntegerv(GL_VIEWPORT)
+            if vp is not None and len(vp) >= 4:
+                vp_w = max(1, int(vp[2]))
+                vp_h = max(1, int(vp[3]))
+                width_px = max(width_px, vp_w)
+                height_px = max(height_px, vp_h)
+        except Exception:
+            pass
+
+        return width_px, height_px
 
     def _should_use_subframe_motion_blur(self) -> bool:
         """Return whether AE-like subframe motion blur should be applied this frame."""
@@ -1151,6 +1365,9 @@ class OpenGLAnimationWidget(QOpenGLWidget):
             self._post_aa_uniform_ca_strength = glGetUniformLocation(program, "u_caStrength")
             self._post_aa_uniform_motion_blur_enabled = glGetUniformLocation(program, "u_motionBlurEnabled")
             self._post_aa_uniform_motion_blur_strength = glGetUniformLocation(program, "u_motionBlurStrength")
+            self._post_aa_uniform_blue_mode_enabled = glGetUniformLocation(program, "u_blueModeEnabled")
+            self._post_aa_uniform_blue_mode_strength = glGetUniformLocation(program, "u_blueModeStrength")
+            self._post_aa_uniform_blue_mode_hue = glGetUniformLocation(program, "u_blueModeHue")
             self._post_aa_uniform_time = glGetUniformLocation(program, "u_time")
             return int(program)
         except Exception as exc:
@@ -1292,7 +1509,14 @@ class OpenGLAnimationWidget(QOpenGLWidget):
             self._clear_post_aa_resources()
             return False
 
-    def _draw_post_aa_pass(self, source_texture: int, width: int, height: int) -> bool:
+    def _draw_post_aa_pass(
+        self,
+        source_texture: int,
+        width: int,
+        height: int,
+        *,
+        include_blue_mode: bool = True,
+    ) -> bool:
         """Draw the post-process AA pass from source texture to the bound framebuffer."""
         if not source_texture:
             return False
@@ -1335,6 +1559,14 @@ class OpenGLAnimationWidget(QOpenGLWidget):
         glUseProgram(program)
         aa_enabled = bool(self.post_aa_enabled)
         motion_blur_enabled = False
+        blue_mode_active = bool(include_blue_mode and self.blue_mode_enabled)
+        tex_u0 = 0.0
+        tex_u1 = 1.0
+        if blue_mode_active:
+            stretch = max(1.0, min(2.5, float(self.blue_mode_stretch_x)))
+            half_span = 0.5 / stretch
+            tex_u0 = max(0.0, min(1.0, 0.5 - half_span))
+            tex_u1 = max(0.0, min(1.0, 0.5 + half_span))
         glActiveTexture(GL_TEXTURE0)
         glBindTexture(GL_TEXTURE_2D, int(source_texture))
         if self._post_aa_uniform_texture >= 0:
@@ -1392,6 +1624,19 @@ class OpenGLAnimationWidget(QOpenGLWidget):
                 self._post_aa_uniform_motion_blur_strength,
                 0.0,
             )
+        if blue_mode_active:
+            overlay_r, overlay_g, overlay_b, overlay_a = self.blue_mode_overlay_rgba
+            blue_strength = max(0.0, min(1.0, float(overlay_a) * 1.75))
+            blue_hue = _rgb_to_hue(float(overlay_r), float(overlay_g), float(overlay_b))
+        else:
+            blue_strength = 0.0
+            blue_hue = 2.0 / 3.0
+        if self._post_aa_uniform_blue_mode_enabled >= 0:
+            glUniform1i(self._post_aa_uniform_blue_mode_enabled, 1 if blue_mode_active else 0)
+        if self._post_aa_uniform_blue_mode_strength >= 0:
+            glUniform1f(self._post_aa_uniform_blue_mode_strength, float(blue_strength))
+        if self._post_aa_uniform_blue_mode_hue >= 0:
+            glUniform1f(self._post_aa_uniform_blue_mode_hue, float(blue_hue))
         if self._post_aa_uniform_time >= 0:
             glUniform1f(self._post_aa_uniform_time, float(self.player.current_time))
 
@@ -1399,13 +1644,13 @@ class OpenGLAnimationWidget(QOpenGLWidget):
         # FBO textures are bottom-origin; viewport space here is y-down.
         # Flip V so the resolved frame keeps the same orientation as the scene.
         glBegin(GL_QUADS)
-        glTexCoord2f(0.0, 1.0)
+        glTexCoord2f(tex_u0, 1.0)
         glVertex2f(0.0, 0.0)
-        glTexCoord2f(1.0, 1.0)
+        glTexCoord2f(tex_u1, 1.0)
         glVertex2f(float(width), 0.0)
-        glTexCoord2f(1.0, 0.0)
+        glTexCoord2f(tex_u1, 0.0)
         glVertex2f(float(width), float(height))
-        glTexCoord2f(0.0, 0.0)
+        glTexCoord2f(tex_u0, 0.0)
         glVertex2f(0.0, float(height))
         glEnd()
 
@@ -1456,7 +1701,11 @@ class OpenGLAnimationWidget(QOpenGLWidget):
             glActiveTexture(int(prev_active))
 
     def _is_post_pass_required(self) -> bool:
-        return bool(self.post_aa_enabled or self.post_motion_blur_enabled)
+        return bool(
+            self.post_aa_enabled
+            or self.post_motion_blur_enabled
+            or self.blue_mode_enabled
+        )
 
     def is_post_pass_enabled(self) -> bool:
         return self._is_post_pass_required()
@@ -1489,7 +1738,12 @@ class OpenGLAnimationWidget(QOpenGLWidget):
             glViewport(0, 0, int(width), int(height))
             glClearColor(0.0, 0.0, 0.0, 0.0)
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
-            ok = self._draw_post_aa_pass(int(source_texture), int(width), int(height))
+            ok = self._draw_post_aa_pass(
+                int(source_texture),
+                int(width),
+                int(height),
+                include_blue_mode=True,
+            )
             if not ok:
                 return 0, int(source_texture)
             return target_fbo, target_texture
@@ -1986,7 +2240,7 @@ class OpenGLAnimationWidget(QOpenGLWidget):
         prev_binding = glGetIntegerv(GL_TEXTURE_BINDING_2D)
         glPushMatrix()
         glLoadIdentity()
-        glEnable(GL_TEXTURE_2D)
+        _set_texture_2d_enabled(True)
         glColor4f(1.0, 1.0, 1.0, 1.0)
         glBindTexture(GL_TEXTURE_2D, active_texture_id)
         glBegin(GL_QUADS)
@@ -2038,11 +2292,11 @@ class OpenGLAnimationWidget(QOpenGLWidget):
             return
 
         prev_binding = glGetIntegerv(GL_TEXTURE_BINDING_2D)
-        texture_enabled = bool(glIsEnabled(GL_TEXTURE_2D))
+        texture_enabled = bool(_is_texture_2d_enabled())
         blend_enabled = bool(glIsEnabled(GL_BLEND))
 
         if texture_enabled:
-            glDisable(GL_TEXTURE_2D)
+            _set_texture_2d_enabled(False)
         if not blend_enabled:
             glEnable(GL_BLEND)
         glBlendFunc(src_factor, dst_factor)
@@ -2060,9 +2314,9 @@ class OpenGLAnimationWidget(QOpenGLWidget):
 
         glBindTexture(GL_TEXTURE_2D, prev_binding)
         if texture_enabled:
-            glEnable(GL_TEXTURE_2D)
+            _set_texture_2d_enabled(True)
         else:
-            glDisable(GL_TEXTURE_2D)
+            _set_texture_2d_enabled(False)
         if blend_enabled:
             glEnable(GL_BLEND)
         else:
@@ -4550,7 +4804,7 @@ class OpenGLAnimationWidget(QOpenGLWidget):
 
     def _render_particle_draw(self, draw: ParticleDraw) -> None:
         glEnable(GL_BLEND)
-        glEnable(GL_TEXTURE_2D)
+        _set_texture_2d_enabled(True)
         set_blend_mode(draw.blend_mode)
         glBindTexture(GL_TEXTURE_2D, draw.texture_id)
         glColor4f(*draw.color)
@@ -5688,7 +5942,7 @@ class OpenGLAnimationWidget(QOpenGLWidget):
         radius = max(5.0, self.rotation_overlay_radius)
         segments = 48
 
-        glDisable(GL_TEXTURE_2D)
+        _set_texture_2d_enabled(False)
         glLineWidth(2.0)
         glColor4f(0.1, 0.9, 1.0, 0.85)
         glBegin(GL_LINE_LOOP)
@@ -5724,7 +5978,7 @@ class OpenGLAnimationWidget(QOpenGLWidget):
         glEnd()
         glPointSize(1.0)
         glLineWidth(1.0)
-        glEnable(GL_TEXTURE_2D)
+        _set_texture_2d_enabled(True)
 
     def render_selection_outlines(self, layer_world_states: Dict[int, Dict]):
         """Draw green outlines around selected layer sprites."""
@@ -5733,7 +5987,7 @@ class OpenGLAnimationWidget(QOpenGLWidget):
         if not self.selected_layer_ids and self.selected_attachment_id is None:
             return
         
-        glDisable(GL_TEXTURE_2D)
+        _set_texture_2d_enabled(False)
         glLineWidth(2.5)
         # Bright green color for selection outline
         glColor4f(0.2, 0.85, 0.4, 0.9)
@@ -5816,7 +6070,7 @@ class OpenGLAnimationWidget(QOpenGLWidget):
                 glEnd()
         
         glLineWidth(1.0)
-        glEnable(GL_TEXTURE_2D)
+        _set_texture_2d_enabled(True)
 
     def _get_layer_world_corners(
         self,
@@ -5910,7 +6164,7 @@ class OpenGLAnimationWidget(QOpenGLWidget):
         self._scale_handle_positions['e'] = (max_x, (min_y + max_y) * 0.5)
         self._scale_handle_positions['w'] = (min_x, (min_y + max_y) * 0.5)
 
-        glDisable(GL_TEXTURE_2D)
+        _set_texture_2d_enabled(False)
         glLineWidth(2.0)
         glColor4f(0.85, 0.8, 0.2, 0.9)
         glBegin(GL_LINE_LOOP)
@@ -5930,7 +6184,7 @@ class OpenGLAnimationWidget(QOpenGLWidget):
         glEnd()
 
         glLineWidth(1.0)
-        glEnable(GL_TEXTURE_2D)
+        _set_texture_2d_enabled(True)
 
     def _render_transform_overlay(self, layer_world_states: Dict[int, Dict]) -> None:
         """Draw a readout of rotation/scale near the selected layer."""
@@ -6008,7 +6262,7 @@ class OpenGLAnimationWidget(QOpenGLWidget):
             (0.95, 0.4, 0.6, 0.9),
         ]
 
-        glDisable(GL_TEXTURE_2D)
+        _set_texture_2d_enabled(False)
         glLineWidth(1.3)
         marker = max(7.0 / max(self.render_scale, 1e-3), 4.0)
         for idx, instance_id in enumerate(instance_ids):
@@ -6067,7 +6321,7 @@ class OpenGLAnimationWidget(QOpenGLWidget):
                 glEnd()
 
         glLineWidth(1.0)
-        glEnable(GL_TEXTURE_2D)
+        _set_texture_2d_enabled(True)
 
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
@@ -6450,7 +6704,7 @@ class OpenGLAnimationWidget(QOpenGLWidget):
                 if layer.parent_id >= 0:
                     children_map.setdefault(layer.parent_id, []).append(layer.layer_id)
         
-        glDisable(GL_TEXTURE_2D)
+        _set_texture_2d_enabled(False)
         glLineWidth(1.5)
         
         for layer in self.player.animation.layers:
@@ -6524,7 +6778,7 @@ class OpenGLAnimationWidget(QOpenGLWidget):
                 glEnd()
         
         glLineWidth(1.0)
-        glEnable(GL_TEXTURE_2D)
+        _set_texture_2d_enabled(True)
 
     def _is_point_on_rotation_handle(self, world_x: float, world_y: float) -> bool:
         """Check if a point lies on the rotation gizmo ring."""
@@ -6898,7 +7152,7 @@ class OpenGLAnimationWidget(QOpenGLWidget):
             return
         
         # Disable texturing for line/point drawing
-        glDisable(GL_TEXTURE_2D)
+        _set_texture_2d_enabled(False)
         
         layer_world_states = self._build_layer_world_states(anim_time)
         layer_map = {layer.layer_id: layer for layer in self.player.animation.layers}
@@ -7050,7 +7304,7 @@ class OpenGLAnimationWidget(QOpenGLWidget):
         glEnd()
         
         # Re-enable texturing
-        glEnable(GL_TEXTURE_2D)
+        _set_texture_2d_enabled(True)
     
     def update_animation(self):
         """Update animation state with proper delta time"""
@@ -7255,6 +7509,67 @@ class OpenGLAnimationWidget(QOpenGLWidget):
         self.post_motion_blur_strength = value
         if self._is_post_pass_required():
             self.update()
+
+    def set_blue_mode(
+        self,
+        enabled: bool,
+        *,
+        stretch_x: float = 1.65,
+        overlay_rgba: Optional[Tuple[float, float, float, float]] = None,
+    ) -> None:
+        """Apply April Fools blue-mode viewport effects."""
+        normalized_enabled = bool(enabled)
+        try:
+            normalized_stretch = float(stretch_x)
+        except (TypeError, ValueError):
+            normalized_stretch = 1.28
+        normalized_stretch = max(1.0, min(2.5, normalized_stretch))
+
+        if overlay_rgba is None or len(overlay_rgba) != 4:
+            normalized_overlay = (0.05, 0.25, 1.0, 0.45)
+        else:
+            try:
+                normalized_overlay = tuple(float(v) for v in overlay_rgba)
+            except Exception:
+                normalized_overlay = (0.05, 0.25, 1.0, 0.45)
+        normalized_overlay = (
+            max(0.0, min(1.0, normalized_overlay[0])),
+            max(0.0, min(1.0, normalized_overlay[1])),
+            max(0.0, min(1.0, normalized_overlay[2])),
+            max(0.0, min(1.0, normalized_overlay[3])),
+        )
+
+        changed = (
+            self.blue_mode_enabled != normalized_enabled
+            or abs(self.blue_mode_stretch_x - normalized_stretch) > 1e-6
+            or any(
+                abs(float(a) - float(b)) > 1e-6
+                for a, b in zip(self.blue_mode_overlay_rgba, normalized_overlay)
+            )
+        )
+        if not changed:
+            return
+
+        self.blue_mode_enabled = normalized_enabled
+        self.blue_mode_stretch_x = normalized_stretch
+        self.blue_mode_overlay_rgba = normalized_overlay
+        self._post_aa_history_valid = False
+        if not self._is_post_pass_required():
+            ctx = self.context()
+            if ctx and ctx.isValid():
+                try:
+                    self.makeCurrent()
+                    self._clear_post_aa_resources()
+                finally:
+                    self.doneCurrent()
+            else:
+                self._post_aa_scene_fbo = None
+                self._post_aa_scene_texture = None
+                self._post_aa_history_fbo = None
+                self._post_aa_history_texture = None
+                self._post_aa_history_valid = False
+                self._post_aa_scene_size = (0, 0)
+        self.update()
 
     def set_scale_gizmo_enabled(self, enabled: bool):
         """Toggle the scale gizmo overlay."""
@@ -8269,7 +8584,11 @@ class OpenGLAnimationWidget(QOpenGLWidget):
             animation: Optional[AnimationData] = payload.get("animation")
             if not animation:
                 continue
+            attachment_atlases = list(payload.get("atlases", []))
             player = AnimationPlayer()
+            player.set_sprite_name_resolver(
+                lambda name, atlases=attachment_atlases: self._resolve_sprite_name_with_atlases(name, atlases)
+            )
             player.load_animation(animation)
             loop_flag = bool(payload.get("loop", True))
             player.loop = loop_flag
@@ -8292,7 +8611,7 @@ class OpenGLAnimationWidget(QOpenGLWidget):
                     target_layer=payload.get("target_layer", ""),
                     target_layer_id=payload.get("target_layer_id"),
                     player=player,
-                    atlases=list(payload.get("atlases", [])),
+                    atlases=attachment_atlases,
                     time_offset=offset_value,
                     tempo_multiplier=tempo_value,
                     loop=loop_flag,

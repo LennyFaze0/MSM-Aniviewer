@@ -37,18 +37,18 @@ A comprehensive animation viewer for My Singing Monsters with OpenGL rendering, 
 ## Installation
 
 1. **Install Python 3.10 or higher**
-
-https://www.python.org/ftp/python/3.13.9/python-3.13.9-amd64.exe
-
-^ at this link, once installed it should just work inside the terminal (cmd)
+   - Download: https://www.python.org/downloads/
+   - Linux users can also install via their distro package manager.
 
 2. **Install dependencies**:
    - **Windows**: run `setup.bat` and it will install everything automatically.
-   - **macOS / Linux**: run `./setup_macos.sh` (use `chmod +x setup_macos.sh` the first time). This mirrors the Windows setup, including automatic pytoshop/packbits installs for PSD export.
+   - **Linux**: run `./setup_linux.sh` (first time: `chmod +x setup_linux.sh`).
+   - **macOS**: run `./setup_macos.sh` (first time: `chmod +x setup_macos.sh`).
+   - The Unix setup scripts create a local `.venv`, install all Python dependencies, and prepare PSD export packages.
 
 3. **Install FFmpeg for video exports**:
-Open the viewer, go to **Settings > Application > FFmpeg Tools** and click **Install FFmpeg**.  
-The viewer will download a verified Windows build, place it inside your AppData folder, and add it to PATH automatically so MOV exports work immediately.
+   - **Windows**: use **Settings > Application > FFmpeg Tools > Install FFmpeg** for automatic install.
+   - **Linux/macOS**: install FFmpeg via your package manager (for example `sudo apt install ffmpeg`, `sudo dnf install ffmpeg`, or `brew install ffmpeg`).
 
 ## Usage
 

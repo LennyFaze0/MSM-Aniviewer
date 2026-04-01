@@ -26,7 +26,7 @@ except ImportError:  # pragma: no cover
 
 try:
     import sounddevice as sd
-except ImportError:  # pragma: no cover
+except Exception:  # pragma: no cover - missing PortAudio or backend issues
     sd = None
 
 try:

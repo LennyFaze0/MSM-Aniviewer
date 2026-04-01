@@ -14,10 +14,27 @@ import threading
 from dataclasses import dataclass
 from typing import Optional, Tuple, Dict
 
+
+_SOUNDDEVICE_IMPORT_ERROR: Optional[str] = None
+_QTMULTIMEDIA_IMPORT_ERROR: Optional[str] = None
+
 import numpy as np
-import sounddevice as sd
 import soundfile as sf
-from PyQt6.QtCore import QObject, QCoreApplication, QThread, pyqtSignal
+from PyQt6.QtCore import QObject, QCoreApplication, QThread, pyqtSignal, QUrl
+
+try:
+    import sounddevice as sd
+except Exception as exc:  # pragma: no cover - missing PortAudio or backend issues
+    sd = None
+    _SOUNDDEVICE_IMPORT_ERROR = f"{exc.__class__.__name__}: {exc}"
+
+
+try:
+    from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
+except Exception as exc:  # pragma: no cover - multimedia plugin not available
+    QMediaPlayer = None
+    QAudioOutput = None
+    _QTMULTIMEDIA_IMPORT_ERROR = f"{exc.__class__.__name__}: {exc}"
 
 
 class _TimeStretchWorker(QObject):
@@ -43,8 +60,16 @@ class AudioManager(QObject):
 
     def __init__(self, parent: Optional[QObject] = None):
         super().__init__(parent)
-        self._enabled: bool = True
+        self._backend_kind: str = "sounddevice" if sd is not None else "none"
+        self._backend_available: bool = sd is not None
+        self._backend_error: Optional[str] = _SOUNDDEVICE_IMPORT_ERROR
+        self._enabled: bool = self._backend_available
         self._current_file: Optional[str] = None
+
+        self._output_device: Optional[int] = None
+        self._forced_output_selector: str = str(os.getenv("MSM_AUDIO_DEVICE", "") or "").strip()
+        self._qt_player: Optional[QMediaPlayer] = None
+        self._qt_audio_output: Optional[QAudioOutput] = None
 
         self._audio_data: Optional[np.ndarray] = None  # Processed audio buffer
         self._source_audio_data: Optional[np.ndarray] = None  # Original audio buffer
@@ -59,7 +84,7 @@ class AudioManager(QObject):
 
         self._volume: float = 0.8
         self._playback_speed: float = 1.0
-        self._pitch_mode: str = "time_stretch"  # time_stretch, pitch_shift, chipmunk
+        self._pitch_mode: str = "time_stretch"  # time_stretch, pitch_shift, chipmunk, pitch_down_locked
         self._pending_pitch_config: Optional[Tuple[float, str]] = None
         self._stretch_thread: Optional[QThread] = None
         self._stretch_worker: Optional[_TimeStretchWorker] = None
@@ -69,16 +94,77 @@ class AudioManager(QObject):
         self._stream_lock = threading.RLock()
         self._time_stretch_ratio: float = 1.0
 
+        if self._backend_available:
+            forced_device = self._resolve_forced_output_device(
+                self._forced_output_selector,
+                sample_rate=self._sample_rate,
+                channels=self._channels,
+            )
+            if forced_device is not None:
+                self._output_device = forced_device
+            else:
+                self._output_device = self._resolve_compatible_output_device(
+                    sample_rate=self._sample_rate,
+                    channels=self._channels,
+                )
+            if self._output_device is None:
+                self._backend_error = "No compatible audio output device detected for sounddevice backend"
+                self._backend_available = False
+                self._enabled = False
+                self._backend_kind = "none"
+
+        if not self._backend_available:
+            self._init_qt_backend()
+
     # ------------------------------------------------------------------ #
     # Properties                                                         #
     # ------------------------------------------------------------------ #
+    @property
+    def backend_available(self) -> bool:
+        return bool(self._backend_available and self._backend_kind in ("sounddevice", "qt"))
+
+    @property
+    def backend_error(self) -> str:
+        return str(self._backend_error or "")
+
+    @property
+    def backend_kind(self) -> str:
+        return str(self._backend_kind or "none")
+
+    @property
+    def backend_summary(self) -> str:
+        parts = [
+            f"kind={self._backend_kind}",
+            f"available={self._backend_available}",
+            f"enabled={self._enabled}",
+        ]
+        if self._backend_kind == "sounddevice" and sd is not None:
+            try:
+                parts.append(f"default_device={sd.default.device}")
+            except Exception:
+                pass
+            if self._forced_output_selector:
+                parts.append(f"forced_selector={self._forced_output_selector}")
+            if self._output_device is not None:
+                parts.append(f"selected_device={self._output_device}")
+                name = self._describe_output_device(self._output_device)
+                if name:
+                    parts.append(f"selected_name={name}")
+        elif self._backend_kind == "qt":
+            parts.append("selected_device=QtMultimedia")
+        if self._backend_error:
+            parts.append(f"error={self._backend_error}")
+        return ", ".join(parts)
+
     @property
     def current_file(self) -> Optional[str]:
         return self._current_file
 
     @property
     def is_ready(self) -> bool:
-        return self._audio_data is not None
+        if self._audio_data is not None:
+            return True
+        return bool(self._backend_kind == "qt" and self._current_file)
 
     @property
     def duration(self) -> float:
@@ -102,6 +188,9 @@ class AudioManager(QObject):
     # Public controls                                                    #
     # ------------------------------------------------------------------ #
     def set_enabled(self, enabled: bool):
+        if enabled and not self.backend_available:
+            if not self._init_qt_backend():
+                enabled = False
         if self._enabled == enabled:
             return
         self._enabled = enabled
@@ -117,30 +206,71 @@ class AudioManager(QObject):
             self._reset_state()
             return False
 
-        data, sample_rate = sf.read(file_path, always_2d=True, dtype="float32")
+        decoded_audio: Optional[np.ndarray] = None
+        sample_rate = 0
+        decode_error: Optional[str] = None
+        try:
+            data, sample_rate = sf.read(file_path, always_2d=True, dtype="float32")
+            decoded_audio = np.ascontiguousarray(data, dtype=np.float32)
+        except Exception as exc:
+            decode_error = f"Audio decode failed: {exc.__class__.__name__}: {exc}"
 
         reuse_stream = (
-            self._stream is not None
+            self._backend_kind == "sounddevice"
+            and self._stream is not None
+            and decoded_audio is not None
             and self._sample_rate == sample_rate
-            and self._channels == data.shape[1]
+            and self._channels == decoded_audio.shape[1]
         )
         self._stop_playback()
-        if not reuse_stream:
+        if self._backend_kind == "sounddevice" and not reuse_stream:
             self._close_stream()
 
-        self._audio_data = np.ascontiguousarray(data, dtype=np.float32)
-        # Keep a shared reference to avoid heavy copies on clip switches.
-        # We never mutate the source buffer in-place, so this is safe.
-        self._source_audio_data = self._audio_data
-        self._sample_rate = sample_rate
-        self._channels = data.shape[1]
-        self._duration = len(data) / sample_rate if sample_rate > 0 else 0.0
-        self._active_duration = self._detect_active_duration(self._audio_data, sample_rate)
+        if decoded_audio is not None and sample_rate > 0:
+            self._audio_data = decoded_audio
+            # Keep a shared reference to avoid heavy copies on clip switches.
+            # We never mutate the source buffer in-place, so this is safe.
+            self._source_audio_data = self._audio_data
+            self._sample_rate = int(sample_rate)
+            self._channels = decoded_audio.shape[1]
+            self._duration = len(decoded_audio) / sample_rate if sample_rate > 0 else 0.0
+            self._active_duration = self._detect_active_duration(self._audio_data, sample_rate)
+        else:
+            self._audio_data = None
+            self._source_audio_data = None
+            self._duration = 0.0
+            self._active_duration = 0.0
+
         self._current_file = file_path
         self._time_stretch_ratio = 1.0
         self._pitch_mode = "time_stretch"
         self._playback_speed = 1.0
+
+        qt_loaded = False
+        if self._backend_kind == "qt" or (not self._backend_available and self._init_qt_backend()):
+            if self._qt_player is not None:
+                try:
+                    self._qt_player.stop()
+                    self._qt_player.setSource(QUrl.fromLocalFile(os.path.abspath(file_path)))
+                    if self._qt_audio_output is not None:
+                        self._qt_audio_output.setVolume(self._volume)
+                    self._backend_error = None
+                    qt_loaded = True
+                except Exception as exc:
+                    self._backend_error = f"Qt audio failed to load source: {exc.__class__.__name__}: {exc}"
+                    qt_loaded = False
+
         self._set_position(0.0)
+
+        if decoded_audio is None and not qt_loaded:
+            if decode_error:
+                self._backend_error = decode_error
+            return False
+
+        if decode_error and qt_loaded:
+            # Keep decode failure details for exports while allowing playback via Qt.
+            self._backend_error = decode_error
+
         return True
 
     @staticmethod
@@ -240,13 +370,24 @@ class AudioManager(QObject):
         with self._stream_lock:
             self._volume = clamped / 100.0
             stream = self._stream
+            qt_output = self._qt_audio_output
         if stream:
             try:
                 stream.write_available  # noop, ensures stream exists
             except Exception:
                 pass
+        if qt_output is not None:
+            try:
+                qt_output.setVolume(self._volume)
+            except Exception:
+                pass
 
     def is_playing(self) -> bool:
+        if self._backend_kind == "qt" and self._qt_player is not None and QMediaPlayer is not None:
+            try:
+                return self._qt_player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+            except Exception:
+                pass
         return self._play_active
 
     def configure_playback(self, speed: float, pitch_mode: str):
@@ -255,11 +396,26 @@ class AudioManager(QObject):
 
         Args:
             speed: Tempo multiplier relative to original audio.
-            pitch_mode: 'time_stretch', 'pitch_shift', or 'chipmunk'.
+            pitch_mode: 'time_stretch', 'pitch_shift', 'chipmunk', or 'pitch_down_locked'.
         """
         clamped_speed = max(0.01, float(speed))
-        if pitch_mode not in ("time_stretch", "pitch_shift", "chipmunk"):
+        if pitch_mode not in ("time_stretch", "pitch_shift", "chipmunk", "pitch_down_locked"):
             pitch_mode = "time_stretch"
+
+        if self._backend_kind == "qt" and self._qt_player is not None:
+            with self._stream_lock:
+                self._playback_speed = clamped_speed
+                self._pitch_mode = pitch_mode
+            try:
+                # QtMultimedia cannot apply independent pitch shift while tempo remains fixed.
+                # For pitch_down_locked, keep tempo normal as the best fallback.
+                qt_rate = 1.0 if pitch_mode == "pitch_down_locked" else clamped_speed
+                self._qt_player.setPlaybackRate(qt_rate)
+                self._backend_error = None
+            except Exception as exc:
+                self._backend_error = f"Qt audio playback-rate change failed: {exc.__class__.__name__}: {exc}"
+            self._pending_pitch_config = None
+            return
 
         self._pending_pitch_config = (clamped_speed, pitch_mode)
         with self._stream_lock:
@@ -284,6 +440,8 @@ class AudioManager(QObject):
 
         if pitch_mode == "time_stretch":
             self._start_time_stretch(source, clamped_speed, current_time, current_duration, was_playing)
+        elif pitch_mode == "pitch_down_locked":
+            self._apply_pitch_down_locked_mode(source, clamped_speed, current_time, was_playing)
         else:
             self._apply_pitch_mode(source, clamped_speed, pitch_mode, current_time, was_playing)
 
@@ -294,6 +452,12 @@ class AudioManager(QObject):
         self._stop_playback()
         self._close_stream()
         self._cancel_stretch_worker()
+        if self._qt_player is not None:
+            try:
+                self._qt_player.stop()
+                self._qt_player.setSource(QUrl())
+            except Exception:
+                pass
         self._audio_data = None
         self._source_audio_data = None
         self._current_file = None
@@ -314,31 +478,347 @@ class AudioManager(QObject):
             else:
                 frame = 0
             self._playback_cursor = frame
+        if self._backend_kind == "qt" and self._qt_player is not None:
+            try:
+                self._qt_player.setPosition(max(0, int(round(target * 1000.0))))
+            except Exception:
+                pass
 
     def _start_playback(self):
+        if not self.backend_available:
+            with self._stream_lock:
+                self._play_active = False
+            return
+
+        if self._backend_kind == "qt":
+            with self._stream_lock:
+                self._play_active = True
+            if self._qt_player is not None and self._enabled:
+                try:
+                    self._qt_player.play()
+                    self._backend_error = None
+                except Exception as exc:
+                    with self._stream_lock:
+                        self._play_active = False
+                    self._backend_error = f"Qt audio playback failed: {exc.__class__.__name__}: {exc}"
+            return
+
         with self._stream_lock:
-            if not self._audio_data is None:
+            if self._audio_data is not None:
                 self._playback_cursor = min(self._playback_cursor, len(self._audio_data))
                 self._play_active = True
         self._ensure_stream()
 
     def _stop_playback(self):
+        if self._backend_kind == "qt" and self._qt_player is not None:
+            try:
+                self._qt_player.pause()
+            except Exception:
+                pass
         with self._stream_lock:
             self._play_active = False
 
     def _ensure_stream(self):
+        if self._backend_kind != "sounddevice" or not self._backend_available or sd is None:
+            return
+
         if self._stream is None and self.is_ready:
-            self._stream = sd.OutputStream(
-                samplerate=self._sample_rate,
-                channels=self._channels,
-                dtype="float32",
-                blocksize=1024,
-                latency="high",
-                callback=self._stream_callback,
-            )
-            self._stream.start()
-        elif self._stream and not self._stream.active:
-            self._stream.start()
+            stream_kwargs = {
+                "samplerate": self._sample_rate,
+                "channels": self._channels,
+                "dtype": "float32",
+                "blocksize": 1024,
+                "latency": "high",
+                "callback": self._stream_callback,
+            }
+            if self._output_device is not None:
+                stream_kwargs["device"] = self._output_device
+            try:
+                self._stream = sd.OutputStream(**stream_kwargs)
+                self._stream.start()
+                self._backend_error = None
+                return
+            except Exception as exc:
+                self._close_stream()
+                fallback_device = self._resolve_compatible_output_device(
+                    sample_rate=self._sample_rate,
+                    channels=self._channels,
+                )
+                if fallback_device is not None:
+                    try:
+                        self._output_device = fallback_device
+                        stream_kwargs["device"] = fallback_device
+                        self._stream = sd.OutputStream(**stream_kwargs)
+                        self._stream.start()
+                        self._backend_error = None
+                        return
+                    except Exception as retry_exc:
+                        reason = (
+                            "Failed to open audio output stream on Linux: "
+                            f"{retry_exc.__class__.__name__}: {retry_exc}"
+                        )
+                else:
+                    reason = (
+                        "Failed to open audio output stream on Linux: "
+                        f"{exc.__class__.__name__}: {exc}"
+                    )
+                if self._promote_qt_fallback(reason):
+                    if self._enabled and self._current_file:
+                        self._start_playback()
+                    return
+                return
+
+        if self._stream and not self._stream.active:
+            try:
+                self._stream.start()
+                self._backend_error = None
+            except Exception as exc:
+                reason = (
+                    "Audio stream stopped unexpectedly and could not restart: "
+                    f"{exc.__class__.__name__}: {exc}"
+                )
+                if self._promote_qt_fallback(reason):
+                    if self._enabled and self._current_file:
+                        self._start_playback()
+                    return
+                self._close_stream()
+
+    def _promote_qt_fallback(self, reason: str) -> bool:
+        """Switch to Qt multimedia backend if sounddevice fails at runtime."""
+        self._backend_error = str(reason or "sounddevice backend failed")
+        self._backend_available = False
+        self._backend_kind = "none"
+        self._close_stream()
+        if self._init_qt_backend():
+            return True
+        self._enabled = False
+        return False
+
+    def _resolve_compatible_output_device(self, sample_rate: int, channels: int) -> Optional[int]:
+        """Find an output device that can play the requested format."""
+        if sd is None:
+            return None
+
+        candidates = []
+
+        def _add_candidate(raw_idx) -> None:
+            try:
+                idx = int(raw_idx)
+            except Exception:
+                return
+            if idx < 0 or idx in candidates:
+                return
+            candidates.append(idx)
+
+        try:
+            device_list = sd.query_devices()
+        except Exception as exc:
+            self._backend_error = f"Unable to query output devices: {exc.__class__.__name__}: {exc}"
+            return None
+
+        # On Linux desktops, route through the mixer first to avoid silent HDMI/hw sinks.
+        preferred_tokens = ("pipewire", "pulse", "default", "sysdefault")
+        for token in preferred_tokens:
+            for idx, dev in enumerate(device_list):
+                try:
+                    max_out = int(dev.get("max_output_channels", 0) or 0)
+                except Exception:
+                    max_out = 0
+                if max_out <= 0:
+                    continue
+                name = str(dev.get("name", "") or "").lower()
+                if token in name:
+                    _add_candidate(idx)
+
+        try:
+            default_device = sd.default.device
+            if isinstance(default_device, (list, tuple)) and len(default_device) >= 2:
+                default_output = default_device[1]
+            else:
+                default_output = default_device
+            _add_candidate(default_output)
+        except Exception:
+            pass
+
+        for idx, dev in enumerate(device_list):
+            try:
+                max_out = int(dev.get("max_output_channels", 0) or 0)
+            except Exception:
+                max_out = 0
+            if max_out > 0:
+                _add_candidate(idx)
+
+        req_channels = max(1, int(channels or 1))
+        req_rate = int(sample_rate or 0)
+
+        for idx in candidates:
+            try:
+                info = sd.query_devices(idx, "output")
+            except Exception:
+                continue
+            max_out = int(info.get("max_output_channels", 0) or 0)
+            if max_out <= 0:
+                continue
+            test_channels = min(req_channels, max_out)
+            try:
+                if req_rate > 0:
+                    sd.check_output_settings(device=idx, channels=test_channels, samplerate=req_rate)
+                else:
+                    sd.check_output_settings(device=idx, channels=test_channels)
+                return int(idx)
+            except Exception:
+                # Fallback to the device's preferred/default sample rate if needed.
+                try:
+                    sd.check_output_settings(device=idx, channels=test_channels)
+                    return int(idx)
+                except Exception:
+                    continue
+
+        return None
+
+    def _describe_output_device(self, device_index: int) -> str:
+        """Return a readable output device name for diagnostics logs."""
+        if sd is None:
+            return ""
+        try:
+            info = sd.query_devices(int(device_index), "output")
+        except Exception:
+            return ""
+        name = str(info.get("name", "") or "").strip()
+        return name
+
+    def _resolve_forced_output_device(self, selector: str, sample_rate: int, channels: int) -> Optional[int]:
+        """Resolve a forced output device by index or name token (MSM_AUDIO_DEVICE)."""
+        if sd is None:
+            return None
+        token = str(selector or "").strip()
+        if not token:
+            return None
+
+        try:
+            devices = sd.query_devices()
+        except Exception as exc:
+            self._backend_error = f"Unable to query output devices: {exc.__class__.__name__}: {exc}"
+            return None
+
+        req_channels = max(1, int(channels or 1))
+        req_rate = int(sample_rate or 0)
+
+        def _supports(idx: int) -> bool:
+            try:
+                info = sd.query_devices(idx, "output")
+            except Exception:
+                return False
+            max_out = int(info.get("max_output_channels", 0) or 0)
+            if max_out <= 0:
+                return False
+            test_channels = min(req_channels, max_out)
+            try:
+                if req_rate > 0:
+                    sd.check_output_settings(device=idx, channels=test_channels, samplerate=req_rate)
+                else:
+                    sd.check_output_settings(device=idx, channels=test_channels)
+                return True
+            except Exception:
+                try:
+                    sd.check_output_settings(device=idx, channels=test_channels)
+                    return True
+                except Exception:
+                    return False
+
+        try:
+            idx = int(token)
+        except Exception:
+            idx = None
+        if idx is not None:
+            if _supports(idx):
+                return idx
+            self._backend_error = f"Forced output device index {idx} is not compatible."
+            return None
+
+        lowered = token.lower()
+        for i, dev in enumerate(devices):
+            try:
+                max_out = int(dev.get("max_output_channels", 0) or 0)
+            except Exception:
+                max_out = 0
+            if max_out <= 0:
+                continue
+            name = str(dev.get("name", "") or "").lower()
+            if lowered in name and _supports(i):
+                return i
+
+        self._backend_error = f"Forced output device '{token}' did not match a compatible output sink."
+        return None
+
+    def _init_qt_backend(self) -> bool:
+        """Initialize Qt multimedia as a fallback playback backend."""
+        if self._qt_player is not None and self._qt_audio_output is not None and self._backend_kind == "qt":
+            self._backend_available = True
+            return True
+
+        if QMediaPlayer is None or QAudioOutput is None:
+            qt_msg = "QtMultimedia is not available in this PyQt build"
+            if _QTMULTIMEDIA_IMPORT_ERROR:
+                qt_msg = f"{qt_msg}: {_QTMULTIMEDIA_IMPORT_ERROR}"
+            if self._backend_error:
+                self._backend_error = f"{self._backend_error}; {qt_msg}"
+            else:
+                self._backend_error = qt_msg
+            self._backend_kind = "none"
+            self._backend_available = False
+            return False
+
+        try:
+            audio_out = QAudioOutput(self)
+            audio_out.setVolume(self._volume)
+            player = QMediaPlayer(self)
+            player.setAudioOutput(audio_out)
+            player.positionChanged.connect(self._on_qt_position_changed)
+            player.playbackStateChanged.connect(self._on_qt_playback_state_changed)
+        except Exception as exc:
+            self._qt_player = None
+            self._qt_audio_output = None
+            self._backend_kind = "none"
+            self._backend_available = False
+            self._backend_error = f"QtMultimedia backend initialization failed: {exc.__class__.__name__}: {exc}"
+            return False
+
+        self._qt_audio_output = audio_out
+        self._qt_player = player
+        self._backend_kind = "qt"
+        self._backend_available = True
+        self._backend_error = None
+
+        if self._current_file:
+            try:
+                self._qt_player.setSource(QUrl.fromLocalFile(os.path.abspath(self._current_file)))
+            except Exception:
+                pass
+
+        return True
+
+    def _on_qt_position_changed(self, position_ms: int):
+        seconds = max(0.0, float(position_ms) / 1000.0)
+        with self._stream_lock:
+            self._current_position = self._clamp_time(seconds)
+            if self._audio_data is not None and self._sample_rate > 0:
+                self._playback_cursor = min(int(self._current_position * self._sample_rate), len(self._audio_data))
+
+    def _on_qt_playback_state_changed(self, state):
+        if QMediaPlayer is None:
+            return
+        with self._stream_lock:
+            self._play_active = state == QMediaPlayer.PlaybackState.PlayingState
+        if self._qt_player is not None and self._duration <= 0.0:
+            try:
+                media_duration = float(self._qt_player.duration()) / 1000.0
+            except Exception:
+                media_duration = 0.0
+            if media_duration > 0.0:
+                self._duration = media_duration
+                if self._active_duration <= 0.0:
+                    self._active_duration = media_duration
 
     def _close_stream(self):
         if self._stream:
@@ -351,6 +831,11 @@ class AudioManager(QObject):
             except Exception:
                 pass
             self._stream = None
+        if self._backend_kind == "qt" and self._qt_player is not None:
+            try:
+                self._qt_player.stop()
+            except Exception:
+                pass
 
     def _stream_callback(self, outdata, frames, time_info, status):
         with self._stream_lock:
@@ -374,7 +859,7 @@ class AudioManager(QObject):
             start = self._playback_cursor
             mode = self._pitch_mode
 
-            if mode == "time_stretch":
+            if mode in ("time_stretch", "pitch_down_locked"):
                 end = min(start + frames, len(audio))
                 chunk = audio[start:end]
                 produced = chunk.shape[0]
@@ -454,7 +939,8 @@ class AudioManager(QObject):
         Args:
             duration: Length in seconds to render.
             speed: Optional override for playback speed multiplier.
-            pitch_mode: Optional override for pitch handling ('time_stretch', 'pitch_shift', 'chipmunk').
+            pitch_mode: Optional override for pitch handling
+                ('time_stretch', 'pitch_shift', 'chipmunk', 'pitch_down_locked').
         """
         if not self.is_ready or duration <= 0.0:
             return None
@@ -464,10 +950,10 @@ class AudioManager(QObject):
             return None
 
         mode = pitch_mode or self._pitch_mode or "time_stretch"
-        if mode not in ("time_stretch", "pitch_shift", "chipmunk"):
+        if mode not in ("time_stretch", "pitch_shift", "chipmunk", "pitch_down_locked"):
             mode = "time_stretch"
 
-        if mode == "time_stretch":
+        if mode in ("time_stretch", "pitch_down_locked"):
             audio = self._audio_data
             if audio is None:
                 return None
@@ -504,6 +990,29 @@ class AudioManager(QObject):
                 self._time_stretch_ratio = 1.0
             self._set_position(seek_time)
         if self._pending_pitch_config and self._pending_pitch_config[1] == mode:
+            self._pending_pitch_config = None
+        if was_playing and self._enabled:
+            self._start_playback()
+
+    def _apply_pitch_down_locked_mode(
+        self,
+        source: np.ndarray,
+        pitch_factor: float,
+        seek_time: float,
+        was_playing: bool,
+    ):
+        """Apply a pitch-down effect while keeping playback tempo unchanged."""
+        if was_playing:
+            self._stop_playback()
+        processed = self._pitch_shift_locked_audio_static(source, pitch_factor)
+        with self._stream_lock:
+            self._audio_data = processed
+            self._duration = len(processed) / self._sample_rate if self._sample_rate > 0 else 0.0
+            self._pitch_mode = "pitch_down_locked"
+            self._playback_speed = max(0.01, float(pitch_factor))
+            self._time_stretch_ratio = 1.0
+            self._set_position(seek_time)
+        if self._pending_pitch_config and self._pending_pitch_config[1] == "pitch_down_locked":
             self._pending_pitch_config = None
         if was_playing and self._enabled:
             self._start_playback()
@@ -680,6 +1189,34 @@ class AudioManager(QObject):
         return output
 
     @staticmethod
+    def _pitch_shift_locked_audio_static(audio: np.ndarray, pitch_factor: float) -> np.ndarray:
+        """
+        Lower/raise pitch while keeping overall playback duration close to original.
+
+        This uses a two-stage process:
+          1) resample by pitch_factor (changes pitch + tempo),
+          2) time-stretch back by inverse factor (restores tempo, keeps shifted pitch).
+        """
+        if audio is None or len(audio) == 0:
+            return np.zeros((0, 1), dtype=np.float32)
+        try:
+            factor = float(pitch_factor)
+        except (TypeError, ValueError):
+            factor = 1.0
+        factor = max(0.25, min(4.0, factor))
+        if abs(factor - 1.0) < 1e-6:
+            return audio.copy()
+
+        target_len = max(1, int(round(len(audio) / factor)))
+        resampled = AudioManager._resample_chunk(audio, target_len)
+        compensated = AudioManager._time_stretch_audio_static(resampled, 1.0 / factor)
+        if compensated.ndim != 2:
+            compensated = np.asarray(compensated, dtype=np.float32).reshape((-1, audio.shape[1]))
+        if len(compensated) != len(audio):
+            compensated = AudioManager._resample_chunk(compensated, len(audio))
+        return np.ascontiguousarray(compensated, dtype=np.float32)
+
+    @staticmethod
     def _resample_chunk(chunk: np.ndarray, new_length: int) -> np.ndarray:
         """Simple linear resampler to preserve pitch."""
         if new_length <= 0:
@@ -714,7 +1251,9 @@ class MultiTrackAudioMixer(QObject):
 
     def __init__(self, parent: Optional[QObject] = None):
         super().__init__(parent)
-        self._enabled: bool = True
+        self._backend_available: bool = sd is not None
+        self._backend_error: Optional[str] = _SOUNDDEVICE_IMPORT_ERROR
+        self._enabled: bool = self._backend_available
         self._volume: float = 0.8
         self._playing: bool = False
         self._voices: Dict[object, _MixVoice] = {}
@@ -722,8 +1261,11 @@ class MultiTrackAudioMixer(QObject):
         self._sample_rate: int = 44100
         self._channels: int = 1
         self._stream_lock = threading.RLock()
+        self._output_device: Optional[int] = None
 
     def set_enabled(self, enabled: bool):
+        if enabled and not self._backend_available:
+            enabled = False
         if self._enabled == enabled:
             return
         self._enabled = enabled
@@ -737,6 +1279,9 @@ class MultiTrackAudioMixer(QObject):
             self._volume = clamped / 100.0
 
     def set_playing(self, playing: bool):
+        if playing and not self._backend_available:
+            self._playing = False
+            return
         with self._stream_lock:
             self._playing = bool(playing)
         if self._playing:
@@ -807,16 +1352,67 @@ class MultiTrackAudioMixer(QObject):
         self._close_stream()
 
     def _ensure_stream(self):
+        if not self._backend_available or sd is None:
+            return
         if self._stream is None and self._voices:
-            self._stream = sd.OutputStream(
-                samplerate=self._sample_rate,
-                channels=self._channels,
-                dtype="float32",
-                callback=self._stream_callback,
-            )
-            self._stream.start()
+            stream_kwargs = {
+                "samplerate": self._sample_rate,
+                "channels": self._channels,
+                "dtype": "float32",
+                "callback": self._stream_callback,
+            }
+            if self._output_device is not None:
+                stream_kwargs["device"] = self._output_device
+            try:
+                self._stream = sd.OutputStream(**stream_kwargs)
+                self._stream.start()
+                self._backend_error = None
+                return
+            except Exception:
+                fallback = self._resolve_fallback_output_device()
+                if fallback is None:
+                    self._backend_available = False
+                    self._enabled = False
+                    return
+                self._output_device = fallback
+                try:
+                    stream_kwargs["device"] = fallback
+                    self._stream = sd.OutputStream(**stream_kwargs)
+                    self._stream.start()
+                    self._backend_error = None
+                except Exception:
+                    self._backend_available = False
+                    self._enabled = False
+                    self._close_stream()
+                    return
         elif self._stream and not self._stream.active:
-            self._stream.start()
+            try:
+                self._stream.start()
+            except Exception:
+                self._backend_available = False
+                self._enabled = False
+                self._close_stream()
+
+    def _resolve_fallback_output_device(self) -> Optional[int]:
+        if sd is None:
+            return None
+        try:
+            devices = sd.query_devices()
+        except Exception:
+            return None
+        for idx, dev in enumerate(devices):
+            try:
+                max_out = int(dev.get("max_output_channels", 0))
+            except Exception:
+                max_out = 0
+            if max_out <= 0:
+                continue
+            try:
+                sd.check_output_settings(device=idx, channels=min(self._channels, max_out))
+                return idx
+            except Exception:
+                continue
+        return None
 
     def _close_stream(self):
         if self._stream:
