@@ -213,6 +213,46 @@ def _decode_attachment_time_value(value: float) -> Tuple[float, float]:
     return value, 1.0
 
 
+
+def _parse_attachments_and_sheet_remaps(
+    buf: Buffer,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, str]]]:
+    """Parse costume attachment records plus optional sheet remaps."""
+    attachments_checkpoint = buf.tell()
+    attachments: List[Dict[str, Any]] = []
+    sheet_remaps: List[Dict[str, str]] = []
+    fallback_error: ValueError | None = None
+
+    try:
+        attachments = parse_ae_anim_layers(buf)
+        if not buf.remaining:
+            # Rev5 variant: attachment block is terminal; no sheet remap section.
+            sheet_remaps = []
+        else:
+            sheet_count = buf.read_u32()
+            sheet_remaps = parse_sheet_remaps(buf, preset_count=sheet_count)
+    except ValueError as exc:
+        fallback_error = exc
+        buf.seek(attachments_checkpoint)
+        try:
+            sheet_count = buf.read_u32()
+            sheet_remaps = parse_sheet_remaps(buf, preset_count=sheet_count)
+            if not buf.remaining:
+                # Legacy files may omit attachment records entirely.
+                attachments = []
+            else:
+                attachments = parse_ae_anim_layers(buf)
+        except ValueError as final_exc:
+            if fallback_error:
+                raise ValueError(
+                    "Failed to parse costume attachments/sheet remaps block using either "
+                    "known layout."
+                ) from final_exc
+            raise
+
+    return attachments, sheet_remaps
+
+
 def parse_costume_file(data: bytes) -> Dict[str, Any]:
     buf = Buffer(data)
     parsed = {
@@ -222,46 +262,35 @@ def parse_costume_file(data: bytes) -> Dict[str, Any]:
         "set_blend_layers": parse_set_blend_layers(buf),
     }
 
-    layer_colors = parse_layer_colors(buf)
-    parsed["layer_colors"] = layer_colors
-    parsed["layer_color_overrides"] = layer_colors  # Legacy alias
-
-    # Modern BINs store AE attachments before the sheet remap block, while
-    # certain legacy BINs write the sheet swaps first. Parse both layouts.
-    attachments_checkpoint = buf.tell()
-    attachments: List[Dict[str, Any]] = []
-    sheet_remaps: List[Dict[str, str]] = []
-    fallback_error: ValueError | None = None
-    try:
-        attachments = parse_ae_anim_layers(buf)
-        sheet_count = buf.read_u32()
-        sheet_remaps = parse_sheet_remaps(buf, preset_count=sheet_count)
-    except ValueError as exc:
-        fallback_error = exc
-        buf.seek(attachments_checkpoint)
+    # Most files include a layer_colors block, but some Rev5 costume BINs jump
+    # directly into attachment records. Try both layouts.
+    tail_checkpoint = buf.tell()
+    tail_errors: List[ValueError] = []
+    for include_layer_colors in (True, False):
+        buf.seek(tail_checkpoint)
         try:
-            sheet_count = buf.read_u32()
-            sheet_remaps = parse_sheet_remaps(buf, preset_count=sheet_count)
-            attachments = parse_ae_anim_layers(buf)
-        except ValueError as final_exc:
-            if fallback_error:
+            if include_layer_colors:
+                layer_colors = parse_layer_colors(buf)
+            else:
+                layer_colors = []
+            attachments, sheet_remaps = _parse_attachments_and_sheet_remaps(buf)
+            if any(buf.remaining):
                 raise ValueError(
-                    "Failed to parse costume attachments/sheet remaps block using either "
-                    "known layout."
-                ) from final_exc
-            raise
+                    f"Unparsed trailing bytes detected at offset {len(data) - len(buf.remaining)}."
+                )
 
-    parsed["ae_anim_layers"] = attachments
+            parsed["layer_colors"] = layer_colors
+            parsed["layer_color_overrides"] = layer_colors  # Legacy alias
+            parsed["ae_anim_layers"] = attachments
+            parsed["sheet_remaps"] = sheet_remaps
+            parsed["swaps"] = sheet_remaps  # Legacy key for older JSON consumers
+            return parsed
+        except ValueError as exc:
+            tail_errors.append(exc)
 
-    parsed["sheet_remaps"] = sheet_remaps
-    parsed["swaps"] = sheet_remaps  # Legacy key for older JSON consumers
-
-    if any(buf.remaining):
-        raise ValueError(
-            f"Unparsed trailing bytes detected at offset {len(data) - len(buf.remaining)}."
-        )
-
-    return parsed
+    if tail_errors:
+        raise tail_errors[-1]
+    raise ValueError("Failed to parse costume tail blocks.")
 
 
 def main() -> None:

@@ -3,6 +3,7 @@ Timeline Widget
 Provides playback controls and timeline scrubbing with keyframe markers.
 """
 
+import math
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 
@@ -23,6 +24,9 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QPointF, QRectF
 from PyQt6.QtGui import QPainter, QColor, QPen, QPainterPath, QPixmap
+
+_QINT32_MIN = -2147483648
+_QINT32_MAX = 2147483647
 
 
 class KeyframeMarkerBar(QWidget):
@@ -813,12 +817,37 @@ class TimelineWidget(QWidget):
     def set_time_label(self, text: str):
         self.time_label.setText(text)
 
+    @staticmethod
+    def _clamp_qint32(value: float, *, minimum: int = 0) -> int:
+        """Clamp a numeric value to Qt's signed 32-bit integer range."""
+        if not math.isfinite(value):
+            value = float(minimum)
+        clamped = min(float(_QINT32_MAX), max(float(_QINT32_MIN), float(value)))
+        clamped_int = int(clamped)
+        if clamped_int < minimum:
+            return minimum
+        return clamped_int
+
+    @staticmethod
+    def _sanitize_ms(value_ms: float, *, default_ms: float = 1.0) -> float:
+        """Normalize a millisecond duration into a finite Qt-safe range."""
+        if not math.isfinite(value_ms):
+            value_ms = default_ms
+        return min(float(_QINT32_MAX), max(0.0, float(value_ms)))
+
     def set_slider_maximum(self, maximum: int):
-        duration_seconds = max(0.0, maximum / 1000.0)
+        duration_ms = self._sanitize_ms(float(maximum), default_ms=1.0)
+        duration_seconds = max(0.0, duration_ms / 1000.0)
         self.set_timeline_duration(duration_seconds)
 
     def set_timeline_duration(self, duration_seconds: float):
-        self._duration_ms = max(1.0, float(duration_seconds) * 1000.0)
+        try:
+            duration_value = float(duration_seconds)
+        except (TypeError, ValueError):
+            duration_value = 0.0
+        if not math.isfinite(duration_value) or duration_value < 0.0:
+            duration_value = 0.0
+        self._duration_ms = max(1.0, self._sanitize_ms(duration_value * 1000.0, default_ms=1.0))
         if self._view_duration_ms <= 0.0 or self._view_duration_ms > self._duration_ms:
             self._view_duration_ms = self._duration_ms
             self._view_start_ms = 0.0
@@ -949,10 +978,11 @@ class TimelineWidget(QWidget):
         self._update_lane_view_window()
 
     def _update_slider_range(self):
-        view_ms = max(1.0, self._view_duration_ms)
-        slider_value = int(min(max(self._current_time_ms - self._view_start_ms, 0.0), view_ms))
+        view_ms = max(1.0, self._sanitize_ms(self._view_duration_ms, default_ms=1.0))
+        slider_float = min(max(self._current_time_ms - self._view_start_ms, 0.0), view_ms)
+        slider_value = self._clamp_qint32(slider_float, minimum=0)
         self.timeline_slider.blockSignals(True)
-        self.timeline_slider.setMaximum(int(view_ms))
+        self.timeline_slider.setMaximum(self._clamp_qint32(view_ms, minimum=1))
         self.timeline_slider.setValue(slider_value)
         self.timeline_slider.blockSignals(False)
 
@@ -965,12 +995,15 @@ class TimelineWidget(QWidget):
             self.timeline_scrollbar.hide()
             self.timeline_scrollbar.setRange(0, 0)
         else:
-            max_start = int(max(0.0, self._duration_ms - self._view_duration_ms))
+            max_start = self._clamp_qint32(max(0.0, self._duration_ms - self._view_duration_ms), minimum=0)
+            page_step = self._clamp_qint32(max(1.0, self._view_duration_ms), minimum=1)
+            single_step = self._clamp_qint32(max(1.0, self._view_duration_ms * 0.1), minimum=1)
+            current_value = self._clamp_qint32(self._view_start_ms, minimum=0)
             self.timeline_scrollbar.blockSignals(True)
             self.timeline_scrollbar.setRange(0, max_start)
-            self.timeline_scrollbar.setPageStep(int(self._view_duration_ms))
-            self.timeline_scrollbar.setSingleStep(max(1, int(self._view_duration_ms * 0.1)))
-            self.timeline_scrollbar.setValue(int(self._view_start_ms))
+            self.timeline_scrollbar.setPageStep(page_step)
+            self.timeline_scrollbar.setSingleStep(single_step)
+            self.timeline_scrollbar.setValue(min(current_value, max_start))
             self.timeline_scrollbar.blockSignals(False)
             self.timeline_scrollbar.show()
 

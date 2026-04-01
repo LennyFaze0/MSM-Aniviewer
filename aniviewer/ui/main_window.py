@@ -80,6 +80,11 @@ from .monster_browser_dialog import (
     MonsterVariantOption,
 )
 from .sprite_workshop_dialog import SpriteWorkshopDialog
+from .monster_migration_dialog import (
+    MonsterMigrationDialog,
+    MonsterMigrationRequest,
+    MigrationSourceOption,
+)
 from .midi_editor_dialog import MidiEditorDialog
 from .sprite_picker_dialog import SpritePickerDialog
 from .constraints_dialog import ConstraintEditorDialog
@@ -88,6 +93,14 @@ from utils.ffmpeg_installer import resolve_ffmpeg_path, query_ffmpeg_encoders
 from utils.pytoshop_installer import PytoshopInstaller, PythonPackageInstaller
 from utils.ae_rig_exporter import AERigExporter
 from utils.shader_registry import ShaderRegistry
+from utils.bin_revision_detection import (
+    build_auto_converter_order,
+    collect_bin_detection_hints,
+    converter_display_name,
+    infer_revision_hint,
+    source_format_revision_hint,
+    source_format_revision_label,
+)
 from utils.dof_particles import (
     extract_particle_nodes,
     extract_control_points,
@@ -104,6 +117,23 @@ try:
     import UnityPy  # type: ignore
 except Exception:
     UnityPy = None
+
+_UNITYPY_IMPORT_ERROR: Optional[str] = None
+
+
+def _ensure_unitypy():
+    """Import UnityPy lazily so installs during runtime can be picked up."""
+    global UnityPy, _UNITYPY_IMPORT_ERROR
+    if UnityPy is not None:
+        return UnityPy
+    try:
+        import UnityPy as _UnityPy  # type: ignore
+    except Exception as exc:
+        _UNITYPY_IMPORT_ERROR = repr(exc)
+        return None
+    UnityPy = _UnityPy
+    _UNITYPY_IMPORT_ERROR = None
+    return UnityPy
 
 
 def _detect_project_root() -> Path:
@@ -124,6 +154,7 @@ class SpriteReplacementRecord:
     sprite_name: str
     source_path: Optional[str]
     applied_at: str
+    original_geometry: Optional[Dict[str, Any]] = None
 from Resources.bin2json.parse_costume_bin import parse_costume_file
 
 
@@ -212,6 +243,7 @@ class MSMAnimationViewer(QMainWindow):
         self.game_path: str = self.settings.value('game_path', '')
         self.downloads_path: str = self.settings.value('downloads_path', '')
         self.dof_path: str = self.settings.value('dof_path', '')
+        self._ensure_path_profiles_store()
         self.dof_search_enabled: bool = bool(self.settings.value('dof/search_enabled', False, type=bool))
         self.dof_particles_world_space: bool = bool(
             self.settings.value('dof/particles_world_space', True, type=bool)
@@ -340,6 +372,10 @@ class MSMAnimationViewer(QMainWindow):
         self.sync_audio_to_bpm: bool = True
         self.pitch_shift_enabled: bool = False
         self.chipmunk_mode: bool = False
+        self.blue_mode_enabled: bool = False
+        self.blue_mode_pitch_factor: float = 0.78
+        self.blue_mode_stretch_x: float = 1.65
+        self.blue_mode_overlay_rgba: Tuple[float, float, float, float] = (0.05, 0.25, 1.0, 0.45)
         self.metronome_enabled: bool = bool(self.settings.value('metronome/enabled', False, type=bool))
         self.metronome_audible: bool = bool(self.settings.value('metronome/audible', True, type=bool))
         ts_num = self.settings.value('metronome/time_signature_numerator', 4, type=int)
@@ -355,6 +391,7 @@ class MSMAnimationViewer(QMainWindow):
         self.muppets_bin2json_path: Optional[str] = ""
         self.oldest_bin2json_path: Optional[str] = ""
         self.composer_bin2json_path: Optional[str] = ""
+        self.rev5_bin2json_path: Optional[str] = ""
         self.rev4_bin2json_path: Optional[str] = ""
         self.rev2_bin2json_path: Optional[str] = ""
         self.dof_anim_to_json_path: Optional[str] = ""
@@ -582,6 +619,7 @@ class MSMAnimationViewer(QMainWindow):
         self._last_tile_render_signature: Optional[str] = None
         self._last_terrain_alignment_signature: Optional[str] = None
         self._sprite_workshop_dialog: Optional[SpriteWorkshopDialog] = None
+        self._migration_settings_bridge: Optional[SettingsDialog] = None
         self._keyframe_clipboard: Optional[Dict[str, Any]] = None
         self._hang_watchdog_active: bool = False
         self.buddy_audio_tracks: Dict[str, str] = {}
@@ -611,6 +649,7 @@ class MSMAnimationViewer(QMainWindow):
         self.viewport_tool_buttons: List[QToolButton] = []
         self.viewport_tool_cursor_btn: Optional[QToolButton] = None
         self.viewport_tool_zoom_btn: Optional[QToolButton] = None
+        self.blue_mode_toggle_btn: Optional[QToolButton] = None
         self._viewport_tool_icon_cursor_selected: Optional[QIcon] = None
         self._viewport_tool_icon_cursor_unselected: Optional[QIcon] = None
         self._viewport_tool_icon_zoom_selected: Optional[QIcon] = None
@@ -623,6 +662,13 @@ class MSMAnimationViewer(QMainWindow):
         self.audio_manager = AudioManager(self)
         self.audio_manager.set_volume(self.control_panel.audio_volume_slider.value())
         self.audio_manager.set_enabled(self.control_panel.audio_enable_checkbox.isChecked())
+        self._audio_backend_warning_shown: bool = False
+        if self.audio_manager.backend_available:
+            self.log_widget.log(
+                f"Audio backend ready: {self.audio_manager.backend_summary}",
+                "INFO",
+            )
+        self._report_audio_backend_status()
         self._apply_audio_preferences_to_controls()
         self.metronome = Metronome(self)
         self.metronome.tick.connect(self._on_metronome_tick)
@@ -710,10 +756,24 @@ class MSMAnimationViewer(QMainWindow):
         self.focus_mode_btn.setToolTip("Hide both side panels")
         self.focus_mode_btn.toggled.connect(self._on_focus_mode_toggled)
         toolbar_layout.addWidget(self.focus_mode_btn)
+
+        if self._is_blue_mode_day():
+            self.blue_mode_toggle_btn = QToolButton()
+            self.blue_mode_toggle_btn.setText("Blue Mode")
+            self.blue_mode_toggle_btn.setCheckable(True)
+            self.blue_mode_toggle_btn.setToolTip(
+                "April 1 special mode: deeper audio pitch + stretched blue viewport."
+            )
+            self.blue_mode_toggle_btn.toggled.connect(self.on_blue_mode_toggled)
+            toolbar_layout.addWidget(self.blue_mode_toggle_btn)
         
         sprite_workshop_btn = QPushButton("Sprite Workshop")
         sprite_workshop_btn.clicked.connect(self.show_sprite_workshop)
         toolbar_layout.addWidget(sprite_workshop_btn)
+
+        monster_migration_btn = QPushButton("Monster Migration")
+        monster_migration_btn.clicked.connect(self.show_monster_migration)
+        toolbar_layout.addWidget(monster_migration_btn)
 
         midi_editor_btn = QPushButton("MIDI Editor")
         midi_editor_btn.clicked.connect(self.show_midi_editor)
@@ -825,6 +885,7 @@ class MSMAnimationViewer(QMainWindow):
         self.gl_widget.playback_state_changed.connect(self.on_playback_state_changed)
         self.gl_widget.transform_action_committed.connect(self._record_transform_action)
         self.gl_widget.tile_render_stats.connect(self._on_tile_render_stats)
+        self.gl_widget.runtime_error.connect(self._on_gl_runtime_error)
         stored_tile_path = self.settings.value("terrain/tile_render_path", "", type=str) or ""
         if stored_tile_path:
             self.gl_widget.set_tile_render_path(stored_tile_path)
@@ -1914,6 +1975,7 @@ class MSMAnimationViewer(QMainWindow):
         muppets_converter_path = resources_dir / "bin2json" / "muppets_bin_to_json.py"
         oldest_converter_path = resources_dir / "bin2json" / "oldest_bin_to_json.py"
         composer_converter_path = resources_dir / "bin2json" / "composer_bin_to_json.py"
+        rev5_converter_path = resources_dir / "bin2json" / "rev5-2-json.py"
         rev4_converter_path = resources_dir / "bin2json" / "rev4-2-json.py"
         rev2_converter_path = resources_dir / "bin2json" / "rev2-2-json.py"
         dof_converter_path = resources_dir / "bin2json" / "dof_anim_to_json.py"
@@ -1939,48 +2001,48 @@ class MSMAnimationViewer(QMainWindow):
         if legacy_converter_path.exists():
             self.legacy_bin2json_path = str(legacy_converter_path)
             self.log_widget.log(
-                f"Legacy BIN converter available: {self.legacy_bin2json_path}",
+                f"Rev1 (Legacy Mobile) BIN converter available: {self.legacy_bin2json_path}",
                 "INFO",
             )
         else:
             self.log_widget.log(
-                "Legacy BIN converter missing; older BINs cannot be parsed automatically.",
+                "Rev1 (Legacy Mobile) BIN converter missing; older BINs cannot be parsed automatically.",
                 "WARNING",
             )
         if choir_converter_path.exists():
             self.choir_bin2json_path = str(choir_converter_path)
             self.log_widget.log(
-                f"Choir BIN converter available: {self.choir_bin2json_path}",
+                f"Rev3 BIN converter available: {self.choir_bin2json_path}",
                 "INFO",
             )
         else:
             self.choir_bin2json_path = None
             self.log_widget.log(
-                "Choir BIN converter missing; Monster Choir BINs require manual conversion.",
+                "Rev3 BIN converter missing; rev3 BINs require manual conversion.",
                 "INFO",
             )
         if muppets_converter_path.exists():
             self.muppets_bin2json_path = str(muppets_converter_path)
             self.log_widget.log(
-                f"Muppets BIN converter available: {self.muppets_bin2json_path}",
+                f"Rev2 (My Muppets Show) BIN converter available: {self.muppets_bin2json_path}",
                 "INFO",
             )
         else:
             self.muppets_bin2json_path = None
             self.log_widget.log(
-                "Muppets BIN converter missing; muppet_* BINs require manual conversion.",
+                "Rev2 (My Muppets Show) BIN converter missing; muppet_* BINs require manual conversion.",
                 "INFO",
             )
         if oldest_converter_path.exists():
             self.oldest_bin2json_path = str(oldest_converter_path)
             self.log_widget.log(
-                f"Oldest BIN converter available: {self.oldest_bin2json_path}",
+                f"Rev1 BIN converter available: {self.oldest_bin2json_path}",
                 "INFO",
             )
         else:
             self.oldest_bin2json_path = None
             self.log_widget.log(
-                "Oldest BIN converter missing; launch-build BINs require manual conversion.",
+                "Rev1 BIN converter missing; some rev1 BINs require manual conversion.",
                 "INFO",
             )
         if composer_converter_path.exists():
@@ -2007,6 +2069,18 @@ class MSMAnimationViewer(QMainWindow):
                 "Rev4 BIN converter missing; classic app builds require manual conversion.",
                 "INFO",
             )
+        if rev5_converter_path.exists():
+            self.rev5_bin2json_path = str(rev5_converter_path)
+            self.log_widget.log(
+                f"Rev5 BIN converter available: {self.rev5_bin2json_path}",
+                "INFO",
+            )
+        else:
+            self.rev5_bin2json_path = None
+            self.log_widget.log(
+                "Rev5 BIN converter missing; rev5 builds may require fallback conversion.",
+                "INFO",
+            )
         if rev2_converter_path.exists():
             self.rev2_bin2json_path = str(rev2_converter_path)
             self.log_widget.log(
@@ -2016,7 +2090,7 @@ class MSMAnimationViewer(QMainWindow):
         else:
             self.rev2_bin2json_path = None
             self.log_widget.log(
-                "Rev2 BIN converter missing; My Singing Muppets files require manual conversion.",
+                "Rev2 BIN converter missing; rev2 files require manual conversion.",
                 "INFO",
             )
         if dof_converter_path.exists():
@@ -2245,6 +2319,145 @@ class MSMAnimationViewer(QMainWindow):
                 "INFO"
             )
 
+    @staticmethod
+    def _sanitize_path_setting_value(value: Any) -> str:
+        if value is None:
+            return ""
+        return str(value).strip()
+
+    def _normalize_path_profile_entry(self, raw: Any, fallback_name: str) -> Dict[str, str]:
+        if isinstance(raw, dict):
+            name = self._sanitize_path_setting_value(raw.get("name")) or fallback_name
+            game_path = self._sanitize_path_setting_value(raw.get("game_path"))
+            downloads_path = self._sanitize_path_setting_value(raw.get("downloads_path"))
+            dof_path = self._sanitize_path_setting_value(raw.get("dof_path"))
+        else:
+            name = fallback_name
+            game_path = ""
+            downloads_path = ""
+            dof_path = ""
+        return {
+            "name": name,
+            "game_path": game_path,
+            "downloads_path": downloads_path,
+            "dof_path": dof_path,
+        }
+
+    def _load_path_profiles_store(self) -> Tuple[List[Dict[str, str]], int]:
+        profiles: List[Dict[str, str]] = []
+        raw_profiles = self.settings.value("paths/profiles_json", "", type=str) or ""
+        if raw_profiles:
+            try:
+                parsed = json.loads(raw_profiles)
+            except Exception:
+                parsed = []
+            if isinstance(parsed, list):
+                for idx, entry in enumerate(parsed):
+                    profiles.append(self._normalize_path_profile_entry(entry, f"Profile {idx + 1}"))
+
+        if not profiles:
+            profiles = [
+                {
+                    "name": "Default",
+                    "game_path": self._sanitize_path_setting_value(self.game_path),
+                    "downloads_path": self._sanitize_path_setting_value(self.downloads_path),
+                    "dof_path": self._sanitize_path_setting_value(self.dof_path),
+                }
+            ]
+
+        active_index = self.settings.value("paths/active_profile_index", 0, type=int)
+        try:
+            active_index = int(active_index)
+        except (TypeError, ValueError):
+            active_index = 0
+        if active_index < 0:
+            active_index = 0
+        if active_index >= len(profiles):
+            active_index = len(profiles) - 1
+
+        return profiles, active_index
+
+    def _ensure_path_profiles_store(self) -> None:
+        profiles, active_index = self._load_path_profiles_store()
+        active = profiles[active_index]
+        self.game_path = active.get("game_path", "")
+        self.downloads_path = active.get("downloads_path", "")
+        self.dof_path = active.get("dof_path", "")
+
+        self.settings.setValue("paths/profiles_json", json.dumps(profiles, ensure_ascii=True))
+        self.settings.setValue("paths/active_profile_index", int(active_index))
+        self.settings.setValue("game_path", self.game_path)
+        self.settings.setValue("downloads_path", self.downloads_path)
+        self.settings.setValue("dof_path", self.dof_path)
+
+    def _update_active_path_profile(
+        self,
+        *,
+        game_path: Optional[str] = None,
+        downloads_path: Optional[str] = None,
+        dof_path: Optional[str] = None,
+    ) -> None:
+        profiles, active_index = self._load_path_profiles_store()
+        active = profiles[active_index]
+        if game_path is not None:
+            active["game_path"] = self._sanitize_path_setting_value(game_path)
+        if downloads_path is not None:
+            active["downloads_path"] = self._sanitize_path_setting_value(downloads_path)
+        if dof_path is not None:
+            active["dof_path"] = self._sanitize_path_setting_value(dof_path)
+
+        self.settings.setValue("paths/profiles_json", json.dumps(profiles, ensure_ascii=True))
+        self.settings.setValue("paths/active_profile_index", int(active_index))
+
+    def _clear_dof_runtime_caches(self) -> None:
+        self._dof_particle_library_root = None
+        self._dof_particle_library = None
+        self._dof_particle_entry_cache.clear()
+        self._dof_control_point_cache.clear()
+        self._dof_source_node_cache.clear()
+
+    def _reload_primary_paths_from_settings(self, *, refresh: bool = True) -> bool:
+        new_game_path = self._sanitize_path_setting_value(
+            self.settings.value('game_path', self.game_path, type=str)
+        )
+        new_downloads_path = self._sanitize_path_setting_value(
+            self.settings.value('downloads_path', self.downloads_path, type=str)
+        )
+        new_dof_path = self._sanitize_path_setting_value(
+            self.settings.value('dof_path', self.dof_path, type=str)
+        )
+
+        changed = (
+            new_game_path != self.game_path
+            or new_downloads_path != self.downloads_path
+            or new_dof_path != self.dof_path
+        )
+        if not changed:
+            self._update_path_label()
+            return False
+
+        old_dof_path = self.dof_path
+        self.game_path = new_game_path
+        self.downloads_path = new_downloads_path
+        self.dof_path = new_dof_path
+        self.shader_registry.set_game_path(self.game_path or None)
+        self._downloads_xml_bin_roots = self._find_downloads_xml_bin_roots()
+
+        if self.dof_path != old_dof_path:
+            self._clear_dof_runtime_caches()
+
+        self._update_path_label()
+
+        if refresh:
+            self.build_audio_library()
+            self.refresh_file_list()
+            if self.dof_path:
+                self.build_dof_audio_library()
+            if self.dof_search_enabled and self.dof_path:
+                self.refresh_dof_file_list()
+
+        return True
+
     def _update_path_label(self) -> None:
         """Update the toolbar label to reflect the current game/downloads paths."""
         if self.game_path:
@@ -2269,6 +2482,7 @@ class MSMAnimationViewer(QMainWindow):
                 self.game_path = path
                 self.shader_registry.set_game_path(self.game_path)
                 self.settings.setValue('game_path', path)
+                self._update_active_path_profile(game_path=path)
                 self._update_path_label()
                 self.log_widget.log(f"Game path set to: {path}", "SUCCESS")
                 self.build_audio_library()
@@ -2299,11 +2513,8 @@ class MSMAnimationViewer(QMainWindow):
             self.log_widget.log("Detected Unity bundle layout for DOF assets.", "INFO")
         self.dof_path = folder
         self.settings.setValue('dof_path', folder)
-        self._dof_particle_library_root = None
-        self._dof_particle_library = None
-        self._dof_particle_entry_cache.clear()
-        self._dof_control_point_cache.clear()
-        self._dof_source_node_cache.clear()
+        self._update_active_path_profile(dof_path=folder)
+        self._clear_dof_runtime_caches()
         self.log_widget.log(f"DOF Assets path set to: {folder}", "SUCCESS")
         self.build_dof_audio_library()
         self.refresh_dof_file_list()
@@ -2319,6 +2530,7 @@ class MSMAnimationViewer(QMainWindow):
             return
         self.downloads_path = folder
         self.settings.setValue('downloads_path', folder)
+        self._update_active_path_profile(downloads_path=folder)
         self._downloads_xml_bin_roots = self._find_downloads_xml_bin_roots()
         self._update_path_label()
         self.log_widget.log(f"Downloads path set to: {folder}", "SUCCESS")
@@ -2598,13 +2810,21 @@ class MSMAnimationViewer(QMainWindow):
         if self._dof_bundle_cache_path == root and self._dof_bundle_anim_cache:
             return list(self._dof_bundle_anim_cache)
 
-        try:
-            import UnityPy  # type: ignore
-        except Exception:
+        unitypy_mod = self._ensure_unitypy_available()
+        if unitypy_mod is None:
             self.log_widget.log(
                 "UnityPy is required to scan bundle animations. Install it to list DOF bundle files.",
                 "WARNING",
             )
+            self.log_widget.log(
+                f"Active interpreter: {sys.executable}",
+                "INFO",
+            )
+            if _UNITYPY_IMPORT_ERROR:
+                self.log_widget.log(
+                    f"UnityPy import error: {_UNITYPY_IMPORT_ERROR}",
+                    "INFO",
+                )
             self._dof_bundle_cache_path = root
             self._dof_bundle_anim_cache = []
             return []
@@ -2634,7 +2854,7 @@ class MSMAnimationViewer(QMainWindow):
                     "INFO",
                 )
             try:
-                env = UnityPy.load(data_path)
+                env = unitypy_mod.load(data_path)
             except Exception:
                 continue
             for obj in env.objects:
@@ -5888,7 +6108,7 @@ class MSMAnimationViewer(QMainWindow):
     ) -> List[TextureAtlas]:
         """Create TextureAtlas objects for a set of source descriptors."""
         atlases: List[TextureAtlas] = []
-        if not sources or (not self.game_path and not self.downloads_path):
+        if not sources:
             return atlases
         dof_context = bool(self.dof_search_enabled)
         if not dof_context and json_dir and self.dof_path:
@@ -6086,6 +6306,27 @@ class MSMAnimationViewer(QMainWindow):
                 tags.add(raw_value.strip())
             return tags
 
+        def _coerce_keyframe_time(raw_value: Any) -> float:
+            """
+            Normalize keyframe times to avoid parser noise (denormals/overflow junk)
+            from legacy/revision payloads.
+            """
+            try:
+                value = float(raw_value)
+            except (TypeError, ValueError):
+                return 0.0
+            if not math.isfinite(value):
+                return 0.0
+            if abs(value) < 1e-4:
+                return 0.0
+            # Keep timeline-safe bounds while still allowing long clips.
+            max_seconds = 2147483647 / 1000.0
+            if value > max_seconds:
+                return max_seconds
+            if value < -max_seconds:
+                return -max_seconds
+            return value
+
         legacy_payload = False
         if resource_dict is not None:
             legacy_payload = self._is_legacy_payload(resource_dict, source_path)
@@ -6140,21 +6381,48 @@ class MSMAnimationViewer(QMainWindow):
             layer_has_depth = False
             frame_entries = layer_data.get('frames', [])
             if frame_entries:
-                indexed = enumerate(frame_entries)
+                indexed = list(enumerate(frame_entries))
+
+                def _frame_sort_key(pair: Tuple[int, Dict[str, Any]]) -> Tuple[float, int, int]:
+                    idx, frame = pair
+                    time_value = _coerce_keyframe_time(frame.get("time", 0.0))
+                    sprite_dict = frame.get("sprite") if isinstance(frame.get("sprite"), dict) else {}
+                    sprite_name = str(sprite_dict.get("string", "") or "").strip()
+                    # For identical times, keep empty-sprite records first so non-empty
+                    # sprite records win "last keyframe at time" evaluation.
+                    sprite_priority = 1 if sprite_name else 0
+                    return (time_value, sprite_priority, idx)
+
                 sorted_frames = [
                     frame for _, frame in sorted(
                         indexed,
-                        key=lambda pair: (pair[1].get('time', 0.0), pair[0])
+                        key=_frame_sort_key,
                     )
                 ]
             else:
                 sorted_frames = frame_entries
             for frame_data in sorted_frames:
-                sprite_info = frame_data.get('sprite', {}) or {}
-                sprite_name = sprite_info.get('string', '')
-                sprite_immediate = sprite_info.get('immediate', 0)
+                time_value = _coerce_keyframe_time(frame_data.get("time", 0.0))
+                sprite_info = frame_data.get('sprite', {}) if isinstance(frame_data.get('sprite'), dict) else {}
+                sprite_name = str(sprite_info.get('string', '') or '')
+                sprite_immediate = sprite_info.get('immediate', 0 if sprite_name else -1)
+                if sprite_immediate == 0 and not sprite_name:
+                    sprite_immediate = -1
                 if legacy_payload and sprite_name and sprite_immediate <= 0:
                     sprite_immediate = 1
+
+                pos_info = frame_data.get('pos') if isinstance(frame_data.get('pos'), dict) else {}
+                scale_info = frame_data.get('scale') if isinstance(frame_data.get('scale'), dict) else {}
+                rotation_info = frame_data.get('rotation') if isinstance(frame_data.get('rotation'), dict) else {}
+                opacity_info = frame_data.get('opacity') if isinstance(frame_data.get('opacity'), dict) else {}
+                rgb_info = frame_data.get('rgb') if isinstance(frame_data.get('rgb'), dict) else {}
+
+                immediate_pos = pos_info.get('immediate', -1 if not pos_info else 0)
+                immediate_scale = scale_info.get('immediate', -1 if not scale_info else 0)
+                immediate_rotation = rotation_info.get('immediate', -1 if not rotation_info else 0)
+                immediate_opacity = opacity_info.get('immediate', -1 if not opacity_info else 0)
+                immediate_rgb = rgb_info.get('immediate', -1 if not rgb_info else 0)
+
                 depth_value = 0.0
                 depth_immediate = -1
                 depth_entry = frame_data.get('depth')
@@ -6169,26 +6437,26 @@ class MSMAnimationViewer(QMainWindow):
                     layer_has_depth = True
                 keyframes.append(
                     KeyframeData(
-                        time=frame_data.get('time', 0.0),
-                        pos_x=frame_data.get('pos', {}).get('x', 0),
-                        pos_y=frame_data.get('pos', {}).get('y', 0),
+                        time=time_value,
+                        pos_x=pos_info.get('x', 0),
+                        pos_y=pos_info.get('y', 0),
                         depth=depth_value,
-                        scale_x=frame_data.get('scale', {}).get('x', 100),
-                        scale_y=frame_data.get('scale', {}).get('y', 100),
-                        rotation=frame_data.get('rotation', {}).get('value', 0),
-                        opacity=frame_data.get('opacity', {}).get('value', 100),
+                        scale_x=scale_info.get('x', 100),
+                        scale_y=scale_info.get('y', 100),
+                        rotation=rotation_info.get('value', 0),
+                        opacity=opacity_info.get('value', 100),
                         sprite_name=sprite_name,
-                        r=frame_data.get('rgb', {}).get('red', 255),
-                        g=frame_data.get('rgb', {}).get('green', 255),
-                        b=frame_data.get('rgb', {}).get('blue', 255),
-                        a=frame_data.get('rgb', {}).get('alpha', 255),
-                        immediate_pos=frame_data.get('pos', {}).get('immediate', 0),
+                        r=rgb_info.get('red', 255),
+                        g=rgb_info.get('green', 255),
+                        b=rgb_info.get('blue', 255),
+                        a=rgb_info.get('alpha', 255),
+                        immediate_pos=immediate_pos,
                         immediate_depth=depth_immediate,
-                        immediate_scale=frame_data.get('scale', {}).get('immediate', 0),
-                        immediate_rotation=frame_data.get('rotation', {}).get('immediate', 0),
-                        immediate_opacity=frame_data.get('opacity', {}).get('immediate', 0),
+                        immediate_scale=immediate_scale,
+                        immediate_rotation=immediate_rotation,
+                        immediate_opacity=immediate_opacity,
                         immediate_sprite=sprite_immediate,
-                        immediate_rgb=frame_data.get('rgb', {}).get('immediate', -1)
+                        immediate_rgb=immediate_rgb,
                     )
                 )
             blend_value = self._normalize_blend_value(layer_data.get('blend', 0), blend_version)
@@ -7081,116 +7349,87 @@ class MSMAnimationViewer(QMainWindow):
             return None
 
         json_path = os.path.splitext(bin_path)[0] + '.json'
-        bin_name = os.path.basename(bin_path).lower()
-        normalized_path = os.path.normcase(os.path.normpath(bin_path))
-        is_muppet_bin = bin_name.startswith("muppet_")
-        is_my_singing_muppets = "my singing muppets.app" in normalized_path
-        is_composer_bin = "_composer" in bin_name
+        detection_hints = collect_bin_detection_hints(bin_path)
+        revision_hint = detection_hints.revision_hint
 
         relative_display = self._relative_xml_bin_display(bin_path)
         action = "Re-exporting" if force else "Converting"
         self.log_widget.log(f"{action} {relative_display} to JSON...", "INFO")
+        hint_parts: List[str] = []
+        if revision_hint is not None:
+            hint_parts.append(f"rev {revision_hint}")
+        if detection_hints.family_hint:
+            hint_parts.append(f"{detection_hints.family_hint} family")
+        if hint_parts:
+            self.log_widget.log(f"Auto-detect hints: {', '.join(hint_parts)}.", "INFO")
 
-        attempts: List[Tuple[str, str, List[str], str]] = []
+        converter_paths: Dict[str, Optional[str]] = {
+            "rev6": self.bin2json_path,
+            "rev5": self.rev5_bin2json_path,
+            "rev4": self.rev4_bin2json_path,
+            "rev2": self.rev2_bin2json_path,
+            "legacy": self.legacy_bin2json_path,
+            "rev1_classic": self.oldest_bin2json_path,
+            "rev1_launch": self.oldest_bin2json_path,
+            # Backward-compatible alias.
+            "oldest": self.oldest_bin2json_path,
+            "choir": self.choir_bin2json_path,
+            "muppets": self.muppets_bin2json_path,
+        }
+        converter_labels: Dict[str, str] = {
+            "rev6": "Rev6 BIN parser",
+            "rev5": "Rev5 BIN parser",
+            "rev4": "Rev4 BIN parser",
+            "rev2": "Rev2 BIN parser",
+            "legacy": "Rev1 (Legacy Mobile) BIN parser",
+            "rev1_classic": "Rev1 BIN parser",
+            "rev1_launch": "Rev1 BIN parser",
+            "oldest": "Rev1 BIN parser",
+            "choir": "Rev3 BIN parser",
+            "muppets": "Rev2 (My Muppets Show) BIN parser",
+        }
+        missing_messages: Dict[str, str] = {
+            "rev6": "Rev6 BIN converter missing; cannot parse rev6 files.",
+            "rev5": "Rev5 BIN converter missing; cannot auto-parse rev5 files.",
+            "rev4": "Rev4 BIN converter missing; cannot auto-parse classic app files.",
+            "rev2": "Rev2 BIN converter missing; cannot auto-parse rev2 files.",
+            "legacy": "Rev1 (Legacy Mobile) BIN converter missing; cannot auto-parse early mobile files.",
+            "rev1_classic": "Rev1 BIN converter missing; cannot auto-parse rev1 files.",
+            "rev1_launch": "Rev1 BIN converter missing; cannot auto-parse rev1 files.",
+            "oldest": "Rev1 BIN converter missing; cannot auto-parse rev1 files.",
+            "choir": "Rev3 BIN converter missing; cannot auto-parse rev3 files.",
+            "muppets": "Rev2 (My Muppets Show) BIN converter missing; cannot auto-parse muppet_* files.",
+        }
 
-        def queue_attempt(
-            label: str,
-            friendly: str,
-            script_path: Optional[str],
-            args: List[str],
-            missing_msg: Optional[str] = None,
-        ) -> None:
+        preferred_order = build_auto_converter_order(detection_hints)
+
+        attempts: List[Tuple[str, str, List[str], str, str, Optional[int]]] = []
+        queued: Set[str] = set()
+
+        for key in preferred_order:
+            if key in queued:
+                continue
+            queued.add(key)
+            script_path = converter_paths.get(key)
             if not script_path:
-                if missing_msg:
-                    self.log_widget.log(missing_msg, "WARNING")
-                return
+                self.log_widget.log(missing_messages.get(key, f"Converter '{key}' missing."), "WARNING")
+                continue
+            if key in ("legacy", "rev1_classic", "rev1_launch", "oldest", "choir", "muppets"):
+                cmd = self._build_python_command(script_path) + [bin_path, "-o", json_path]
+                produced_json = json_path
+            else:
+                cmd = self._build_python_command(script_path) + ["d", bin_path]
+                produced_json = os.path.splitext(bin_path)[0] + ".json"
             attempts.append(
                 (
-                    label,
-                    friendly,
-                    self._build_python_command(script_path) + args,
+                    key,
+                    converter_labels.get(key, f"{converter_display_name(key)} BIN parser"),
+                    cmd,
                     os.path.dirname(script_path),
+                    produced_json,
+                    self._expected_converter_output_rev(key),
                 )
             )
-
-        if is_muppet_bin and is_my_singing_muppets:
-            queue_attempt(
-                "rev2",
-                "Rev2 BIN parser",
-                self.rev2_bin2json_path,
-                ["d", bin_path],
-                "Rev2 BIN converter missing; cannot auto-parse My Singing Muppets files.",
-            )
-
-        if is_muppet_bin and not is_my_singing_muppets:
-            queue_attempt(
-                "muppets",
-                "Muppets BIN parser",
-                self.muppets_bin2json_path,
-                [bin_path, "-o", json_path],
-                "Muppets BIN converter missing; cannot auto-parse muppet_* files.",
-            )
-
-        rev4_queued = False
-        if is_composer_bin:
-            if self.rev4_bin2json_path:
-                queue_attempt(
-                    "rev4",
-                    "Rev4 BIN parser",
-                    self.rev4_bin2json_path,
-                    ["d", bin_path],
-                    "Rev4 BIN converter missing; cannot auto-parse classic app files.",
-                )
-                rev4_queued = True
-            else:
-                self.log_widget.log(
-                    "Composer BIN detected but Rev4 converter missing; cannot auto-parse composer files.",
-                    "WARNING",
-                )
-
-        queue_attempt(
-            "legacy",
-            "Legacy BIN parser",
-            self.legacy_bin2json_path,
-            [bin_path, "-o", json_path],
-            "Legacy BIN converter missing; cannot auto-parse early mobile files.",
-        )
-        queue_attempt(
-            "choir",
-            "Choir BIN parser",
-            self.choir_bin2json_path,
-            [bin_path, "-o", json_path],
-            "Choir BIN converter missing; cannot auto-parse Monster Choir files.",
-        )
-        if not is_muppet_bin or not is_my_singing_muppets:
-            queue_attempt(
-                "rev2",
-                "Rev2 BIN parser",
-                self.rev2_bin2json_path,
-                ["d", bin_path],
-                "Rev2 BIN converter missing; cannot auto-parse My Singing Muppets files.",
-            )
-        if not rev4_queued:
-            queue_attempt(
-                "rev4",
-                "Rev4 BIN parser",
-                self.rev4_bin2json_path,
-                ["d", bin_path],
-                "Rev4 BIN converter missing; cannot auto-parse classic app files.",
-            )
-        queue_attempt(
-            "oldest",
-            "Oldest BIN parser",
-            self.oldest_bin2json_path,
-            [bin_path, "-o", json_path],
-            "Oldest BIN converter missing; cannot auto-parse launch-build files.",
-        )
-        queue_attempt(
-            "rev6",
-            "Primary BIN parser",
-            self.bin2json_path,
-            ["d", bin_path],
-        )
 
         if not attempts:
             self.log_widget.log(
@@ -7203,7 +7442,7 @@ class MSMAnimationViewer(QMainWindow):
 
         error_messages: List[str] = []
 
-        for label, friendly, cmd, cwd in attempts:
+        for label, friendly, cmd, cwd, produced_json, expected_rev in attempts:
             self.log_widget.log(f"Attempting {friendly}...", "INFO")
             try:
                 result = self._run_converter_command(cmd, cwd)
@@ -7217,6 +7456,26 @@ class MSMAnimationViewer(QMainWindow):
                 stdout = (result.stdout or "").strip()
                 if stdout:
                     self.log_widget.log(stdout, "INFO")
+                if (
+                    os.path.normcase(os.path.normpath(produced_json))
+                    != os.path.normcase(os.path.normpath(json_path))
+                ):
+                    try:
+                        if os.path.exists(json_path):
+                            os.remove(json_path)
+                        shutil.move(produced_json, json_path)
+                    except Exception as exc:
+                        error_text = f"{friendly} produced JSON but move failed: {exc}"
+                        error_messages.append(error_text)
+                        self.log_widget.log(error_text, "WARNING")
+                        continue
+                valid, reason = self._validate_converted_animation_json(json_path, expected_rev)
+                if not valid:
+                    error_text = f"{friendly} output rejected: {reason}"
+                    error_messages.append(error_text)
+                    self.log_widget.log(error_text, "WARNING")
+                    continue
+                self.log_widget.log(f"{friendly} output validated: {reason}", "INFO")
                 self.log_widget.log(
                     f"Converted {os.path.basename(bin_path)} via {friendly}",
                     "SUCCESS",
@@ -7232,6 +7491,69 @@ class MSMAnimationViewer(QMainWindow):
         if announce:
             self._warn_bin_conversion("Conversion Failed", failure_reason)
         return None
+
+    @staticmethod
+    def _expected_converter_output_rev(converter_key: str) -> Optional[int]:
+        if converter_key == "rev2":
+            return 2
+        if converter_key == "rev4":
+            return 4
+        if converter_key in ("rev6", "rev5", "legacy", "rev1_classic", "rev1_launch", "oldest", "choir", "muppets"):
+            return 6
+        return None
+
+    @staticmethod
+    def _infer_revision_hint(normalized_path: str) -> Optional[int]:
+        return infer_revision_hint(normalized_path)
+
+    def _validate_converted_animation_json(
+        self,
+        json_path: str,
+        expected_rev: Optional[int] = None,
+    ) -> Tuple[bool, str]:
+        try:
+            with open(json_path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except Exception as exc:
+            return False, f"output JSON is unreadable ({exc})"
+
+        if not isinstance(payload, dict):
+            return False, "output JSON root is not an object"
+
+        if expected_rev is not None:
+            rev_value = payload.get("rev")
+            try:
+                rev_int = int(rev_value)
+            except (TypeError, ValueError):
+                return False, f"missing/invalid rev value ({rev_value!r})"
+            if rev_int != expected_rev:
+                return False, f"rev {rev_int} does not match expected rev {expected_rev}"
+
+        anims = payload.get("anims")
+        if not isinstance(anims, list) or not anims:
+            return False, "no animations were produced"
+
+        valid_anims = 0
+        layer_total = 0
+        for anim in anims:
+            if not isinstance(anim, dict):
+                continue
+            layers = anim.get("layers")
+            if not isinstance(layers, list) or not layers:
+                continue
+            layer_count = 0
+            for layer in layers:
+                if isinstance(layer, dict):
+                    frames = layer.get("frames")
+                    if isinstance(frames, list) and len(frames) > 0:
+                        layer_count += 1
+            if layer_count:
+                valid_anims += 1
+                layer_total += layer_count
+
+        if valid_anims <= 0 or layer_total <= 0:
+            return False, "animation payload has no valid layers/frames"
+        return True, f"{valid_anims} animation(s), {layer_total} layer(s)"
 
     @staticmethod
     def _build_python_command(script_path: str) -> List[str]:
@@ -7731,9 +8053,13 @@ class MSMAnimationViewer(QMainWindow):
                 "INFO"
             )
             if self.current_animation_revision is not None:
-                suffix = " (Muppet Revision)" if self._is_muppet_payload() else ""
+                revision_label = self._format_detected_revision_label(
+                    payload,
+                    self.current_animation_revision,
+                    json_path,
+                )
                 self.log_widget.log(
-                    f"Detected BIN revision {self.current_animation_revision}{suffix}",
+                    f"Detected BIN revision {revision_label}",
                     "INFO"
                 )
             else:
@@ -8098,10 +8424,25 @@ class MSMAnimationViewer(QMainWindow):
         json_path: Optional[str]
     ) -> Optional[int]:
         """
-        Infer the BIN revision by inspecting payload metadata. Modern exports include
-        an explicit 'rev' field; older legacy files omit it, so we tag them as the
-        historical revision used by those BINs (rev 4).
+        Infer the source BIN revision from metadata and path hints.
+        Some converters emit rev6-style JSON for compatibility, so we prefer
+        explicit source-revision metadata when present.
         """
+        source_revision = payload.get("source_revision")
+        if isinstance(source_revision, int):
+            return source_revision
+        if isinstance(source_revision, str):
+            try:
+                return int(source_revision.strip())
+            except (TypeError, ValueError):
+                pass
+
+        source_format = payload.get("source_format")
+        if isinstance(source_format, str):
+            hint = source_format_revision_hint(source_format)
+            if hint is not None:
+                return hint
+
         rev_value = payload.get("rev")
         if isinstance(rev_value, int):
             return rev_value
@@ -8110,9 +8451,63 @@ class MSMAnimationViewer(QMainWindow):
                 return int(rev_value.strip())
             except (TypeError, ValueError):
                 pass
+
+        normalized = os.path.normcase(os.path.normpath(json_path or "")).lower()
+        if normalized:
+            if (
+                "my singing monsters oldest.app" in normalized
+                or "my singing monsters102.app" in normalized
+                or "my singing monsters 1.0" in normalized
+            ):
+                return 1
+            if (
+                "my muppets show.app" in normalized
+                or "my singing muppets.app" in normalized
+                or "my muppet show" in normalized
+            ):
+                return 2
+            if "monster choir" in normalized or "monsterchoirandroid" in normalized:
+                return 3
+
         if legacy_active:
             return 4
         return None
+
+    @staticmethod
+    def _format_detected_revision_label(
+        payload: Dict[str, Any],
+        revision: int,
+        json_path: Optional[str],
+    ) -> str:
+        source_format = payload.get("source_format")
+        source_key = source_format.strip().lower() if isinstance(source_format, str) else ""
+
+        normalized = os.path.normcase(os.path.normpath(json_path or "")).lower()
+
+        # Rev3 parser is shared by both choir and non-choir builds.
+        if revision == 3 or source_key in ("choir", "rev3"):
+            if "monster choir" in normalized or "monsterchoirandroid" in normalized:
+                return "Rev 3 (Monster Choir)"
+            return "Rev 3"
+
+        if source_key:
+            formatted = source_format_revision_label(source_key)
+            if formatted:
+                return formatted
+
+        if revision == 1 and (
+            "my singing monsters oldest.app" in normalized
+            or "my singing monsters102.app" in normalized
+            or "my singing monsters 1.0" in normalized
+        ):
+            return "Rev 1"
+        if revision == 2 and (
+            "my muppets show.app" in normalized
+            or "my singing muppets.app" in normalized
+            or "my muppet show" in normalized
+        ):
+            return "Rev 2 (My Muppets Show)"
+        return f"Rev {revision}"
 
     @staticmethod
     def _normalize_blend_value(raw_value: int, version: int) -> int:
@@ -8268,11 +8663,37 @@ class MSMAnimationViewer(QMainWindow):
             return None
         return self._pose_baseline_player.get_layer_state(layer, time_value)
 
+    def _is_blue_mode_day(self) -> bool:
+        """Blue mode is intentionally available only on April 1st."""
+        today = datetime.now()
+        return bool(today.month == 4 and today.day == 1)
+
     def _load_audio_preferences_from_storage(self):
         """Populate audio preference flags from QSettings."""
         self.sync_audio_to_bpm = self.settings.value('audio/sync_to_bpm', True, type=bool)
         self.pitch_shift_enabled = self.settings.value('audio/pitch_shift_enabled', False, type=bool)
         self.chipmunk_mode = self.settings.value('audio/chipmunk_mode', False, type=bool)
+
+    def _resolve_audio_playback_config(self, *, include_blue_mode: bool = True) -> Tuple[float, str]:
+        """
+        Return active (speed, pitch_mode) for the viewer audio backend.
+
+        When blue mode is active, force a lower-pitched playback profile across
+        all clips regardless of BPM sync/pitch-shift toggles.
+        """
+        if include_blue_mode and self.blue_mode_enabled and self._is_blue_mode_day():
+            return max(0.25, min(2.0, float(self.blue_mode_pitch_factor))), "pitch_down_locked"
+
+        if self.sync_audio_to_bpm:
+            speed = self.current_bpm / max(1e-3, self.current_base_bpm)
+        else:
+            speed = 1.0
+
+        if not self.sync_audio_to_bpm or abs(speed - 1.0) < 1e-3 or not self.pitch_shift_enabled:
+            pitch_mode = "time_stretch"
+        else:
+            pitch_mode = "chipmunk" if self.chipmunk_mode else "pitch_shift"
+        return speed, pitch_mode
 
     def _load_constraints_from_settings(self) -> List[ConstraintSpec]:
         """Load constraints from QSettings (global, not per animation)."""
@@ -8568,15 +8989,7 @@ class MSMAnimationViewer(QMainWindow):
         """Sync audio playback speed with current BPM settings."""
         if not self.audio_manager.is_ready:
             return
-        if self.sync_audio_to_bpm:
-            speed = self.current_bpm / max(1e-3, self.current_base_bpm)
-        else:
-            speed = 1.0
-
-        if not self.sync_audio_to_bpm or abs(speed - 1.0) < 1e-3 or not self.pitch_shift_enabled:
-            pitch_mode = "time_stretch"
-        else:
-            pitch_mode = "chipmunk" if self.chipmunk_mode else "pitch_shift"
+        speed, pitch_mode = self._resolve_audio_playback_config(include_blue_mode=True)
 
         self._start_hang_watchdog("update_audio_speed", timeout=12.0)
         self.audio_manager.configure_playback(speed, pitch_mode)
@@ -8612,15 +9025,7 @@ class MSMAnimationViewer(QMainWindow):
 
     def _get_audio_export_config(self) -> Tuple[float, str]:
         """Return (speed, pitch_mode) to mirror audio playback settings for exports."""
-        if self.sync_audio_to_bpm:
-            speed = self.current_bpm / max(1e-3, self.current_base_bpm)
-        else:
-            speed = 1.0
-        if not self.sync_audio_to_bpm or abs(speed - 1.0) < 1e-3 or not self.pitch_shift_enabled:
-            pitch_mode = "time_stretch"
-        else:
-            pitch_mode = "chipmunk" if self.chipmunk_mode else "pitch_shift"
-        return speed, pitch_mode
+        return self._resolve_audio_playback_config(include_blue_mode=True)
 
     def _start_hang_watchdog(self, label: str, timeout: float = 12.0):
         """Arm faulthandler watchdog to print stack traces if we hang."""
@@ -8894,6 +9299,30 @@ class MSMAnimationViewer(QMainWindow):
                 use_cache=False
             )
             self._rebuild_source_atlas_lookup(sources, self.gl_widget.texture_atlases)
+            loaded_atlas_count = len(self.gl_widget.texture_atlases)
+            source_count = len(sources)
+            if source_count:
+                if loaded_atlas_count == 0:
+                    self.log_widget.log(
+                        (
+                            "No texture atlases were loaded for this animation. "
+                            "Set the game/downloads path or load JSON from an extracted data folder."
+                        ),
+                        "ERROR",
+                    )
+                elif loaded_atlas_count < source_count:
+                    self.log_widget.log(
+                        (
+                            f"Loaded {loaded_atlas_count}/{source_count} texture atlases. "
+                            "Missing atlases can make sprites invisible."
+                        ),
+                        "WARNING",
+                    )
+                else:
+                    self.log_widget.log(
+                        f"Loaded {loaded_atlas_count} texture atlas source(s)",
+                        "INFO",
+                    )
             
             # Parse animation data
             blend_version = self.current_blend_version or 1
@@ -8919,6 +9348,7 @@ class MSMAnimationViewer(QMainWindow):
             self._configure_costume_shaders(None, None)
 
             self.gl_widget.player.load_animation(animation)
+            self._log_renderability_snapshot(animation, stage="pre_gl")
             self._dump_mask_debug_layer_layout(animation)
             self.gl_widget.invalidate_animation_cache()
             self._record_layer_defaults(animation.layers)
@@ -8948,6 +9378,27 @@ class MSMAnimationViewer(QMainWindow):
             # Reinitialize GL to load textures
             self.gl_widget.makeCurrent()
             self.gl_widget.initializeGL()
+            gl_summary = str(getattr(self.gl_widget, "_gl_context_summary", "") or "").strip()
+            if gl_summary:
+                self.log_widget.log(gl_summary, "INFO")
+            failed_texture_uploads = list(getattr(self.gl_widget, "_last_texture_upload_failures", []) or [])
+            if failed_texture_uploads:
+                preview = ", ".join(failed_texture_uploads[:5])
+                if len(failed_texture_uploads) > 5:
+                    preview += ", ..."
+                self.log_widget.log(
+                    f"Failed to upload {len(failed_texture_uploads)} atlas texture(s): {preview}",
+                    "ERROR",
+                )
+            bound_texture_count = sum(
+                1 for atlas in self.gl_widget.texture_atlases if getattr(atlas, "texture_id", None)
+            )
+            if self.gl_widget.texture_atlases and bound_texture_count == 0:
+                self.log_widget.log(
+                    "OpenGL initialized but atlas textures were not bound; rendering will appear blank.",
+                    "ERROR",
+                )
+            self._log_renderability_snapshot(animation, stage="post_gl")
             self._restore_sprite_workshop_edits()
             self.gl_widget.doneCurrent()
 
@@ -8982,6 +9433,107 @@ class MSMAnimationViewer(QMainWindow):
             self._update_terrain_tile_index_range()
         finally:
             self._stop_hang_watchdog()
+
+    def _log_renderability_snapshot(self, animation: Optional[AnimationData], *, stage: str) -> None:
+        """Emit a lightweight summary of whether current animation data can render."""
+        if animation is None:
+            return
+        try:
+            player = getattr(self.gl_widget, "player", None)
+            renderer = getattr(self.gl_widget, "renderer", None)
+            atlases = list(getattr(self.gl_widget, "texture_atlases", []) or [])
+            if player is None or renderer is None:
+                return
+
+            duration = float(getattr(player, "duration", 0.0) or 0.0)
+            if not math.isfinite(duration) or duration < 0.0:
+                duration = 0.0
+
+            sample_times: List[float] = [0.0]
+            if duration > 1e-6:
+                sample_times.append(min(duration, max(0.0, duration * 0.5)))
+            # De-duplicate while preserving order
+            deduped_times: List[float] = []
+            for t in sample_times:
+                if all(abs(t - seen) > 1e-6 for seen in deduped_times):
+                    deduped_times.append(t)
+            sample_times = deduped_times
+
+            atlas_total = len(atlases)
+            atlas_textured = sum(1 for atlas in atlases if getattr(atlas, "texture_id", None))
+            atlas_missing_samples: List[str] = []
+            for atlas in atlases:
+                if getattr(atlas, "texture_id", None):
+                    continue
+                label = (
+                    getattr(atlas, "source_name", None)
+                    or os.path.basename(getattr(atlas, "image_path", "") or "")
+                    or "<atlas>"
+                )
+                atlas_missing_samples.append(str(label))
+                if len(atlas_missing_samples) >= 5:
+                    break
+
+            for sample_time in sample_times:
+                total_layers = len(animation.layers or [])
+                visible_layers = 0
+                sprite_layers = 0
+                matched_layers = 0
+                missing_samples: List[str] = []
+                for layer in animation.layers or []:
+                    if not getattr(layer, "visible", True):
+                        continue
+                    visible_layers += 1
+                    state = player.get_layer_state(layer, sample_time) or {}
+                    sprite_name = str(state.get("sprite_name") or "").strip()
+                    if not sprite_name:
+                        continue
+                    sprite_layers += 1
+                    sprite, atlas, _resolved_name = renderer._find_sprite_in_atlases(sprite_name, atlases)
+                    if sprite and atlas:
+                        matched_layers += 1
+                    else:
+                        if len(missing_samples) < 5:
+                            missing_samples.append(f"{layer.name or layer.layer_id}:{sprite_name}")
+
+                self.log_widget.log(
+                    (
+                        f"Render diagnostics ({stage}, t={sample_time:.3f}s): "
+                        f"layers={total_layers}, visible={visible_layers}, "
+                        f"sprite_states={sprite_layers}, atlas_matches={matched_layers}, "
+                        f"textured_atlases={atlas_textured}/{atlas_total}"
+                    ),
+                    "INFO",
+                )
+                if sprite_layers == 0:
+                    self.log_widget.log(
+                        f"Render diagnostics ({stage}): no visible layers had a sprite at t={sample_time:.3f}s.",
+                        "WARNING",
+                    )
+                elif matched_layers == 0:
+                    self.log_widget.log(
+                        (
+                            f"Render diagnostics ({stage}): sprite lookup failed for all visible sprite layers "
+                            f"at t={sample_time:.3f}s."
+                        ),
+                        "ERROR",
+                    )
+                if missing_samples:
+                    self.log_widget.log(
+                        f"Render diagnostics ({stage}) missing sprite samples: {', '.join(missing_samples)}",
+                        "WARNING",
+                    )
+
+            if atlas_total and atlas_textured < atlas_total and atlas_missing_samples:
+                self.log_widget.log(
+                    (
+                        f"Render diagnostics ({stage}): {atlas_total - atlas_textured} atlas texture(s) "
+                        f"not bound yet: {', '.join(atlas_missing_samples)}"
+                    ),
+                    "WARNING",
+                )
+        except Exception as exc:
+            self.log_widget.log(f"Render diagnostics ({stage}) failed: {exc}", "WARNING")
 
     def _mask_debug_enabled(self) -> bool:
         raw = os.environ.get("ANIVIEWER_MASK_DEBUG", "0").strip().lower()
@@ -9151,6 +9703,41 @@ class MSMAnimationViewer(QMainWindow):
         except Exception:
             return
 
+    def _report_audio_backend_status(self, *, force: bool = False):
+        """Report backend issues once so missing host audio libs are obvious."""
+        if not getattr(self, "audio_manager", None):
+            return
+        if self.audio_manager.backend_available:
+            return
+        if self._audio_backend_warning_shown and not force:
+            return
+        self._audio_backend_warning_shown = True
+
+        detail = self.audio_manager.backend_error
+        self.control_panel.update_audio_status("Audio: backend unavailable", False)
+        if detail:
+            self.log_widget.log(f"Audio playback backend unavailable: {detail}", "ERROR")
+        else:
+            self.log_widget.log("Audio playback backend unavailable.", "ERROR")
+        self.log_widget.log(f"Active interpreter: {sys.executable}", "INFO")
+        self.log_widget.log(
+            "Verify in this exact interpreter: `.venv/bin/python -c \"import sounddevice as sd; print(sd.get_portaudio_version())\"`",
+            "INFO",
+        )
+        self.log_widget.log(
+            "If that command fails, PortAudio is not visible to this runtime even if installed globally.",
+            "INFO",
+        )
+        if detail and "libgssapi_krb5.so.2" in detail:
+            self.log_widget.log(
+                "QtMultimedia fallback is missing Kerberos runtime libs (`libgssapi_krb5.so.2`). Install your distro's krb5 runtime package.",
+                "INFO",
+            )
+        self.log_widget.log(
+            "Linux fix: install PortAudio on the host system (for example `sudo apt install libportaudio2` or `sudo pacman -S portaudio`) and restart the viewer.",
+            "INFO",
+        )
+
     def load_audio_for_animation(self, animation_name: str):
         """Load and sync the audio clip that matches the selected animation."""
         if not animation_name:
@@ -9198,13 +9785,21 @@ class MSMAnimationViewer(QMainWindow):
                 self._update_animation_time_scale()
                 self._update_audio_speed()
                 audio_time = self._get_audio_sync_time(current_time)
-                if self.gl_widget.player.playing:
-                    self.audio_manager.play(audio_time)
-                else:
-                    self.audio_manager.seek(audio_time)
                 rel_path = self._audio_display_path(audio_path)
-                self.control_panel.update_audio_status(f"{animation_name} -> {rel_path}", True)
-                self.log_widget.log(f"Loaded audio clip: {rel_path}", "SUCCESS")
+                if self.audio_manager.backend_available:
+                    if self.gl_widget.player.playing:
+                        self.audio_manager.play(audio_time)
+                    else:
+                        self.audio_manager.seek(audio_time)
+                    self.control_panel.update_audio_status(f"{animation_name} -> {rel_path}", True)
+                    self.log_widget.log(
+                        f"Loaded audio clip: {rel_path} ({self.audio_manager.backend_summary})",
+                        "SUCCESS",
+                    )
+                else:
+                    self.control_panel.update_audio_status(f"Audio backend unavailable ({rel_path})", False)
+                    self.log_widget.log(f"Loaded audio clip (playback backend unavailable): {rel_path}", "WARNING")
+                    self._report_audio_backend_status()
             else:
                 self.audio_manager.clear()
                 self.current_audio_from_manifest = False
@@ -10076,14 +10671,15 @@ class MSMAnimationViewer(QMainWindow):
                 "INFO",
             )
             return cached
-        if UnityPy is None:
+        unitypy_mod = self._ensure_unitypy_available()
+        if unitypy_mod is None:
             self.log_widget.log(
                 "DOF audio: UnityPy not available; cannot scan bundle audio.",
                 "WARNING",
             )
             return None
         try:
-            env = UnityPy.load(bundle_path)
+            env = unitypy_mod.load(bundle_path)
         except Exception as exc:
             self.log_widget.log(f"DOF audio bundle load failed: {exc}", "WARNING")
             return None
@@ -10361,7 +10957,7 @@ class MSMAnimationViewer(QMainWindow):
         """Load and cache particle materials/textures for DOF bundles."""
         if not self.dof_path:
             return None
-        if UnityPy is None:
+        if self._ensure_unitypy_available() is None:
             self.log_widget.log(
                 "DOF particles: UnityPy not available; cannot load particle assets.",
                 "WARNING",
@@ -11002,7 +11598,7 @@ class MSMAnimationViewer(QMainWindow):
         if not dof_context:
             self.gl_widget.set_particle_entries([])
             return
-        if UnityPy is None:
+        if self._ensure_unitypy_available() is None:
             self.gl_widget.set_particle_entries([])
             return
         anim_name = animation.name or self.current_animation_name or ""
@@ -11110,13 +11706,14 @@ class MSMAnimationViewer(QMainWindow):
         self.gl_widget.set_particle_entries(cached, flip_y=particle_flip_y)
 
     def _scan_bundle_for_anim_name(self, anim_name: str) -> Optional[str]:
-        if not self.dof_path or UnityPy is None:
+        unitypy_mod = self._ensure_unitypy_available()
+        if not self.dof_path or unitypy_mod is None:
             return None
         target = anim_name.lower()
         data_files = self._find_unity_bundle_data_files(self.dof_path)
         for data_path in data_files:
             try:
-                env = UnityPy.load(data_path)
+                env = unitypy_mod.load(data_path)
             except Exception:
                 continue
             for obj in env.objects:
@@ -12035,6 +12632,7 @@ class MSMAnimationViewer(QMainWindow):
         sprite: SpriteInfo,
         patch: Image.Image,
         source_path: Optional[str] = None,
+        refresh_previews: bool = True,
     ) -> bool:
         """Paste a prepared patch into the atlas bitmap and upload it."""
         atlas_bitmap = self._ensure_mutable_atlas_bitmap(atlas)
@@ -12051,8 +12649,10 @@ class MSMAnimationViewer(QMainWindow):
             source_path=os.path.abspath(source_path) if source_path else None,
             applied_at=datetime.now().isoformat(timespec="seconds"),
         )
-        self._reset_layer_thumbnail_cache()
-        self.gl_widget.update()
+        if refresh_previews:
+            self._reset_layer_thumbnail_cache()
+            self._refresh_layer_thumbnails()
+            self.gl_widget.update()
         return True
 
     def replace_sprite_from_file(
@@ -12077,15 +12677,296 @@ class MSMAnimationViewer(QMainWindow):
         )
         return True, ""
 
+    @staticmethod
+    def is_sprite_replacement_size_mismatch(message: str) -> bool:
+        text = (message or "").lower()
+        return "expects" in text and "but got" in text and "pixels" in text
+
+    def _upload_full_atlas_bitmap(self, atlas: TextureAtlas, atlas_bitmap: Image.Image) -> bool:
+        """Upload a full atlas image to the GPU texture, resizing if needed."""
+        if atlas_bitmap is None:
+            return False
+        image = atlas_bitmap.convert("RGBA")
+        arr = np.array(image, dtype=np.float32) / 255.0
+        alpha = arr[..., 3:4]
+        arr[..., :3] *= alpha
+        arr = (arr * 255.0).astype(np.uint8)
+        self.gl_widget.makeCurrent()
+        try:
+            if not atlas.texture_id:
+                atlas.texture_id = glGenTextures(1)
+            glBindTexture(GL_TEXTURE_2D, atlas.texture_id)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 1)
+            glTexImage2D(
+                GL_TEXTURE_2D,
+                0,
+                GL_RGBA,
+                int(image.width),
+                int(image.height),
+                0,
+                GL_RGBA,
+                GL_UNSIGNED_BYTE,
+                arr.tobytes(),
+            )
+        except Exception:
+            return False
+        finally:
+            self.gl_widget.doneCurrent()
+        return True
+
+    def _prepare_flexible_patch_for_sprite(
+        self,
+        sprite: SpriteInfo,
+        edited_image: Image.Image,
+    ) -> Tuple[Optional[Image.Image], Tuple[int, int], Optional[str]]:
+        """
+        Prepare a replacement patch without enforcing original dimensions.
+
+        Returns:
+            (atlas_oriented_patch, display_size, error)
+        """
+        image = edited_image.convert("RGBA")
+        display_w, display_h = image.size
+        if display_w <= 0 or display_h <= 0:
+            return None, (0, 0), "Replacement image has invalid dimensions."
+        if sprite.rotated:
+            patch = image.rotate(-90, expand=True)
+        else:
+            patch = image
+        if patch.width <= 0 or patch.height <= 0:
+            return None, (display_w, display_h), "Replacement image produced an empty patch."
+        return patch, (display_w, display_h), None
+
+    def _rescale_sprite_uvs_for_atlas_resize(
+        self,
+        atlas: TextureAtlas,
+        old_width: int,
+        old_height: int,
+        new_width: int,
+        new_height: int,
+    ) -> None:
+        """Keep sprite UVs anchored to the same pixel locations after atlas resize."""
+        if old_width <= 0 or old_height <= 0 or new_width <= 0 or new_height <= 0:
+            return
+        if old_width == new_width and old_height == new_height:
+            return
+        scale_u = float(old_width) / float(new_width)
+        scale_v = float(old_height) / float(new_height)
+        for info in atlas.sprites.values():
+            if not getattr(info, "vertices_uv", None):
+                continue
+            remapped: List[Tuple[float, float]] = []
+            for pair in info.vertices_uv:
+                if not pair or len(pair) < 2:
+                    continue
+                remapped.append((float(pair[0]) * scale_u, float(pair[1]) * scale_v))
+            info.vertices_uv = remapped
+
+    def replace_sprite_from_file_with_expanded_layout(
+        self,
+        atlas: TextureAtlas,
+        sprite: SpriteInfo,
+        file_path: str,
+        *,
+        padding: int = 2,
+    ) -> Tuple[bool, str]:
+        """
+        Replace a sprite using its native image size by expanding/repacking atlas space.
+        """
+        try:
+            edited = Image.open(file_path).convert("RGBA")
+        except Exception as exc:
+            return False, f"Failed to load image: {exc}"
+
+        patch, display_size, error = self._prepare_flexible_patch_for_sprite(sprite, edited)
+        if error or patch is None:
+            return False, error or "Unable to prepare replacement patch."
+
+        atlas_bitmap = self._ensure_mutable_atlas_bitmap(atlas)
+        if atlas_bitmap is None:
+            return False, "Unable to load mutable atlas bitmap."
+
+        key = self._atlas_cache_key(atlas)
+        if not key:
+            return False, "Unable to identify atlas cache key."
+
+        old_geometry = {
+            "x": int(sprite.x),
+            "y": int(sprite.y),
+            "w": int(sprite.w),
+            "h": int(sprite.h),
+            "offset_x": float(sprite.offset_x),
+            "offset_y": float(sprite.offset_y),
+            "original_w": float(sprite.original_w),
+            "original_h": float(sprite.original_h),
+            "pivot_x": float(sprite.pivot_x),
+            "pivot_y": float(sprite.pivot_y),
+            "rotated": bool(sprite.rotated),
+            "atlas_image_width": int(getattr(atlas, "image_width", 0) or 0),
+            "atlas_image_height": int(getattr(atlas, "image_height", 0) or 0),
+            "atlas_logical_width": int(getattr(atlas, "logical_width", 0) or 0),
+            "atlas_logical_height": int(getattr(atlas, "logical_height", 0) or 0),
+        }
+
+        current_w = int(atlas_bitmap.width)
+        current_h = int(atlas_bitmap.height)
+        new_x = 0
+        new_y = current_h + max(0, int(padding))
+        new_w = max(current_w, int(patch.width))
+        new_h = new_y + int(patch.height)
+
+        expanded = Image.new("RGBA", (new_w, new_h), (0, 0, 0, 0))
+        expanded.paste(atlas_bitmap, (0, 0))
+        expanded.paste(patch, (new_x, new_y))
+
+        self._atlas_modified_images[key] = expanded
+        self._atlas_image_cache[key] = expanded
+
+        self._rescale_sprite_uvs_for_atlas_resize(
+            atlas,
+            old_width=current_w,
+            old_height=current_h,
+            new_width=new_w,
+            new_height=new_h,
+        )
+
+        atlas.image_width = int(new_w)
+        atlas.image_height = int(new_h)
+        atlas.logical_width = max(int(getattr(atlas, "logical_width", 0) or 0), atlas.image_width)
+        atlas.logical_height = max(int(getattr(atlas, "logical_height", 0) or 0), atlas.image_height)
+
+        sprite.x = int(new_x)
+        sprite.y = int(new_y)
+        sprite.w = int(patch.width)
+        sprite.h = int(patch.height)
+        sprite.original_w = float(max(1, int(display_size[0])))
+        sprite.original_h = float(max(1, int(display_size[1])))
+
+        if not self._upload_full_atlas_bitmap(atlas, expanded):
+            return False, "Unable to upload expanded atlas texture."
+
+        sprite_key = self._sprite_workshop_key(atlas, sprite.name)
+        self._atlas_dirty_flags[key] = True
+        self._sprite_replacements[sprite_key] = SpriteReplacementRecord(
+            atlas_key=key,
+            sprite_name=sprite.name,
+            source_path=os.path.abspath(file_path) if file_path else None,
+            applied_at=datetime.now().isoformat(timespec="seconds"),
+            original_geometry=old_geometry,
+        )
+        self._reset_layer_thumbnail_cache()
+        self._refresh_layer_thumbnails()
+        self.gl_widget.update()
+        self.log_widget.log(
+            f"Sprite '{sprite.name}' imported at native size {display_size[0]}x{display_size[1]} "
+            f"and atlas expanded to {new_w}x{new_h}.",
+            "SUCCESS",
+        )
+        return True, ""
+
+    @staticmethod
+    def _next_backup_path(file_path: str, suffix: str = ".bak") -> str:
+        """Return the next available backup file path for ``file_path``."""
+        candidate = f"{file_path}{suffix}"
+        if not os.path.exists(candidate):
+            return candidate
+        index = 1
+        while True:
+            numbered = f"{file_path}{suffix}.{index}"
+            if not os.path.exists(numbered):
+                return numbered
+            index += 1
+
+    def _backup_file(self, file_path: str) -> Tuple[bool, str]:
+        """Create a timestamp-safe backup copy of an existing file."""
+        if not file_path or not os.path.exists(file_path):
+            return False, "Source file does not exist."
+        backup_path = self._next_backup_path(file_path)
+        try:
+            shutil.copy2(file_path, backup_path)
+        except Exception as exc:
+            return False, str(exc)
+        return True, backup_path
+
+    def save_modified_atlas_in_place(
+        self,
+        atlas: TextureAtlas,
+        *,
+        bake_recolor: bool = False,
+        premultiply_alpha: bool = False,
+    ) -> Tuple[bool, str]:
+        """
+        Persist atlas changes to the current XML path and spritesheet image path.
+        Falls back to writing a sibling PNG when the original image format is not PNG.
+        """
+        xml_path = getattr(atlas, "xml_path", None)
+        image_path = getattr(atlas, "image_path", None)
+        if not xml_path or not os.path.exists(xml_path):
+            return False, "Existing atlas XML path is unavailable."
+        if not image_path:
+            return False, "Existing atlas image path is unavailable."
+
+        backup_ok, backup_result = self._backup_file(xml_path)
+        if not backup_ok:
+            return False, f"Failed to back up existing XML: {backup_result}"
+        xml_backup_path = backup_result
+        self.log_widget.log(
+            f"Backed up atlas XML to {os.path.basename(xml_backup_path)} before applying changes.",
+            "INFO",
+        )
+
+        image_ext = os.path.splitext(image_path)[1].lower()
+        output_png = image_path
+        if image_ext != ".png":
+            output_png = os.path.join(
+                os.path.dirname(image_path),
+                f"{Path(image_path).stem}_custom.png",
+            )
+            self.log_widget.log(
+                f"Atlas image format '{image_ext or '<none>'}' is not directly writable as PNG; "
+                f"writing to {os.path.basename(output_png)} instead.",
+                "WARNING",
+            )
+
+        ok, message = self.export_modified_spritesheet(
+            atlas,
+            output_png,
+            bake_recolor=bake_recolor,
+            premultiply_alpha=premultiply_alpha,
+            rewrite_manifest=True,
+            xml_output_path=xml_path,
+        )
+        if not ok:
+            return False, f"{message} (XML backup kept at {xml_backup_path})"
+        return True, f"{xml_path} (backup: {xml_backup_path})"
+
     def remove_sprite_replacement(self, atlas: TextureAtlas, sprite: SpriteInfo) -> bool:
         """Restore a sprite region to its original pixels."""
         key = self._sprite_workshop_key(atlas, sprite.name)
-        if key not in self._sprite_replacements:
+        record = self._sprite_replacements.get(key)
+        if record is None:
             return False
         original = self._original_atlas_bitmap(atlas)
         target = self._ensure_mutable_atlas_bitmap(atlas)
         if original is None or target is None:
             return False
+        geometry = record.original_geometry or {}
+        if geometry:
+            sprite.x = int(geometry.get("x", sprite.x))
+            sprite.y = int(geometry.get("y", sprite.y))
+            sprite.w = int(geometry.get("w", sprite.w))
+            sprite.h = int(geometry.get("h", sprite.h))
+            sprite.offset_x = float(geometry.get("offset_x", sprite.offset_x))
+            sprite.offset_y = float(geometry.get("offset_y", sprite.offset_y))
+            sprite.original_w = float(geometry.get("original_w", sprite.original_w))
+            sprite.original_h = float(geometry.get("original_h", sprite.original_h))
+            sprite.pivot_x = float(geometry.get("pivot_x", sprite.pivot_x))
+            sprite.pivot_y = float(geometry.get("pivot_y", sprite.pivot_y))
+            sprite.rotated = bool(geometry.get("rotated", sprite.rotated))
         region = (
             int(sprite.x),
             int(sprite.y),
@@ -12101,6 +12982,7 @@ class MSMAnimationViewer(QMainWindow):
         if not still_dirty:
             self._atlas_dirty_flags.pop(atlas_key, None)
         self._reset_layer_thumbnail_cache()
+        self._refresh_layer_thumbnails()
         self.gl_widget.update()
         self.log_widget.log(
             f"Sprite '{sprite.name}' restored to atlas defaults.",
@@ -12269,12 +13151,75 @@ class MSMAnimationViewer(QMainWindow):
                 ET.SubElement(elem, "triangles").text = " ".join(str(idx) for idx in sprite.triangles)
         return ET.ElementTree(root)
 
+    @staticmethod
+    def _indent_xml_tree(tree: ET.ElementTree, space: str = "    ") -> None:
+        """Pretty-print XML output with deterministic indentation."""
+        try:
+            ET.indent(tree, space=space)  # type: ignore[attr-defined]
+            return
+        except Exception:
+            pass
+        root = tree.getroot()
+        if root is None:
+            return
+
+        def _indent(elem: ET.Element, level: int = 0) -> None:
+            i = "\n" + level * space
+            if len(elem):
+                if not elem.text or not elem.text.strip():
+                    elem.text = i + space
+                for child in elem:
+                    _indent(child, level + 1)
+                if not elem[-1].tail or not elem[-1].tail.strip():
+                    elem[-1].tail = i
+            if level and (not elem.tail or not elem.tail.strip()):
+                elem.tail = i
+
+        _indent(root)
+
+    @staticmethod
+    def _format_xml_image_path(output_png: str, xml_output: str) -> str:
+        """
+        Format imagePath for atlas XMLs without dot-segments (./ or ../).
+
+        Preference:
+        1) If path contains a `data/` segment, write path from there (e.g. gfx/monsters/x.png).
+        2) Otherwise use a cleaned relative path from XML dir with dot-segments removed.
+        """
+        png_norm = os.path.normpath(output_png)
+        png_parts = Path(png_norm).parts
+        lower_parts = [part.lower() for part in png_parts]
+        if "data" in lower_parts:
+            idx = lower_parts.index("data")
+            suffix = png_parts[idx + 1 :]
+            if suffix:
+                return "/".join(suffix).replace("\\", "/")
+
+        try:
+            rel_image_path = os.path.relpath(
+                output_png,
+                os.path.dirname(xml_output) or ".",
+            )
+        except ValueError:
+            rel_image_path = os.path.basename(output_png)
+        rel_image_path = rel_image_path.replace("\\", "/")
+        cleaned_parts = [
+            segment
+            for segment in rel_image_path.split("/")
+            if segment and segment not in (".", "..")
+        ]
+        if cleaned_parts:
+            return "/".join(cleaned_parts)
+        return os.path.basename(output_png).replace("\\", "/")
+
     def export_modified_spritesheet(
         self,
         atlas: TextureAtlas,
         output_png: str,
         bake_recolor: bool = False,
         premultiply_alpha: bool = False,
+        rewrite_manifest: bool = False,
+        xml_output_path: Optional[str] = None,
     ) -> Tuple[bool, str]:
         """Write the current atlas bitmap plus an updated XML manifest."""
         os.makedirs(os.path.dirname(output_png) or ".", exist_ok=True)
@@ -12303,14 +13248,18 @@ class MSMAnimationViewer(QMainWindow):
                 sheet_image = atlas_image.copy()
             sheet_image = self._premultiply_image(sheet_image)
         sheet_image.save(output_png, "PNG")
-        xml_output = os.path.splitext(output_png)[0] + ".xml"
+        xml_output = xml_output_path or (os.path.splitext(output_png)[0] + ".xml")
+        os.makedirs(os.path.dirname(xml_output) or ".", exist_ok=True)
         existing_xml = getattr(atlas, "xml_path", None)
+        if os.path.exists(xml_output):
+            existing_xml = xml_output
+        rel_image_path = self._format_xml_image_path(output_png, xml_output)
         xml_tree: Optional[ET.ElementTree] = None
-        if existing_xml and os.path.exists(existing_xml):
+        if not rewrite_manifest and existing_xml and os.path.exists(existing_xml):
             try:
                 xml_tree = ET.parse(existing_xml)
                 xml_root = xml_tree.getroot()
-                xml_root.set("imagePath", os.path.basename(output_png))
+                xml_root.set("imagePath", rel_image_path.replace("\\", "/"))
                 xml_root.set("width", str(atlas.image_width))
                 xml_root.set("height", str(atlas.image_height))
                 if atlas.is_hires:
@@ -12318,7 +13267,11 @@ class MSMAnimationViewer(QMainWindow):
             except Exception:
                 xml_tree = None
         if xml_tree is None:
-            xml_tree = self._build_atlas_xml_tree(atlas, os.path.basename(output_png))
+            xml_tree = self._build_atlas_xml_tree(
+                atlas,
+                rel_image_path.replace("\\", "/"),
+            )
+        self._indent_xml_tree(xml_tree)
         xml_tree.write(xml_output, encoding="utf-8", xml_declaration=True)
         self.log_widget.log(
             f"Exported spritesheet '{self._atlas_display_name(atlas)}' to {output_png} and {xml_output}.",
@@ -12378,13 +13331,23 @@ class MSMAnimationViewer(QMainWindow):
             if patch.size != expected_size:
                 skipped.append(sprite_name)
                 continue
-            if not self._apply_sprite_patch(atlas, target_sprite, patch, source_path=image_path):
+            if not self._apply_sprite_patch(
+                atlas,
+                target_sprite,
+                patch,
+                source_path=image_path,
+                refresh_previews=False,
+            ):
                 skipped.append(sprite_name)
                 continue
             imported += 1
 
         if imported == 0:
             return False, "No matching sprites from the spritesheet could be imported."
+
+        self._reset_layer_thumbnail_cache()
+        self._refresh_layer_thumbnails()
+        self.gl_widget.update()
 
         if skipped:
             self.log_widget.log(
@@ -12440,6 +13403,632 @@ class MSMAnimationViewer(QMainWindow):
         self._sprite_workshop_dialog.show()
         self._sprite_workshop_dialog.raise_()
         self._sprite_workshop_dialog.activateWindow()
+
+    def _get_migration_settings_bridge(self) -> SettingsDialog:
+        """Lazily create a hidden Settings dialog used for converter helpers."""
+        bridge = self._migration_settings_bridge
+        if bridge is not None:
+            return bridge
+        bridge = SettingsDialog(
+            self.export_settings,
+            self.settings,
+            self.shader_registry,
+            self.game_path,
+            self,
+        )
+        bridge.hide()
+        self._migration_settings_bridge = bridge
+        return bridge
+
+    @staticmethod
+    def _find_downloads_xml_bin_roots_for_path(downloads_path: str) -> List[str]:
+        """Locate xml_bin folders below an arbitrary downloads root."""
+        roots: List[str] = []
+        if not downloads_path or not os.path.isdir(downloads_path):
+            return roots
+
+        seen: Set[str] = set()
+
+        def add_root(path: str) -> None:
+            if not path or not os.path.isdir(path):
+                return
+            norm = os.path.normcase(os.path.normpath(path))
+            if norm in seen:
+                return
+            seen.add(norm)
+            roots.append(path)
+
+        direct_candidates = [
+            downloads_path,
+            os.path.join(downloads_path, "xml_bin"),
+            os.path.join(downloads_path, "data", "xml_bin"),
+        ]
+        for candidate in direct_candidates:
+            if os.path.basename(candidate).lower() == "xml_bin":
+                add_root(candidate)
+
+        max_depth = 6
+        for root, dirs, _ in os.walk(downloads_path):
+            rel = os.path.relpath(root, downloads_path)
+            depth = 0 if rel == "." else len(rel.split(os.sep))
+            if depth > max_depth:
+                dirs[:] = []
+                continue
+            if os.path.basename(root).lower() == "xml_bin":
+                add_root(root)
+                dirs[:] = []
+
+        roots.sort(key=lambda value: value.lower())
+        return roots
+
+    def _profile_xml_bin_roots(self, profile: Dict[str, Any]) -> List[str]:
+        """Return deduplicated xml_bin roots for a specific path profile."""
+        roots: List[str] = []
+        seen: Set[str] = set()
+
+        def add_root(path: Optional[str]) -> None:
+            if not path or not os.path.isdir(path):
+                return
+            norm = os.path.normcase(os.path.normpath(path))
+            if norm in seen:
+                return
+            seen.add(norm)
+            roots.append(path)
+
+        downloads_path = self._sanitize_path_setting_value(profile.get("downloads_path"))
+        game_path = self._sanitize_path_setting_value(profile.get("game_path"))
+
+        for root in self._find_downloads_xml_bin_roots_for_path(downloads_path):
+            add_root(root)
+
+        if game_path:
+            add_root(os.path.join(game_path, "data", "xml_bin"))
+
+        return roots
+
+    def _available_monster_migration_target_revisions(self) -> List[int]:
+        """Return target revisions that currently have an export writer script."""
+        availability: Dict[int, List[Optional[str]]] = {
+            6: [self.bin2json_path],
+            5: [self.rev5_bin2json_path],
+            4: [self.rev4_bin2json_path],
+            3: [self.choir_bin2json_path],
+            2: [self.rev2_bin2json_path, self.muppets_bin2json_path],
+            1: [self.legacy_bin2json_path, self.oldest_bin2json_path],
+        }
+        revisions: List[int] = []
+        for revision, candidates in availability.items():
+            if any(path and os.path.exists(path) for path in candidates):
+                revisions.append(int(revision))
+        if not revisions:
+            revisions = [6]
+        return sorted(set(revisions), reverse=True)
+
+    @staticmethod
+    def _normalize_migration_token(raw_token: str) -> str:
+        token = (raw_token or "").strip().lower()
+        if token.startswith("monster_"):
+            token = token[len("monster_"):]
+        token = re.sub("[^a-z0-9_]+", "_", token)
+        token = token.strip("_")
+        return token
+
+    @staticmethod
+    def _to_posix(path_text: str) -> str:
+        return Path(path_text).as_posix()
+
+    def _build_monster_migration_source_pool(
+        self,
+    ) -> Tuple[List[MigrationSourceOption], List[Dict[str, str]], int]:
+        """Aggregate monster BIN/JSON records from every configured path profile."""
+        profiles, active_index = self._load_path_profiles_store()
+        options: List[MigrationSourceOption] = []
+
+        for profile_index, profile in enumerate(profiles):
+            profile_name = self._sanitize_path_setting_value(profile.get("name")) or f"Profile {profile_index + 1}"
+            roots = self._profile_xml_bin_roots(profile)
+            if not roots:
+                continue
+
+            records: Dict[str, MonsterFileRecord] = {}
+            for base_root in roots:
+                for root, _, files in os.walk(base_root):
+                    for file_name in files:
+                        lower = file_name.lower()
+                        if not (lower.endswith(".bin") or lower.endswith(".json")):
+                            continue
+                        stem = Path(file_name).stem.lower()
+                        if not stem.startswith("monster_"):
+                            continue
+                        if self._is_excluded_monster_stem(stem):
+                            continue
+
+                        full_path = os.path.normpath(os.path.join(root, file_name))
+                        relative_path = self._to_posix(os.path.relpath(full_path, base_root))
+
+                        record = records.get(stem)
+                        if not record:
+                            record = MonsterFileRecord(stem=stem, relative_path=relative_path)
+                            records[stem] = record
+
+                        if lower.endswith(".json") and not record.json_path:
+                            record.json_path = full_path
+                            record.relative_path = relative_path
+                        elif lower.endswith(".bin") and not record.bin_path:
+                            record.bin_path = full_path
+                            if not record.relative_path:
+                                record.relative_path = relative_path
+
+            for stem, record in records.items():
+                if not record.has_source():
+                    continue
+
+                raw_token = stem[len("monster_"):] if stem.startswith("monster_") else stem
+                token = self._normalize_migration_token(raw_token)
+                if not token:
+                    continue
+
+                source_path = record.bin_path or record.json_path
+                display_name = self._monster_browser_display_name(
+                    source_path=source_path,
+                    token=token,
+                    fallback=stem,
+                )
+                if not display_name:
+                    display_name = stem
+
+                revision_hint: Optional[int] = None
+                if record.bin_path and os.path.exists(record.bin_path):
+                    hints = collect_bin_detection_hints(record.bin_path)
+                    revision_hint = hints.revision_hint
+                elif record.json_path:
+                    normalized = os.path.normcase(os.path.normpath(record.json_path))
+                    revision_hint = infer_revision_hint(normalized, os.path.basename(record.json_path))
+
+                source_kind = "BIN+JSON" if (record.bin_path and record.json_path) else ("BIN" if record.bin_path else "JSON")
+                label = f"{display_name} [{token}] - {profile_name} ({source_kind})"
+
+                options.append(
+                    MigrationSourceOption(
+                        label=label,
+                        token=token,
+                        stem=stem,
+                        profile_index=profile_index,
+                        profile_name=profile_name,
+                        json_path=record.json_path,
+                        bin_path=record.bin_path,
+                        revision_hint=revision_hint,
+                    )
+                )
+
+        options.sort(key=lambda item: item.label.lower())
+        return options, profiles, active_index
+
+    def _find_profile_monster_record(self, profile: Dict[str, Any], stem: str) -> Optional[MonsterFileRecord]:
+        """Locate an existing monster BIN/JSON in the selected target profile."""
+        normalized_stem = (stem or "").strip().lower()
+        if not normalized_stem:
+            return None
+
+        record = MonsterFileRecord(stem=normalized_stem, relative_path=f"{normalized_stem}.bin")
+        roots = self._profile_xml_bin_roots(profile)
+
+        for base_root in roots:
+            for root, _, files in os.walk(base_root):
+                for file_name in files:
+                    suffix = file_name.lower()
+                    if not (suffix.endswith(".bin") or suffix.endswith(".json")):
+                        continue
+                    if Path(file_name).stem.lower() != normalized_stem:
+                        continue
+                    full_path = os.path.normpath(os.path.join(root, file_name))
+                    relative_path = self._to_posix(os.path.relpath(full_path, base_root))
+                    record.relative_path = relative_path
+                    if suffix.endswith(".json") and not record.json_path:
+                        record.json_path = full_path
+                    elif suffix.endswith(".bin") and not record.bin_path:
+                        record.bin_path = full_path
+                if record.bin_path and record.json_path:
+                    break
+            if record.bin_path and record.json_path:
+                break
+
+        return record if record.has_source() else None
+
+    def _choose_profile_migration_output_root(self, profile: Dict[str, Any]) -> Optional[str]:
+        """Choose where migrated BIN files should be written for a target profile."""
+        game_path = self._sanitize_path_setting_value(profile.get("game_path"))
+        downloads_path = self._sanitize_path_setting_value(profile.get("downloads_path"))
+
+        if game_path:
+            root = os.path.join(game_path, "data", "xml_bin")
+            try:
+                os.makedirs(root, exist_ok=True)
+                return root
+            except Exception:
+                pass
+
+        for existing in self._find_downloads_xml_bin_roots_for_path(downloads_path):
+            if os.path.isdir(existing):
+                return existing
+
+        if downloads_path:
+            for fallback in (
+                os.path.join(downloads_path, "data", "xml_bin"),
+                os.path.join(downloads_path, "xml_bin"),
+            ):
+                try:
+                    os.makedirs(fallback, exist_ok=True)
+                    return fallback
+                except Exception:
+                    continue
+
+        return None
+
+    def _read_migration_payload(self, source_path: str) -> Optional[Dict[str, Any]]:
+        """Read a source BIN/JSON payload through the existing converter stack."""
+        bridge = self._get_migration_settings_bridge()
+        try:
+            payload = bridge._read_animation_payload(source_path)
+        except Exception as exc:
+            self.log_widget.log(f"Failed to load migration source '{source_path}': {exc}", "ERROR")
+            return None
+        if not isinstance(payload, dict):
+            self.log_widget.log("Migration source payload is not a JSON object.", "ERROR")
+            return None
+        anims = payload.get("anims")
+        if not isinstance(anims, list) or not anims:
+            self.log_widget.log("Migration source payload has no animations.", "ERROR")
+            return None
+        return payload
+
+    @staticmethod
+    def _merge_migration_sources(base_sources: Any, incoming_sources: Any) -> List[Dict[str, Any]]:
+        merged: List[Dict[str, Any]] = []
+        seen: Set[Tuple[str, str]] = set()
+
+        def add_source(source: Any) -> None:
+            if not isinstance(source, dict):
+                return
+            src = str(source.get("src", "") or "").strip().replace(chr(92), "/")
+            source_id = str(source.get("id", ""))
+            key = (src.lower(), source_id)
+            if not src or key in seen:
+                return
+            seen.add(key)
+            source_copy = copy.deepcopy(source)
+            source_copy["src"] = src
+            merged.append(source_copy)
+
+        if isinstance(base_sources, list):
+            for source in base_sources:
+                add_source(source)
+        if isinstance(incoming_sources, list):
+            for source in incoming_sources:
+                add_source(source)
+
+        return merged
+
+    def _merge_migration_payloads(
+        self,
+        target_payload: Dict[str, Any],
+        incoming_payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Merge incoming animations into an existing target payload by name."""
+        merged = copy.deepcopy(target_payload if isinstance(target_payload, dict) else {})
+        target_anims = merged.get("anims")
+        incoming_anims = incoming_payload.get("anims")
+        if not isinstance(target_anims, list):
+            target_anims = []
+        if not isinstance(incoming_anims, list):
+            incoming_anims = []
+
+        incoming_by_name: Dict[str, Dict[str, Any]] = {}
+        incoming_without_name: List[Dict[str, Any]] = []
+        for anim in incoming_anims:
+            if not isinstance(anim, dict):
+                continue
+            key = str(anim.get("name", "") or "").strip().lower()
+            if key:
+                incoming_by_name[key] = copy.deepcopy(anim)
+            else:
+                incoming_without_name.append(copy.deepcopy(anim))
+
+        result_anims: List[Dict[str, Any]] = []
+        replaced_names: Set[str] = set()
+        for anim in target_anims:
+            if not isinstance(anim, dict):
+                continue
+            key = str(anim.get("name", "") or "").strip().lower()
+            if key and key in incoming_by_name:
+                result_anims.append(copy.deepcopy(incoming_by_name[key]))
+                replaced_names.add(key)
+            else:
+                result_anims.append(copy.deepcopy(anim))
+
+        for key, anim in incoming_by_name.items():
+            if key in replaced_names:
+                continue
+            result_anims.append(copy.deepcopy(anim))
+        result_anims.extend(incoming_without_name)
+
+        merged["anims"] = result_anims
+        merged["sources"] = self._merge_migration_sources(
+            merged.get("sources"),
+            incoming_payload.get("sources"),
+        )
+
+        incoming_blend = incoming_payload.get("blend_version")
+        if incoming_blend is not None:
+            merged["blend_version"] = incoming_blend
+
+        incoming_rev = incoming_payload.get("rev")
+        if incoming_rev is not None:
+            merged["rev"] = incoming_rev
+
+        for key in ("source_format", "source_revision"):
+            if key in incoming_payload:
+                merged[key] = incoming_payload[key]
+
+        return merged
+
+    @staticmethod
+    def _rewrite_animation_island_prefixes(payload: Dict[str, Any], target_island: int) -> int:
+        """Rewrite leading NN- prefixes in animation names to a target island id."""
+        anims = payload.get("anims") if isinstance(payload, dict) else None
+        if not isinstance(anims, list):
+            return 0
+
+        rewritten = 0
+        for anim in anims:
+            if not isinstance(anim, dict):
+                continue
+            name = str(anim.get("name", "") or "")
+            match = re.match(r"^([0-9]{1,3})([-_].*)$", name)
+            if not match:
+                continue
+            old_prefix = match.group(1)
+            suffix = match.group(2)
+            new_prefix = f"{int(target_island):0{len(old_prefix)}d}"
+            new_name = f"{new_prefix}{suffix}"
+            if new_name != name:
+                anim["name"] = new_name
+                rewritten += 1
+
+        return rewritten
+
+    @staticmethod
+    def _normalize_migration_source_entries(payload: Dict[str, Any]) -> None:
+        """Normalize source atlas references to portable relative paths."""
+        sources = payload.get("sources")
+        if not isinstance(sources, list):
+            payload["sources"] = []
+            return
+
+        for source in sources:
+            if not isinstance(source, dict):
+                continue
+            src = str(source.get("src", "") or "").strip()
+            if not src:
+                continue
+            src = src.replace(chr(92), "/")
+            if os.path.isabs(src):
+                src = os.path.basename(src)
+            if src.lower().startswith("data/"):
+                src = src[5:]
+            source["src"] = src.lstrip("/")
+
+    @staticmethod
+    def _infer_source_converter_hint(
+        payload: Dict[str, Any],
+        source: MigrationSourceOption,
+    ) -> Optional[str]:
+        source_format = payload.get("source_format")
+        if isinstance(source_format, str):
+            key = source_format.strip().lower()
+            if key:
+                return key
+
+        if source.revision_hint == 1:
+            return "rev1_classic"
+        if source.revision_hint == 2:
+            text = " ".join(
+                [
+                    source.stem,
+                    source.bin_path or "",
+                    source.json_path or "",
+                ]
+            ).lower()
+            if "muppet" in text:
+                return "muppets"
+            return "rev2"
+        if source.revision_hint == 3:
+            return "rev3"
+        if source.revision_hint == 4:
+            return "rev4"
+        if source.revision_hint == 5:
+            return "rev5"
+        if source.revision_hint == 6:
+            return "rev6"
+        return None
+
+    def _run_monster_migration(
+        self,
+        request: MonsterMigrationRequest,
+        profiles: List[Dict[str, Any]],
+    ) -> bool:
+        """Execute a full source->target migration request from the dialog."""
+        if request.target_profile_index < 0 or request.target_profile_index >= len(profiles):
+            QMessageBox.warning(self, "Invalid Target", "Target profile selection is invalid.")
+            return False
+
+        source_path = request.source.preferred_source_path
+        if not source_path or not os.path.exists(source_path):
+            QMessageBox.warning(self, "Missing Source", "Selected source monster file no longer exists.")
+            return False
+
+        target_token = self._normalize_migration_token(request.target_token)
+        if not target_token:
+            QMessageBox.warning(self, "Invalid Target", "Target monster token is invalid.")
+            return False
+
+        source_profile = profiles[request.source.profile_index] if 0 <= request.source.profile_index < len(profiles) else {}
+        target_profile = profiles[request.target_profile_index]
+
+        payload = self._read_migration_payload(source_path)
+        if payload is None:
+            QMessageBox.warning(self, "Migration Failed", "Could not parse source monster payload.")
+            return False
+
+        if request.remap_island_prefix:
+            rewritten = self._rewrite_animation_island_prefixes(payload, request.target_island)
+            if rewritten:
+                self.log_widget.log(
+                    f"Rewrote island prefixes on {rewritten} animation(s).",
+                    "INFO",
+                )
+
+        target_stem = f"monster_{target_token}"
+
+        if request.merge_with_existing:
+            existing_record = self._find_profile_monster_record(target_profile, target_stem)
+            if existing_record and existing_record.has_source():
+                existing_path = existing_record.bin_path or existing_record.json_path
+                existing_payload = self._read_migration_payload(existing_path) if existing_path else None
+                if existing_payload is not None:
+                    payload = self._merge_migration_payloads(existing_payload, payload)
+                    self.log_widget.log(
+                        "Merged incoming animations with existing target monster.",
+                        "INFO",
+                    )
+                else:
+                    self.log_widget.log(
+                        "Existing target payload could not be loaded; falling back to replace mode.",
+                        "WARNING",
+                    )
+            else:
+                self.log_widget.log(
+                    "Merge mode requested but target monster was not found; creating new target.",
+                    "INFO",
+                )
+
+        self._normalize_migration_source_entries(payload)
+
+        target_root = self._choose_profile_migration_output_root(target_profile)
+        if not target_root:
+            QMessageBox.warning(
+                self,
+                "Missing Target Path",
+                "Target profile has no writable game/downloads path for xml_bin output.",
+            )
+            return False
+
+        target_bin_path = os.path.join(target_root, f"{target_stem}.bin")
+        os.makedirs(os.path.dirname(target_bin_path), exist_ok=True)
+
+        bridge = self._get_migration_settings_bridge()
+        source_hint = self._infer_source_converter_hint(payload, request.source)
+
+        source_dir = os.path.dirname(source_path)
+        if not os.path.isdir(source_dir):
+            source_dir = tempfile.gettempdir()
+
+        with tempfile.TemporaryDirectory(prefix="monster_migration_", dir=source_dir) as temp_dir:
+            temp_json_path = os.path.join(temp_dir, f"{target_stem}.json")
+            try:
+                with open(temp_json_path, "w", encoding="utf-8") as handle:
+                    json.dump(payload, handle, indent=2)
+            except Exception as exc:
+                QMessageBox.warning(self, "Migration Failed", f"Could not prepare migration JSON:\n{exc}")
+                return False
+
+            upgrade_blend = request.target_revision == 6
+            self.log_widget.log(
+                f"Migrating {request.source.stem} -> {target_stem} (rev {request.target_revision})...",
+                "INFO",
+            )
+
+            converted = bridge._convert_json_to_bin(
+                temp_json_path,
+                target_bin_path,
+                int(request.target_revision),
+                bool(upgrade_blend),
+                source_converter_hint=source_hint,
+            )
+            if not converted:
+                self.log_widget.log("Monster migration failed during BIN export.", "ERROR")
+                QMessageBox.warning(
+                    self,
+                    "Migration Failed",
+                    "BIN export failed. Check converter availability and migration log details.",
+                )
+                return False
+
+            if request.write_json_output:
+                output_json_path = os.path.splitext(target_bin_path)[0] + ".json"
+                try:
+                    with open(output_json_path, "w", encoding="utf-8") as handle:
+                        json.dump(payload, handle, indent=2)
+                    self.log_widget.log(
+                        f"Wrote migration JSON: {output_json_path}",
+                        "INFO",
+                    )
+                except Exception as exc:
+                    self.log_widget.log(f"Failed to write migration JSON: {exc}", "WARNING")
+
+            if request.copy_assets:
+                try:
+                    bridge._copy_xml_resources_from_json(temp_json_path, target_bin_path)
+                    self.log_widget.log("Copied XML/image resources for migration.", "SUCCESS")
+                except Exception as exc:
+                    self.log_widget.log(f"Migration asset copy failed: {exc}", "WARNING")
+
+        self.log_widget.log(f"Monster migration complete: {target_bin_path}", "SUCCESS")
+
+        _, active_profile_index = self._load_path_profiles_store()
+        if int(active_profile_index) == int(request.target_profile_index):
+            self.refresh_file_list()
+
+        return True
+
+    def show_monster_migration(self) -> None:
+        """Open the beginner-friendly Monster Migration tool."""
+        sources, profiles, active_profile_index = self._build_monster_migration_source_pool()
+        if not profiles:
+            QMessageBox.warning(
+                self,
+                "No Profiles",
+                "No path profiles are configured. Add one in Settings -> Paths first.",
+            )
+            return
+        if not sources:
+            QMessageBox.warning(
+                self,
+                "No Monsters Found",
+                "No monster BIN/JSON files were found in configured profile paths.",
+            )
+            return
+
+        available_revisions = self._available_monster_migration_target_revisions()
+        dialog = MonsterMigrationDialog(
+            sources=sources,
+            profiles=profiles,
+            available_revisions=available_revisions,
+            active_profile_index=active_profile_index,
+            parent=self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        request = dialog.build_request()
+        if request is None:
+            return
+
+        if request.open_legacy_tools:
+            self.show_settings()
+            return
+
+        self._run_monster_migration(request, profiles)
 
     def show_midi_editor(self):
         """Display the MSM MIDI editor dialog."""
@@ -13096,11 +14685,26 @@ class MSMAnimationViewer(QMainWindow):
     def update_timeline(self):
         """Update timeline slider range"""
         if self.gl_widget.player.animation:
-            duration = self.gl_widget.player.duration
+            duration = float(self.gl_widget.player.duration or 0.0)
+            if not math.isfinite(duration) or duration < 0.0:
+                duration = 0.0
+            max_timeline_seconds = 2147483647 / 1000.0
+            if duration > max_timeline_seconds:
+                self.log_widget.log(
+                    (
+                        f"Animation duration ({duration:.3f}s) exceeded timeline limits; "
+                        f"clamping to {max_timeline_seconds:.3f}s for UI stability."
+                    ),
+                    "WARNING",
+                )
+                duration = max_timeline_seconds
             slider_max = max(1, int(duration * 1000))
             self.timeline.set_slider_maximum(slider_max)
             self.timeline.set_time_label(f"{self.gl_widget.player.current_time:.2f} / {duration:.2f}s")
-            self.timeline.set_current_time(self.gl_widget.player.current_time)
+            current_time = float(self.gl_widget.player.current_time or 0.0)
+            if not math.isfinite(current_time):
+                current_time = 0.0
+            self.timeline.set_current_time(min(max(0.0, current_time), duration))
             self._refresh_timeline_keyframes()
             self._update_timeline_beat_display()
             self._refresh_timeline_beats()
@@ -13121,7 +14725,22 @@ class MSMAnimationViewer(QMainWindow):
         if not animation:
             self.timeline.set_lane_groups([])
             return
-        duration = max(0.0, self.gl_widget.player.duration)
+        duration = float(max(0.0, self.gl_widget.player.duration))
+        if not math.isfinite(duration):
+            duration = 0.0
+
+        def _sanitize_marker_time(raw_time: Any) -> Optional[float]:
+            try:
+                value = float(raw_time)
+            except (TypeError, ValueError):
+                return None
+            if not math.isfinite(value):
+                return None
+            value = max(0.0, value)
+            if duration > 0.0:
+                value = min(value, duration)
+            return value
+
         if self.selected_layer_ids:
             target_ids = set(self.selected_layer_ids)
         else:
@@ -13133,7 +14752,14 @@ class MSMAnimationViewer(QMainWindow):
         global_specs: List[TimelineLaneSpec] = []
         for idx, lane in enumerate(global_lanes):
             label = (lane.name or f"Global {idx + 1}").strip() or f"Global {idx + 1}"
-            markers = sorted({max(0.0, float(kf.time)) for kf in (lane.keyframes or [])})
+            markers = sorted(
+                {
+                    time_value
+                    for kf in (lane.keyframes or [])
+                    for time_value in [_sanitize_marker_time(getattr(kf, "time", 0.0))]
+                    if time_value is not None
+                }
+            )
             global_specs.append(
                 TimelineLaneSpec(TimelineLaneKey("global", -1, idx), label, markers, deletable=True)
             )
@@ -13146,7 +14772,14 @@ class MSMAnimationViewer(QMainWindow):
                 continue
             layer_label = layer.name or f"Layer {layer.layer_id}"
             layer_specs: List[TimelineLaneSpec] = []
-            base_markers = sorted({max(0.0, float(kf.time)) for kf in (layer.keyframes or [])})
+            base_markers = sorted(
+                {
+                    time_value
+                    for kf in (layer.keyframes or [])
+                    for time_value in [_sanitize_marker_time(getattr(kf, "time", 0.0))]
+                    if time_value is not None
+                }
+            )
             layer_specs.append(
                 TimelineLaneSpec(
                     TimelineLaneKey("layer", layer.layer_id, 0),
@@ -13158,7 +14791,14 @@ class MSMAnimationViewer(QMainWindow):
             extra_lanes = getattr(layer, "extra_keyframe_lanes", []) or []
             for idx, lane in enumerate(extra_lanes, start=1):
                 label = (lane.name or f"Lane {idx}").strip() or f"Lane {idx}"
-                markers = sorted({max(0.0, float(kf.time)) for kf in (lane.keyframes or [])})
+                markers = sorted(
+                    {
+                        time_value
+                        for kf in (lane.keyframes or [])
+                        for time_value in [_sanitize_marker_time(getattr(kf, "time", 0.0))]
+                        if time_value is not None
+                    }
+                )
                 layer_specs.append(
                     TimelineLaneSpec(TimelineLaneKey("layer", layer.layer_id, idx), label, markers, deletable=True)
                 )
@@ -13238,9 +14878,12 @@ class MSMAnimationViewer(QMainWindow):
         step = (60.0 / max(1e-3, float(self.current_bpm))) * note_scale
         beats: List[float] = []
         t = 0.0
-        while t <= duration + 1e-5:
+        max_markers = 50000
+        while t <= duration + 1e-5 and len(beats) < max_markers:
             beats.append(round(t, 6))
             t += step
+        if beats and beats[-1] < duration - 1e-4:
+            beats.append(round(duration, 6))
         if not beats:
             beats = [0.0, duration] if duration > 0.0 else [0.0]
         return self._normalize_beat_sequence(beats, duration)
@@ -13274,7 +14917,11 @@ class MSMAnimationViewer(QMainWindow):
     def _refresh_timeline_beats(self, force_regenerate: bool = False):
         player = getattr(self.gl_widget, "player", None)
         animation = getattr(player, "animation", None) if player else None
-        duration = max(0.0, getattr(player, "duration", 0.0)) if player else 0.0
+        duration = float(getattr(player, "duration", 0.0) or 0.0) if player else 0.0
+        if not math.isfinite(duration) or duration < 0.0:
+            duration = 0.0
+        max_timeline_seconds = 2147483647 / 1000.0
+        duration = min(duration, max_timeline_seconds)
         self.timeline.set_beat_grid_visible(self.show_beat_grid)
         self.timeline.set_beat_edit_enabled(self.show_beat_grid and self.allow_beat_edit)
         if not animation or not self.show_beat_grid or duration <= 0.0:
@@ -14159,6 +15806,11 @@ class MSMAnimationViewer(QMainWindow):
         widget.set_post_grain_strength(self.viewport_post_grain_strength)
         widget.set_post_ca_enabled(self.viewport_post_ca_enabled)
         widget.set_post_ca_strength(self.viewport_post_ca_strength)
+        widget.set_blue_mode(
+            bool(self.blue_mode_enabled and self._is_blue_mode_day()),
+            stretch_x=self.blue_mode_stretch_x,
+            overlay_rgba=self.blue_mode_overlay_rgba,
+        )
 
     def _configure_multi_view_widget(self, widget: OpenGLAnimationWidget) -> None:
         widget.set_constraint_manager(self.constraint_manager)
@@ -14371,6 +16023,13 @@ class MSMAnimationViewer(QMainWindow):
             ),
             "DEBUG",
         )
+
+    def _on_gl_runtime_error(self, message: str) -> None:
+        """Forward renderer-side OpenGL failures to the in-app log."""
+        text = str(message or "").strip()
+        if not text:
+            return
+        self.log_widget.log(text, "ERROR")
 
     # ------------------------------------------------------------------ #
     # Pose recording helpers
@@ -16874,6 +18533,13 @@ class MSMAnimationViewer(QMainWindow):
     def on_audio_enabled_changed(self, enabled: bool):
         """Enable or mute audio playback."""
         self.audio_manager.set_enabled(enabled)
+        if enabled and not self.audio_manager.backend_available:
+            self.control_panel.audio_enable_checkbox.blockSignals(True)
+            self.control_panel.audio_enable_checkbox.setChecked(False)
+            self.control_panel.audio_enable_checkbox.blockSignals(False)
+            self.control_panel.update_audio_status("Audio: backend unavailable", False)
+            self._report_audio_backend_status()
+            return
         if enabled and self.gl_widget.player.playing and self.audio_manager.is_ready:
             self.audio_manager.play(self._get_audio_sync_time(self.gl_widget.player.current_time))
         elif not enabled:
@@ -17419,6 +19085,25 @@ class MSMAnimationViewer(QMainWindow):
         self.pitch_shift_enabled = enabled
         self.settings.setValue('audio/pitch_shift_enabled', enabled)
         self._update_audio_speed()
+
+    def on_blue_mode_toggled(self, enabled: bool):
+        """Toggle April 1 blue mode effects."""
+        if enabled and not self._is_blue_mode_day():
+            enabled = False
+            if self.blue_mode_toggle_btn:
+                self.blue_mode_toggle_btn.blockSignals(True)
+                self.blue_mode_toggle_btn.setChecked(False)
+                self.blue_mode_toggle_btn.blockSignals(False)
+        self.blue_mode_enabled = bool(enabled and self._is_blue_mode_day())
+        if hasattr(self, "gl_widget") and self.gl_widget:
+            self._apply_postfx_settings_to_widget(self.gl_widget)
+        for widget in self.multi_view_widgets:
+            self._apply_postfx_settings_to_widget(widget)
+        self._update_audio_speed()
+        if self.blue_mode_enabled:
+            self.log_widget.log("Blue mode enabled.", "INFO")
+        else:
+            self.log_widget.log("Blue mode disabled.", "INFO")
 
     def on_metronome_toggled(self, enabled: bool):
         """Enable or disable the BPM metronome."""
@@ -20165,6 +21850,9 @@ class MSMAnimationViewer(QMainWindow):
         )
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.log_widget.log("Settings saved", "SUCCESS")
+            paths_changed = self._reload_primary_paths_from_settings(refresh=True)
+            if paths_changed:
+                self.log_widget.log("Applied active path profile from Settings.", "INFO")
             self.gl_widget.set_zoom_to_cursor(self.export_settings.camera_zoom_to_cursor)
             sprite_filter = self.settings.value("viewport/sprite_filter", "bilinear", type=str)
             self.gl_widget.set_sprite_filter_mode(sprite_filter)
@@ -20358,7 +22046,6 @@ class MSMAnimationViewer(QMainWindow):
             self.gl_widget.set_shader_registry(self.shader_registry)
             self.control_panel.set_barebones_file_mode(self.export_settings.use_barebones_file_browser)
             self._apply_keybind_shortcuts()
-            self.dof_path = self.settings.value('dof_path', self.dof_path, type=str)
             self._load_audio_preferences_from_storage()
             self._apply_audio_preferences_to_controls()
             self.metronome_enabled = bool(self.settings.value('metronome/enabled', self.metronome_enabled, type=bool))
@@ -21639,6 +23326,46 @@ All game assets and content are owned by Big Blue Bubble Inc.
                 self.log_widget.log(f"pytoshop import failed after install: {exc}", "ERROR")
                 self._show_pytoshop_install_help(extra_detail=str(exc))
                 return None
+
+    def _ensure_unitypy_available(self):
+        """Return the UnityPy module, installing it automatically when possible."""
+        unitypy_mod = _ensure_unitypy()
+        if unitypy_mod is not None:
+            return unitypy_mod
+
+        if getattr(self, "_unitypy_install_attempted", False):
+            return None
+        self._unitypy_install_attempted = True
+
+        self.log_widget.log(
+            "UnityPy is not installed for this interpreter. Attempting automatic install...",
+            "WARNING",
+        )
+        installer = PythonPackageInstaller(
+            "UnityPy",
+            "UnityPy>=1.25.0",
+            log_fn=lambda msg, level="INFO": self.log_widget.log(msg, level),
+        )
+        if not installer.install_latest():
+            self._install_python_package("UnityPy>=1.25.0")
+
+        try:
+            importlib.invalidate_caches()
+        except Exception:
+            pass
+
+        unitypy_mod = _ensure_unitypy()
+        if unitypy_mod is not None:
+            self.log_widget.log("UnityPy installed successfully for this interpreter.", "SUCCESS")
+            return unitypy_mod
+
+        self.log_widget.log(
+            f"UnityPy unavailable for interpreter: {sys.executable}",
+            "ERROR",
+        )
+        if _UNITYPY_IMPORT_ERROR:
+            self.log_widget.log(f"UnityPy import error: {_UNITYPY_IMPORT_ERROR}", "ERROR")
+        return None
 
     def _install_python_package(self, package_spec: str) -> bool:
         """Install a package using pip for the current interpreter."""

@@ -14,6 +14,19 @@ try:
 except Exception:
     UnityPy = None
 
+
+def _ensure_unitypy():
+    """Import UnityPy lazily so runtime installs are picked up."""
+    global UnityPy
+    if UnityPy is not None:
+        return UnityPy
+    try:
+        import UnityPy as _UnityPy  # type: ignore
+    except Exception:
+        return None
+    UnityPy = _UnityPy
+    return UnityPy
+
 try:
     from PIL import Image
 except Exception:  # pragma: no cover - optional dependency
@@ -299,10 +312,11 @@ def _select_gradient(minmax_gradient) -> Optional[object]:
 
 
 def extract_particle_nodes(bundle_path: str, anim_name: str) -> List[DofParticleNode]:
-    if UnityPy is None:
+    unitypy_mod = _ensure_unitypy()
+    if unitypy_mod is None:
         return []
     try:
-        env = UnityPy.load(str(bundle_path))
+        env = unitypy_mod.load(str(bundle_path))
     except Exception:
         return []
     target_name = anim_name
@@ -368,10 +382,11 @@ def extract_control_points(
     anim_name: str,
     names: Optional[List[str]] = None,
 ) -> Dict[str, DofControlPoint]:
-    if UnityPy is None:
+    unitypy_mod = _ensure_unitypy()
+    if unitypy_mod is None:
         return {}
     try:
-        env = UnityPy.load(str(bundle_path))
+        env = unitypy_mod.load(str(bundle_path))
     except Exception:
         return {}
     target_name = anim_name
@@ -435,10 +450,11 @@ def extract_source_nodes(
     anim_name: str,
     names: Optional[List[str]] = None,
 ) -> Dict[str, DofAnimNode]:
-    if UnityPy is None:
+    unitypy_mod = _ensure_unitypy()
+    if unitypy_mod is None:
         return {}
     try:
-        env = UnityPy.load(str(bundle_path))
+        env = unitypy_mod.load(str(bundle_path))
     except Exception:
         return {}
     target_name = anim_name
@@ -504,7 +520,8 @@ def extract_source_nodes(
 
 def build_particle_library(particles_root: str) -> DofParticleLibrary:
     library = DofParticleLibrary()
-    if UnityPy is None or Image is None:
+    unitypy_mod = _ensure_unitypy()
+    if unitypy_mod is None or Image is None:
         return library
     try:
         bundle_paths = list(Path(particles_root).rglob("__data"))
@@ -514,7 +531,7 @@ def build_particle_library(particles_root: str) -> DofParticleLibrary:
         return library
     for bundle_path in bundle_paths:
         try:
-            env = UnityPy.load(str(bundle_path))
+            env = unitypy_mod.load(str(bundle_path))
         except Exception:
             continue
         for obj in env.objects:

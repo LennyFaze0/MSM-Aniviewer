@@ -442,6 +442,31 @@ class ControlPanel(QWidget):
         anim_group.setLayout(anim_layout)
         animation_section.addWidget(anim_group)
         self.update_costume_options([])
+
+        gizmo_toggle_group = QGroupBox("Gizmo Overlays")
+        gizmo_toggle_layout = QHBoxLayout()
+        gizmo_toggle_layout.setSpacing(8)
+        self.rotation_gizmo_checkbox = QCheckBox("Rotation")
+        self.rotation_gizmo_checkbox.setToolTip("Display a draggable ring around the selected sprite for rotation.")
+        gizmo_toggle_layout.addWidget(self.rotation_gizmo_checkbox)
+
+        self.scale_gizmo_checkbox = QCheckBox("Scale")
+        self.scale_gizmo_checkbox.setToolTip("Display the scale gizmo for selected sprites.")
+        self.scale_gizmo_checkbox.toggled.connect(self.scale_gizmo_toggled.emit)
+        gizmo_toggle_layout.addWidget(self.scale_gizmo_checkbox)
+
+        self.anchor_overlay_checkbox = QCheckBox("Anchor")
+        self.anchor_overlay_checkbox.setToolTip("Displays every layer's anchor pivot and lets you drag them live.")
+        self.anchor_overlay_checkbox.toggled.connect(self.anchor_overlay_toggled.emit)
+        gizmo_toggle_layout.addWidget(self.anchor_overlay_checkbox)
+
+        self.parent_overlay_checkbox = QCheckBox("Parent")
+        self.parent_overlay_checkbox.setToolTip("Shows parent-child connectors and lets you drag parent handles to reposition hierarchies.")
+        self.parent_overlay_checkbox.toggled.connect(self.parent_overlay_toggled.emit)
+        gizmo_toggle_layout.addWidget(self.parent_overlay_checkbox)
+        gizmo_toggle_layout.addStretch(1)
+        gizmo_toggle_group.setLayout(gizmo_toggle_layout)
+        playback_section.addWidget(gizmo_toggle_group)
         
         # Render settings
         render_group = QGroupBox("Render Settings")
@@ -560,34 +585,6 @@ class ControlPanel(QWidget):
         self.rotation_slider.setValue(10)    # 1.0
         render_layout.addWidget(self.rotation_slider)
 
-        # Rotation overlay sizing
-        overlay_layout = QHBoxLayout()
-        overlay_layout.addWidget(QLabel("Rotation Gizmo Size:"))
-        self.rotation_overlay_spin = QDoubleSpinBox()
-        self.rotation_overlay_spin.setMinimum(10.0)
-        self.rotation_overlay_spin.setMaximum(500.0)
-        self.rotation_overlay_spin.setDecimals(1)
-        self.rotation_overlay_spin.setSingleStep(5.0)
-        self.rotation_overlay_spin.setValue(120.0)
-        overlay_layout.addWidget(self.rotation_overlay_spin)
-        render_layout.addLayout(overlay_layout)
-
-        self.rotation_overlay_slider = QSlider(Qt.Orientation.Horizontal)
-        self.rotation_overlay_slider.setMinimum(10)
-        self.rotation_overlay_slider.setMaximum(500)
-        self.rotation_overlay_slider.setValue(120)
-        render_layout.addWidget(self.rotation_overlay_slider)
-
-        self.rotation_gizmo_checkbox = QCheckBox("Show Rotation Gizmo Overlay")
-        self.rotation_gizmo_checkbox.setToolTip("Display a draggable ring around the selected sprite for rotation")
-        render_layout.addWidget(self.rotation_gizmo_checkbox)
-
-        rotation_help = QLabel("Use the overlay ring to rotate sprites after selecting them.")
-        rotation_help.setStyleSheet("color: gray; font-size: 8pt; font-style: italic;")
-        rotation_help.setWordWrap(True)
-        rotation_help.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
-        render_layout.addWidget(rotation_help)
-
         bpm_header = QLabel("Animation BPM")
         bpm_header.setStyleSheet("font-weight: bold; margin-top: 10px;")
         render_layout.addWidget(bpm_header)
@@ -666,14 +663,35 @@ class ControlPanel(QWidget):
         self.lock_bpm_button = QPushButton("Lock Base BPM…")
         render_layout.addWidget(self.lock_bpm_button)
 
-        scale_header = QLabel("Scale Gizmo")
-        scale_header.setStyleSheet("font-weight: bold; margin-top: 10px;")
-        render_layout.addWidget(scale_header)
+        gizmo_adjust_header = QLabel("Gizmo Adjustments")
+        gizmo_adjust_header.setStyleSheet("font-weight: bold; margin-top: 10px;")
+        render_layout.addWidget(gizmo_adjust_header)
 
-        self.scale_gizmo_checkbox = QCheckBox("Show Scale Gizmo Overlay")
-        self.scale_gizmo_checkbox.toggled.connect(self.scale_gizmo_toggled.emit)
-        render_layout.addWidget(self.scale_gizmo_checkbox)
+        # Rotation gizmo adjustments
+        overlay_layout = QHBoxLayout()
+        overlay_layout.addWidget(QLabel("Rotation Gizmo Size:"))
+        self.rotation_overlay_spin = QDoubleSpinBox()
+        self.rotation_overlay_spin.setMinimum(10.0)
+        self.rotation_overlay_spin.setMaximum(500.0)
+        self.rotation_overlay_spin.setDecimals(1)
+        self.rotation_overlay_spin.setSingleStep(5.0)
+        self.rotation_overlay_spin.setValue(120.0)
+        overlay_layout.addWidget(self.rotation_overlay_spin)
+        render_layout.addLayout(overlay_layout)
 
+        self.rotation_overlay_slider = QSlider(Qt.Orientation.Horizontal)
+        self.rotation_overlay_slider.setMinimum(10)
+        self.rotation_overlay_slider.setMaximum(500)
+        self.rotation_overlay_slider.setValue(120)
+        render_layout.addWidget(self.rotation_overlay_slider)
+
+        rotation_help = QLabel("Use the overlay ring to rotate sprites after selecting them.")
+        rotation_help.setStyleSheet("color: gray; font-size: 8pt; font-style: italic;")
+        rotation_help.setWordWrap(True)
+        rotation_help.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+        render_layout.addWidget(rotation_help)
+
+        # Scale gizmo adjustments
         mode_layout = QHBoxLayout()
         mode_layout.addWidget(QLabel("Scale Mode:"))
         self.scale_mode_combo = QComboBox()
@@ -687,20 +705,6 @@ class ControlPanel(QWidget):
         scale_help.setWordWrap(True)
         scale_help.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
         render_layout.addWidget(scale_help)
-
-        overlay_header = QLabel("Anchor & Parent Controls")
-        overlay_header.setStyleSheet("font-weight: bold; margin-top: 10px;")
-        render_layout.addWidget(overlay_header)
-
-        self.anchor_overlay_checkbox = QCheckBox("Show Anchor Overlay / Edit Anchors")
-        self.anchor_overlay_checkbox.setToolTip("Displays every layer's anchor pivot and lets you drag them live.")
-        self.anchor_overlay_checkbox.toggled.connect(self.anchor_overlay_toggled.emit)
-        render_layout.addWidget(self.anchor_overlay_checkbox)
-
-        self.parent_overlay_checkbox = QCheckBox("Show Parent Overlay / Parent Handles")
-        self.parent_overlay_checkbox.setToolTip("Shows parent-child connectors and lets you drag parent handles to reposition hierarchies.")
-        self.parent_overlay_checkbox.toggled.connect(self.parent_overlay_toggled.emit)
-        render_layout.addWidget(self.parent_overlay_checkbox)
 
         anchor_precision_layout = QHBoxLayout()
         anchor_precision_layout.addWidget(QLabel("Anchor Drag Precision:"))
@@ -1807,6 +1811,7 @@ class ControlPanel(QWidget):
         self.set_viewport_bg_parallax_zoom_strength(0.5)
         self.set_viewport_bg_parallax_pan_strength(0.5)
         self.set_viewport_bg_enabled(True)
+        self._wire_control_signals()
 
     def update_audio_status(self, message: str, success: bool = False):
         """Update the inline audio status label."""
@@ -1865,6 +1870,7 @@ class ControlPanel(QWidget):
         muted = item.checkState() != Qt.CheckState.Checked
         self.audio_track_mute_changed.emit(str(track_id), bool(muted))
 
+    def _wire_control_signals(self) -> None:
         # Placement control signal wiring
         self.translation_spin.valueChanged.connect(self._on_translation_spin_changed)
         self.translation_slider.valueChanged.connect(self._on_translation_slider_changed)

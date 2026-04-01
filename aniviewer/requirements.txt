@@ -9,3 +9,4 @@ pillow-heif>=0.16.0
 pillow-avif-plugin>=1.5.2
 soundfile>=0.12.1
 sounddevice>=0.4.6
+UnityPy>=1.25.0

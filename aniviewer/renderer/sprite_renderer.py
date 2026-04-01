@@ -25,6 +25,18 @@ from core.texture_atlas import TextureAtlas
 from core.animation_player import AnimationPlayer
 from utils.shader_registry import ShaderPreset, ShaderRegistry, ShaderBehavior
 
+
+def _set_texture_2d_enabled(enabled: bool) -> None:
+    """Guard GL_TEXTURE_2D capability toggles on strict/core contexts."""
+    try:
+        if enabled:
+            glEnable(GL_TEXTURE_2D)
+        else:
+            glDisable(GL_TEXTURE_2D)
+    except Exception:
+        return
+
+
 _BICUBIC_VERTEX_SHADER = """
 #version 120
 void main() {
@@ -3569,11 +3581,11 @@ class SpriteRenderer:
             if mask_texture_id and mask_uvs:
                 if shader_mode:
                     glActiveTexture(GL_TEXTURE0)
-                    glEnable(GL_TEXTURE_2D)
+                    _set_texture_2d_enabled(True)
                     glBindTexture(GL_TEXTURE_2D, overlay.texture_id)
                     self._apply_texture_filter(overlay.texture_id, shader_mode)
                     glActiveTexture(GL_TEXTURE1)
-                    glEnable(GL_TEXTURE_2D)
+                    _set_texture_2d_enabled(True)
                     glBindTexture(GL_TEXTURE_2D, mask_texture_id)
                     self._apply_texture_filter(mask_texture_id, shader_mode)
                     glActiveTexture(GL_TEXTURE0)
@@ -3588,13 +3600,13 @@ class SpriteRenderer:
                         self._stop_filter_program()
                         glActiveTexture(GL_TEXTURE1)
                         glBindTexture(GL_TEXTURE_2D, 0)
-                        glDisable(GL_TEXTURE_2D)
+                        _set_texture_2d_enabled(False)
                         glActiveTexture(GL_TEXTURE0)
                         glBindTexture(GL_TEXTURE_2D, 0)
                     else:
                         glActiveTexture(GL_TEXTURE1)
                         glBindTexture(GL_TEXTURE_2D, 0)
-                        glDisable(GL_TEXTURE_2D)
+                        _set_texture_2d_enabled(False)
                         glActiveTexture(GL_TEXTURE0)
                         self._begin_overlay_textures(overlay.texture_id, mask_texture_id)
                         _draw_multi(transformed_uvs, mask_uvs)
@@ -3714,9 +3726,9 @@ class SpriteRenderer:
         glStencilFunc(GL_ALWAYS, 1, 0xFF)
         glStencilOp(GL_REPLACE, GL_REPLACE, GL_REPLACE)
         glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE)
-        glDisable(GL_TEXTURE_2D)
+        _set_texture_2d_enabled(False)
         self._draw_overlay_geometry(vertices, draw_info.triangles)
-        glEnable(GL_TEXTURE_2D)
+        _set_texture_2d_enabled(True)
         glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE)
         glStencilFunc(GL_EQUAL, 1, 0xFF)
         glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP)
@@ -4129,7 +4141,7 @@ class SpriteRenderer:
 
     def _begin_overlay_textures(self, overlay_id: int, mask_id: Optional[int]) -> None:
         glActiveTexture(GL_TEXTURE0)
-        glEnable(GL_TEXTURE_2D)
+        _set_texture_2d_enabled(True)
         glBindTexture(GL_TEXTURE_2D, overlay_id)
         if self.texture_filter_mode in ("bicubic", "lanczos"):
             self._apply_texture_filter(overlay_id, "bilinear")
@@ -4138,7 +4150,7 @@ class SpriteRenderer:
         glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE)
         if mask_id:
             glActiveTexture(GL_TEXTURE1)
-            glEnable(GL_TEXTURE_2D)
+            _set_texture_2d_enabled(True)
             glBindTexture(GL_TEXTURE_2D, mask_id)
             if self.texture_filter_mode in ("bicubic", "lanczos"):
                 self._apply_texture_filter(mask_id, "bilinear")
@@ -4160,6 +4172,6 @@ class SpriteRenderer:
             glActiveTexture(GL_TEXTURE1)
             glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE)
             glBindTexture(GL_TEXTURE_2D, 0)
-            glDisable(GL_TEXTURE_2D)
+            _set_texture_2d_enabled(False)
             glActiveTexture(GL_TEXTURE0)
         glBindTexture(GL_TEXTURE_2D, 0)
