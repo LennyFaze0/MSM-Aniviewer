@@ -1,0 +1,10 @@
+build/
+dist/
+*.3dsx
+*.elf
+*.map
+*.lst
+*.smdh
+*.o
+*.d
+*.bak
