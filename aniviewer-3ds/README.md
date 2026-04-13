@@ -1,4 +1,4 @@
-# AniViewer 3DS
+# Aniviewer 3DS
 
 This is a 3DS homebrew playback-only alpha for Rev6 animations.
 
