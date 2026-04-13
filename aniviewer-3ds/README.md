@@ -1,7 +1,6 @@
-# AniViewer 3DS Alpha Viewer
+# AniViewer 3DS
 
 This is a 3DS homebrew playback-only alpha for Rev6 animations.
-It now uses a raw BIN workflow only.
 
 ## Build requirements
 
@@ -26,7 +25,7 @@ Output:
 
 The app discovers raw Rev6 BINs from:
 
-- `sdmc:/3ds/aniviewer3ds/raw/*.bin`
+ `sdmc:/3ds/aniviewer3ds/raw/*.bin`
 
 ### Raw Rev6 BIN requirements
 
@@ -44,15 +43,15 @@ If `.t3x` sheets are missing or fail to load, playback still runs in debug-quad 
 
 ## Controls
 
-- `A`: pause/resume
-- `X`: restart timeline
-- `Y`: reload current BIN
-- `SELECT`: cycle animation within current BIN (when available)
-- `DPad Left/Right`: switch BIN
-- `DPad Up/Down`: speed
-- `L/R`: zoom
-- `3D slider`: depth strength
-- `Circle Pad`: depth tilt
-- `START`: exit
+ `A`: pause/resume
+ `X`: restart timeline
+ `Y`: reload current BIN
+ `SELECT`: cycle animation within current BIN (when available)
+ `DPad Left/Right`: switch BIN
+ `DPad Up/Down`: speed
+ `L/R`: zoom
+ `3D slider`: depth strength
+ `Circle Pad`: depth tilt
+ `START`: exit
 
 If you need a fresh rebuild, run `make clean && make`.
