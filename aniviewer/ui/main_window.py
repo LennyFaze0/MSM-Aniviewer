@@ -27,7 +27,7 @@ import xml.etree.ElementTree as ET
 import zlib
 from glob import glob
 from pathlib import Path
-from typing import Optional, Dict, List, Set, Tuple, Any
+from typing import Optional, Dict, List, Set, Tuple, Any, Callable
 
 import numpy as np
 from dataclasses import dataclass, replace
@@ -40,7 +40,7 @@ from PyQt6.QtWidgets import (
     QLineEdit, QTextEdit, QPlainTextEdit, QAbstractSpinBox, QComboBox,
     QStackedWidget
 )
-from PyQt6.QtCore import Qt, QSettings, QTimer, QEvent, QProcess
+from PyQt6.QtCore import Qt, QSettings, QTimer, QEvent, QProcess, QEventLoop, QThread, QObject, pyqtSignal
 from PyQt6.QtGui import QSurfaceFormat, QColor, QShortcut, QKeySequence, QPixmap, QImage, QIcon, QCursor
 from PyQt6.QtWidgets import QGraphicsDropShadowEffect
 from PIL import Image, ImageChops, ImageDraw
@@ -212,6 +212,47 @@ class CostumeEntry:
     @property
     def source_path(self) -> Optional[str]:
         return self.json_path or self.bin_path
+
+
+class BinConversionWorker(QObject):
+    """Run BIN->JSON conversion off the UI thread."""
+
+    finished = pyqtSignal(dict)
+
+    def __init__(self, viewer: "MSMAnimationViewer", bin_path: str, force: bool = False, announce: bool = True):
+        super().__init__()
+        self._viewer = viewer
+        self._bin_path = bin_path
+        self._force = bool(force)
+        self._announce = bool(announce)
+
+    def run(self) -> None:
+        logs: List[Tuple[str, str]] = []
+        warnings: List[Tuple[str, str]] = []
+        try:
+            json_path = self._viewer._convert_bin_file(
+                self._bin_path,
+                force=self._force,
+                announce=self._announce,
+                log_sink=logs,
+                warning_sink=warnings,
+                refresh_on_success=False,
+                command_runner=MSMAnimationViewer._run_converter_command_blocking,
+            )
+            payload = {
+                "success": bool(json_path),
+                "json_path": json_path,
+                "logs": logs,
+                "warning": warnings[-1] if warnings else None,
+            }
+        except Exception as exc:
+            payload = {
+                "success": False,
+                "json_path": None,
+                "logs": logs,
+                "warning": ("Conversion Failed", str(exc)),
+            }
+        self.finished.emit(payload)
 
 
 class MSMAnimationViewer(QMainWindow):
@@ -402,6 +443,8 @@ class MSMAnimationViewer(QMainWindow):
         self.rev2_bin2json_path: Optional[str] = ""
         self.dof_anim_to_json_path: Optional[str] = ""
         self._dof_convert_process: Optional[QProcess] = None
+        self._bin_convert_thread: Optional[QThread] = None
+        self._bin_convert_worker: Optional[BinConversionWorker] = None
         self._dof_convert_asset_path: Optional[str] = None
         self._dof_convert_output_json: Optional[str] = None
         self._dof_convert_stdout_buffer: str = ""
@@ -7745,6 +7788,10 @@ class MSMAnimationViewer(QMainWindow):
     
     def convert_bin_to_json(self):
         """Convert selected BIN file to JSON"""
+        if self._bin_convert_thread and self._bin_convert_thread.isRunning():
+            QMessageBox.warning(self, "Conversion Running", "A BIN conversion is already in progress.")
+            return
+
         current_data = self.control_panel.bin_combo.currentData()
         current_text = self.control_panel.bin_combo.currentText()
 
@@ -7765,25 +7812,81 @@ class MSMAnimationViewer(QMainWindow):
             return
 
         self._set_bin_conversion_active(True)
-        try:
-            json_path = self._convert_bin_file(bin_path, announce=True)
-        finally:
-            self._set_bin_conversion_active(False)
-        if json_path and not self.select_file_by_path(json_path):
-            self.log_widget.log("Could not auto-select converted JSON file", "WARNING")
+        self._bin_convert_worker = BinConversionWorker(self, bin_path, force=False, announce=True)
+        self._bin_convert_thread = QThread(self)
+        self._bin_convert_worker.moveToThread(self._bin_convert_thread)
+        self._bin_convert_thread.started.connect(self._bin_convert_worker.run)
+        self._bin_convert_worker.finished.connect(self._on_bin_conversion_finished)
+        self._bin_convert_worker.finished.connect(self._bin_convert_thread.quit)
+        self._bin_convert_thread.finished.connect(self._cleanup_bin_conversion_thread)
+        self._bin_convert_thread.start()
 
-    def _convert_bin_file(self, bin_path: str, *, force: bool = False, announce: bool = True) -> Optional[str]:
+    def _on_bin_conversion_finished(self, payload: Dict[str, Any]) -> None:
+        """Handle completion of a background BIN conversion."""
+        self._set_bin_conversion_active(False)
+        for message, level in payload.get("logs", []):
+            self.log_widget.log(message, level)
+
+        warning = payload.get("warning")
+        if warning:
+            title, message = warning
+            self._warn_bin_conversion(str(title), str(message))
+
+        json_path = payload.get("json_path")
+        if not json_path:
+            return
+
+        if not self.select_file_by_path(json_path):
+            self.refresh_file_list()
+            if not self.select_file_by_path(json_path):
+                self.log_widget.log("Could not auto-select converted JSON file", "WARNING")
+
+    def _cleanup_bin_conversion_thread(self) -> None:
+        """Release worker/thread objects after conversion exits."""
+        self._set_bin_conversion_active(False)
+        if self._bin_convert_worker:
+            self._bin_convert_worker.deleteLater()
+            self._bin_convert_worker = None
+        if self._bin_convert_thread:
+            self._bin_convert_thread.deleteLater()
+            self._bin_convert_thread = None
+
+    def _convert_bin_file(
+        self,
+        bin_path: str,
+        *,
+        force: bool = False,
+        announce: bool = True,
+        log_sink: Optional[List[Tuple[str, str]]] = None,
+        warning_sink: Optional[List[Tuple[str, str]]] = None,
+        refresh_on_success: bool = True,
+        command_runner: Optional[Callable[[List[str], Optional[str]], subprocess.CompletedProcess]] = None,
+    ) -> Optional[str]:
         """Convert a specific BIN file via bin2json, optionally forcing re-export."""
+        run_command = command_runner or self._run_converter_command
+
+        def _log(message: str, level: str = "INFO") -> None:
+            if log_sink is not None:
+                log_sink.append((message, level))
+            else:
+                self.log_widget.log(message, level)
+
+        def _warn(title: str, message: str) -> None:
+            if warning_sink is not None:
+                warning_sink.append((title, message))
+            else:
+                self._warn_bin_conversion(title, message)
+
         if not self.bin2json_path:
             if announce:
-                self._warn_bin_conversion("Error", "bin2json script not found")
-            self.log_widget.log("bin2json script not found; conversion skipped.", "ERROR")
+                _warn("Error", "bin2json script not found")
+            _log("bin2json script not found; conversion skipped.", "ERROR")
             return None
 
         if not os.path.exists(bin_path):
-            self.log_widget.log(f"BIN file not found: {bin_path}", "ERROR")
+            _log(f"BIN file not found: {bin_path}", "ERROR")
             if announce:
-                self._warn_bin_conversion("Error", "Selected BIN file no longer exists")
+                _warn("Error", "Selected BIN file no longer exists")
             return None
 
         json_path = os.path.splitext(bin_path)[0] + '.json'
@@ -7792,14 +7895,14 @@ class MSMAnimationViewer(QMainWindow):
 
         relative_display = self._relative_xml_bin_display(bin_path)
         action = "Re-exporting" if force else "Converting"
-        self.log_widget.log(f"{action} {relative_display} to JSON...", "INFO")
+        _log(f"{action} {relative_display} to JSON...", "INFO")
         hint_parts: List[str] = []
         if revision_hint is not None:
             hint_parts.append(f"rev {revision_hint}")
         if detection_hints.family_hint:
             hint_parts.append(f"{detection_hints.family_hint} family")
         if hint_parts:
-            self.log_widget.log(f"Auto-detect hints: {', '.join(hint_parts)}.", "INFO")
+            _log(f"Auto-detect hints: {', '.join(hint_parts)}.", "INFO")
 
         converter_paths: Dict[str, Optional[str]] = {
             "rev6": self.bin2json_path,
@@ -7850,7 +7953,7 @@ class MSMAnimationViewer(QMainWindow):
             queued.add(key)
             script_path = converter_paths.get(key)
             if not script_path:
-                self.log_widget.log(missing_messages.get(key, f"Converter '{key}' missing."), "WARNING")
+                _log(missing_messages.get(key, f"Converter '{key}' missing."), "WARNING")
                 continue
             if key in ("legacy", "rev1_classic", "rev1_launch", "oldest", "choir", "muppets"):
                 cmd = self._build_python_command(script_path) + [bin_path, "-o", json_path]
@@ -7870,30 +7973,30 @@ class MSMAnimationViewer(QMainWindow):
             )
 
         if not attempts:
-            self.log_widget.log(
+            _log(
                 "No BIN converters are available; cannot perform conversion.",
                 "ERROR",
             )
             if announce:
-                self._warn_bin_conversion("Error", "No bin2json converters available.")
+                _warn("Error", "No bin2json converters available.")
             return None
 
         error_messages: List[str] = []
 
         for label, friendly, cmd, cwd, produced_json, expected_rev in attempts:
-            self.log_widget.log(f"Attempting {friendly}...", "INFO")
+            _log(f"Attempting {friendly}...", "INFO")
             try:
-                result = self._run_converter_command(cmd, cwd)
+                result = run_command(cmd, cwd)
             except Exception as exc:
                 error_text = f"{friendly} raised {exc}"
-                self.log_widget.log(error_text, "ERROR")
+                _log(error_text, "ERROR")
                 error_messages.append(error_text)
                 continue
 
             if result.returncode == 0:
                 stdout = (result.stdout or "").strip()
                 if stdout:
-                    self.log_widget.log(stdout, "INFO")
+                    _log(stdout, "INFO")
                 if (
                     os.path.normcase(os.path.normpath(produced_json))
                     != os.path.normcase(os.path.normpath(json_path))
@@ -7905,29 +8008,30 @@ class MSMAnimationViewer(QMainWindow):
                     except Exception as exc:
                         error_text = f"{friendly} produced JSON but move failed: {exc}"
                         error_messages.append(error_text)
-                        self.log_widget.log(error_text, "WARNING")
+                        _log(error_text, "WARNING")
                         continue
                 valid, reason = self._validate_converted_animation_json(json_path, expected_rev)
                 if not valid:
                     error_text = f"{friendly} output rejected: {reason}"
                     error_messages.append(error_text)
-                    self.log_widget.log(error_text, "WARNING")
+                    _log(error_text, "WARNING")
                     continue
-                self.log_widget.log(f"{friendly} output validated: {reason}", "INFO")
-                self.log_widget.log(
+                _log(f"{friendly} output validated: {reason}", "INFO")
+                _log(
                     f"Converted {os.path.basename(bin_path)} via {friendly}",
                     "SUCCESS",
                 )
-                self.refresh_file_list()
+                if refresh_on_success:
+                    self.refresh_file_list()
                 return json_path
 
             error_text = (result.stderr or result.stdout or "").strip() or "Unknown error"
             error_messages.append(f"{friendly}: {error_text}")
-            self.log_widget.log(f"{friendly} failed: {error_text}", "WARNING")
+            _log(f"{friendly} failed: {error_text}", "WARNING")
 
         failure_reason = error_messages[-1] if error_messages else "Unknown error"
         if announce:
-            self._warn_bin_conversion("Conversion Failed", failure_reason)
+            _warn("Conversion Failed", failure_reason)
         return None
 
     @staticmethod
@@ -7999,26 +8103,79 @@ class MSMAnimationViewer(QMainWindow):
             return [sys.executable, "--run-script", script_path]
         return [sys.executable, script_path]
 
+    @staticmethod
+    def _run_converter_command_blocking(cmd: List[str], cwd: Optional[str]) -> subprocess.CompletedProcess:
+        """Execute a converter command without Qt objects (safe for worker threads)."""
+        if not cmd:
+            return subprocess.CompletedProcess(args=cmd, returncode=1, stdout="", stderr="Empty converter command.")
+        try:
+            result = subprocess.run(
+                cmd,
+                cwd=cwd or None,
+                capture_output=True,
+                text=True,
+            )
+            return subprocess.CompletedProcess(
+                args=cmd,
+                returncode=result.returncode,
+                stdout=result.stdout or "",
+                stderr=result.stderr or "",
+            )
+        except Exception as exc:
+            return subprocess.CompletedProcess(args=cmd, returncode=1, stdout="", stderr=str(exc))
+
     def _run_converter_command(self, cmd: List[str], cwd: Optional[str]) -> subprocess.CompletedProcess:
         """Execute a converter command, supporting embedded scripts in frozen builds."""
-        if getattr(sys, "frozen", False) and len(cmd) >= 3 and cmd[0] == sys.executable and cmd[1] == "--run-script":
-            script_path = cmd[2]
-            script_args = cmd[3:]
-            return self._run_embedded_script(script_path, script_args, cwd or os.path.dirname(script_path))
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            cwd=cwd,
+        if not cmd:
+            return subprocess.CompletedProcess(args=cmd, returncode=1, stdout="", stderr="Empty converter command.")
+
+        process = QProcess(self)
+        process.setProgram(cmd[0])
+        process.setArguments(cmd[1:])
+        if cwd:
+            process.setWorkingDirectory(cwd)
+        process.setProcessChannelMode(QProcess.ProcessChannelMode.SeparateChannels)
+
+        stdout_chunks: List[str] = []
+        stderr_chunks: List[str] = []
+
+        def _drain_stdout() -> None:
+            data = process.readAllStandardOutput()
+            if data:
+                stdout_chunks.append(bytes(data).decode("utf-8", errors="replace"))
+
+        def _drain_stderr() -> None:
+            data = process.readAllStandardError()
+            if data:
+                stderr_chunks.append(bytes(data).decode("utf-8", errors="replace"))
+
+        loop = QEventLoop(self)
+        process.readyReadStandardOutput.connect(_drain_stdout)
+        process.readyReadStandardError.connect(_drain_stderr)
+        process.finished.connect(loop.quit)
+        process.errorOccurred.connect(lambda _err: loop.quit())
+
+        process.start()
+        if not process.waitForStarted(15000):
+            _drain_stdout()
+            _drain_stderr()
+            stderr_text = "".join(stderr_chunks).strip() or process.errorString() or "Failed to start converter process."
+            process.deleteLater()
+            return subprocess.CompletedProcess(args=cmd, returncode=1, stdout="".join(stdout_chunks), stderr=stderr_text)
+
+        loop.exec()
+        _drain_stdout()
+        _drain_stderr()
+        return_code = process.exitCode()
+        if process.exitStatus() != QProcess.ExitStatus.NormalExit:
+            return_code = 1
+        process.deleteLater()
+        return subprocess.CompletedProcess(
+            args=cmd,
+            returncode=return_code,
+            stdout="".join(stdout_chunks),
+            stderr="".join(stderr_chunks),
         )
-        while True:
-            try:
-                stdout, stderr = process.communicate(timeout=0.12)
-                break
-            except subprocess.TimeoutExpired:
-                QApplication.processEvents()
-        return subprocess.CompletedProcess(cmd, process.returncode, stdout, stderr)
 
     def _run_embedded_script(
         self,

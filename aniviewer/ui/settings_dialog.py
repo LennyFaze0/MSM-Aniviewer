@@ -28,7 +28,7 @@ from PyQt6.QtWidgets import (
     QSizePolicy, QLineEdit, QFileDialog, QListWidget, QPlainTextEdit,
     QInputDialog, QKeySequenceEdit, QListWidgetItem
 )
-from PyQt6.QtCore import Qt, QSettings, QThread, QObject, pyqtSignal
+from PyQt6.QtCore import Qt, QSettings, QThread, QObject, pyqtSignal, QEventLoop, QProcess
 from PyQt6.QtGui import QKeySequence
 
 from utils.ffmpeg_installer import (
@@ -6316,16 +6316,56 @@ class SettingsDialog(QDialog):
         return [sys.executable, script_path]
 
     def _run_converter_command(self, cmd: List[str], cwd: Optional[str]) -> subprocess.CompletedProcess:
-        run_kwargs = {
-            "capture_output": True,
-            "text": True,
-            "cwd": cwd,
-        }
-        if getattr(sys, "frozen", False) and len(cmd) >= 3 and cmd[0] == sys.executable and cmd[1] == "--run-script":
-            script_path = cmd[2]
-            script_args = cmd[3:]
-            return self._run_embedded_script(script_path, script_args, cwd or os.path.dirname(script_path))
-        return subprocess.run(cmd, **run_kwargs)
+        if not cmd:
+            return subprocess.CompletedProcess(args=cmd, returncode=1, stdout="", stderr="Empty converter command.")
+
+        process = QProcess(self)
+        process.setProgram(cmd[0])
+        process.setArguments(cmd[1:])
+        if cwd:
+            process.setWorkingDirectory(cwd)
+        process.setProcessChannelMode(QProcess.ProcessChannelMode.SeparateChannels)
+
+        stdout_chunks: List[str] = []
+        stderr_chunks: List[str] = []
+
+        def _drain_stdout() -> None:
+            data = process.readAllStandardOutput()
+            if data:
+                stdout_chunks.append(bytes(data).decode("utf-8", errors="replace"))
+
+        def _drain_stderr() -> None:
+            data = process.readAllStandardError()
+            if data:
+                stderr_chunks.append(bytes(data).decode("utf-8", errors="replace"))
+
+        loop = QEventLoop(self)
+        process.readyReadStandardOutput.connect(_drain_stdout)
+        process.readyReadStandardError.connect(_drain_stderr)
+        process.finished.connect(loop.quit)
+        process.errorOccurred.connect(lambda _err: loop.quit())
+
+        process.start()
+        if not process.waitForStarted(15000):
+            _drain_stdout()
+            _drain_stderr()
+            stderr_text = "".join(stderr_chunks).strip() or process.errorString() or "Failed to start converter process."
+            process.deleteLater()
+            return subprocess.CompletedProcess(args=cmd, returncode=1, stdout="".join(stdout_chunks), stderr=stderr_text)
+
+        loop.exec()
+        _drain_stdout()
+        _drain_stderr()
+        return_code = process.exitCode()
+        if process.exitStatus() != QProcess.ExitStatus.NormalExit:
+            return_code = 1
+        process.deleteLater()
+        return subprocess.CompletedProcess(
+            args=cmd,
+            returncode=return_code,
+            stdout="".join(stdout_chunks),
+            stderr="".join(stderr_chunks),
+        )
 
     def _run_embedded_script(
         self,
