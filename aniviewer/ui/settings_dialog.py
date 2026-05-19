@@ -26,7 +26,7 @@ from PyQt6.QtWidgets import (
     QSlider, QCheckBox, QGroupBox, QTabWidget,
     QWidget, QFormLayout, QFrame, QProgressBar, QMessageBox, QScrollArea,
     QSizePolicy, QLineEdit, QFileDialog, QListWidget, QPlainTextEdit,
-    QInputDialog, QKeySequenceEdit
+    QInputDialog, QKeySequenceEdit, QListWidgetItem
 )
 from PyQt6.QtCore import Qt, QSettings, QThread, QObject, pyqtSignal
 from PyQt6.QtGui import QKeySequence
@@ -44,6 +44,15 @@ from utils.bin_revision_detection import (
     collect_bin_detection_hints,
     converter_display_name,
     infer_revision_hint,
+)
+from utils.dof_bundle_remote import (
+    DEFAULT_DOF_CDN_BASE_URL,
+    DofBundleManifestEntry,
+    DofBundleRemoteError,
+    download_dof_bundles,
+    fetch_dof_bundle_manifest,
+    normalize_dof_bundle_platform,
+    normalize_dof_cdn_base_url,
 )
 
 
@@ -631,6 +640,8 @@ class SettingsDialog(QDialog):
         self._dof_converter_path = self._discover_dof_converter()
         self._dof_input_cache_root: Optional[str] = None
         self._dof_input_cache_entries: List[Tuple[str, str]] = []
+        self._dof_remote_manifest_url: str = ""
+        self._dof_remote_manifest_entries: List[DofBundleManifestEntry] = []
         self.anim_transfer_source_payload: Optional[Dict[str, Any]] = None
         self.anim_transfer_target_payload: Optional[Dict[str, Any]] = None
         self.anim_transfer_source_path: Optional[str] = None
@@ -638,6 +649,7 @@ class SettingsDialog(QDialog):
         self._reset_viewport_bg_to_default_on_save: bool = False
         self._path_profiles: List[Dict[str, str]] = []
         self._active_path_profile_index: int = 0
+        self._path_profile_selected_row: int = 0
         self._path_profile_ui_updating: bool = False
         self._load_path_profiles_from_settings()
         self.setWindowTitle("Settings")
@@ -646,6 +658,7 @@ class SettingsDialog(QDialog):
         self.ffmpeg_thread: QThread | None = None
         self.ffmpeg_worker: FFmpegInstallWorker | None = None
         self.ffmpeg_install_running = False
+        self.monster_name_rosetta_regenerate_requested: bool = False
         
         self.init_ui()
         self.load_current_settings()
@@ -655,6 +668,28 @@ class SettingsDialog(QDialog):
         if value is None:
             return ""
         return str(value).strip()
+
+    def set_active_tab(self, label: str) -> bool:
+        """Switch to a tab by its visible label."""
+        target = str(label or "").strip().lower()
+        if not target or not hasattr(self, "tab_widget"):
+            return False
+        for index in range(self.tab_widget.count()):
+            if self.tab_widget.tabText(index).strip().lower() == target:
+                self.tab_widget.setCurrentIndex(index)
+                return True
+        return False
+
+    def focus_dof_asset_grabber(self) -> None:
+        """Focus settings UI on DOF remote bundle download controls."""
+        self.set_active_tab("BIN Converter")
+        if hasattr(self, "bin_convert_mode_combo"):
+            mode_index = self.bin_convert_mode_combo.findData("dof_to_json")
+            if mode_index >= 0:
+                self.bin_convert_mode_combo.setCurrentIndex(mode_index)
+                self._update_bin_convert_controls()
+        if hasattr(self, "dof_remote_build_key_combo"):
+            self.dof_remote_build_key_combo.setFocus(Qt.FocusReason.OtherFocusReason)
 
     def _default_path_profile(self) -> Dict[str, str]:
         legacy_game = self._sanitize_path_value(
@@ -719,49 +754,66 @@ class SettingsDialog(QDialog):
 
         self._path_profiles = profiles
         self._active_path_profile_index = active_index
+        self._path_profile_selected_row = active_index
+
+    def _path_profile_display_name(self, index: int) -> str:
+        if index < 0 or index >= len(self._path_profiles):
+            return ""
+        profile = self._path_profiles[index]
+        name = self._sanitize_path_value(profile.get("name")) or f"Profile {index + 1}"
+        if index == self._active_path_profile_index:
+            return f"{name} (Active)"
+        return name
+
+    def _update_paths_active_profile_label(self) -> None:
+        label_widget = getattr(self, "paths_active_profile_value_label", None)
+        if label_widget is None:
+            return
+        if 0 <= self._active_path_profile_index < len(self._path_profiles):
+            profile = self._path_profiles[self._active_path_profile_index]
+            name = self._sanitize_path_value(profile.get("name")) or f"Profile {self._active_path_profile_index + 1}"
+            game_path = self._sanitize_path_value(profile.get("game_path"))
+            if game_path:
+                label_widget.setText(f"{name} | {game_path}")
+            else:
+                label_widget.setText(name)
+        else:
+            label_widget.setText("None")
 
     def _refresh_paths_profile_widgets(self, *, selected_index: Optional[int] = None) -> None:
         if not hasattr(self, "paths_profile_list"):
             return
 
         if not self._path_profiles:
-            self._path_profiles = [self._default_path_profile()]
-            self._active_path_profile_index = 0
+            self._active_path_profile_index = -1
+        else:
+            if self._active_path_profile_index < 0:
+                self._active_path_profile_index = 0
+            if self._active_path_profile_index >= len(self._path_profiles):
+                self._active_path_profile_index = len(self._path_profiles) - 1
 
-        if self._active_path_profile_index < 0:
-            self._active_path_profile_index = 0
-        if self._active_path_profile_index >= len(self._path_profiles):
-            self._active_path_profile_index = len(self._path_profiles) - 1
-
-        if selected_index is None:
-            current_row = self.paths_profile_list.currentRow()
-            selected_index = current_row if current_row >= 0 else self._active_path_profile_index
-        if selected_index < 0:
-            selected_index = 0
-        if selected_index >= len(self._path_profiles):
-            selected_index = len(self._path_profiles) - 1
+        if not self._path_profiles:
+            selected_index = -1
+        else:
+            if selected_index is None:
+                current_row = self.paths_profile_list.currentRow()
+                selected_index = current_row if current_row >= 0 else self._active_path_profile_index
+            if selected_index < 0:
+                selected_index = 0
+            if selected_index >= len(self._path_profiles):
+                selected_index = len(self._path_profiles) - 1
 
         self._path_profile_ui_updating = True
         try:
             self.paths_profile_list.blockSignals(True)
             self.paths_profile_list.clear()
-            for idx, profile in enumerate(self._path_profiles):
-                name = profile.get("name") or f"Profile {idx + 1}"
-                if idx == self._active_path_profile_index:
-                    name = f"{name} (Active)"
-                self.paths_profile_list.addItem(name)
-            self.paths_profile_list.setCurrentRow(selected_index)
+            for idx, _profile in enumerate(self._path_profiles):
+                self.paths_profile_list.addItem(self._path_profile_display_name(idx))
+            self.paths_profile_list.setCurrentRow(selected_index if selected_index >= 0 else -1)
             self.paths_profile_list.blockSignals(False)
-
-            self.paths_active_profile_combo.blockSignals(True)
-            self.paths_active_profile_combo.clear()
-            for idx, profile in enumerate(self._path_profiles):
-                name = profile.get("name") or f"Profile {idx + 1}"
-                self.paths_active_profile_combo.addItem(name, idx)
-            self.paths_active_profile_combo.setCurrentIndex(self._active_path_profile_index)
-            self.paths_active_profile_combo.blockSignals(False)
-
+            self._path_profile_selected_row = selected_index
             self._load_selected_path_profile_into_fields(selected_index)
+            self._update_paths_active_profile_label()
         finally:
             self._path_profile_ui_updating = False
 
@@ -775,6 +827,8 @@ class SettingsDialog(QDialog):
             getattr(self, "paths_dof_path_edit", None),
             getattr(self, "paths_dof_path_browse_btn", None),
             getattr(self, "paths_remove_profile_btn", None),
+            getattr(self, "paths_duplicate_profile_btn", None),
+            getattr(self, "paths_set_active_btn", None),
         ):
             if widget is not None:
                 widget.setEnabled(enabled)
@@ -791,6 +845,7 @@ class SettingsDialog(QDialog):
             return
 
         profile = self._path_profiles[index]
+        self._path_profile_selected_row = index
         self._set_paths_profile_editor_enabled(True)
 
         self.paths_profile_name_edit.setText(profile.get("name", ""))
@@ -798,12 +853,15 @@ class SettingsDialog(QDialog):
         self.paths_downloads_path_edit.setText(profile.get("downloads_path", ""))
         self.paths_dof_path_edit.setText(profile.get("dof_path", ""))
 
-    def _commit_selected_path_profile_fields(self) -> None:
+    def _commit_selected_path_profile_fields(self, *, row: Optional[int] = None) -> None:
         if self._path_profile_ui_updating:
             return
         if not hasattr(self, "paths_profile_list"):
             return
-        row = self.paths_profile_list.currentRow()
+        if row is None:
+            row = self._path_profile_selected_row
+        if row < 0:
+            row = self.paths_profile_list.currentRow()
         if row < 0 or row >= len(self._path_profiles):
             return
         profile = self._path_profiles[row]
@@ -811,69 +869,90 @@ class SettingsDialog(QDialog):
         profile["game_path"] = self._sanitize_path_value(self.paths_game_path_edit.text())
         profile["downloads_path"] = self._sanitize_path_value(self.paths_downloads_path_edit.text())
         profile["dof_path"] = self._sanitize_path_value(self.paths_dof_path_edit.text())
+        list_item = self.paths_profile_list.item(row)
+        if list_item is not None:
+            list_item.setText(self._path_profile_display_name(row))
+        if row == self._active_path_profile_index:
+            self._update_paths_active_profile_label()
 
     def _on_paths_profile_selected(self, row: int) -> None:
         if self._path_profile_ui_updating:
             return
-        self._commit_selected_path_profile_fields()
+        previous_row = self._path_profile_selected_row
+        self._commit_selected_path_profile_fields(row=previous_row)
         self._path_profile_ui_updating = True
         try:
             self._load_selected_path_profile_into_fields(row)
         finally:
             self._path_profile_ui_updating = False
 
-    def _on_paths_active_profile_changed(self, index: int) -> None:
+    def _set_selected_path_profile_active(self) -> None:
         if self._path_profile_ui_updating:
             return
-        if index < 0 or index >= len(self._path_profiles):
+        if not hasattr(self, "paths_profile_list"):
             return
-        self._active_path_profile_index = index
-        selected_row = self.paths_profile_list.currentRow()
-        self._refresh_paths_profile_widgets(selected_index=selected_row)
+        self._commit_selected_path_profile_fields(row=self._path_profile_selected_row)
+        row = self.paths_profile_list.currentRow()
+        if row < 0 or row >= len(self._path_profiles):
+            return
+        if row == self._active_path_profile_index:
+            return
+        self._active_path_profile_index = row
+        self._refresh_paths_profile_widgets(selected_index=row)
 
     def _on_paths_profile_fields_changed(self) -> None:
         if self._path_profile_ui_updating:
             return
-        self._commit_selected_path_profile_fields()
-        selected_row = self.paths_profile_list.currentRow()
-        self._refresh_paths_profile_widgets(selected_index=selected_row)
+        self._commit_selected_path_profile_fields(row=self._path_profile_selected_row)
 
     def _add_path_profile(self) -> None:
-        self._commit_selected_path_profile_fields()
+        self._commit_selected_path_profile_fields(row=self._path_profile_selected_row)
         count = len(self._path_profiles)
-        if count <= 0:
-            new_profile = self._default_path_profile()
-        else:
-            current_row = self.paths_profile_list.currentRow()
-            if current_row < 0 or current_row >= count:
-                current_row = self._active_path_profile_index
-            source = self._path_profiles[current_row]
-            new_profile = {
-                "name": f"Profile {count + 1}",
-                "game_path": source.get("game_path", ""),
-                "downloads_path": source.get("downloads_path", ""),
-                "dof_path": source.get("dof_path", ""),
-            }
+        new_profile = {
+            "name": f"Profile {count + 1}",
+            "game_path": "",
+            "downloads_path": "",
+            "dof_path": "",
+        }
         self._path_profiles.append(new_profile)
         self._refresh_paths_profile_widgets(selected_index=len(self._path_profiles) - 1)
 
-    def _remove_path_profile(self) -> None:
-        if len(self._path_profiles) <= 1:
-            QMessageBox.information(
-                self,
-                "Profile Required",
-                "At least one path profile must remain.",
-            )
+    def _duplicate_selected_path_profile(self) -> None:
+        self._commit_selected_path_profile_fields(row=self._path_profile_selected_row)
+        if not self._path_profiles:
             return
+        row = self.paths_profile_list.currentRow()
+        if row < 0 or row >= len(self._path_profiles):
+            row = self._active_path_profile_index
+        source = self._path_profiles[row]
+        dup_index = len(self._path_profiles) + 1
+        duplicate = {
+            "name": f"{self._sanitize_path_value(source.get('name')) or f'Profile {row + 1}'} Copy",
+            "game_path": self._sanitize_path_value(source.get("game_path")),
+            "downloads_path": self._sanitize_path_value(source.get("downloads_path")),
+            "dof_path": self._sanitize_path_value(source.get("dof_path")),
+        }
+        if not duplicate["name"].strip():
+            duplicate["name"] = f"Profile {dup_index}"
+        self._path_profiles.append(duplicate)
+        self._refresh_paths_profile_widgets(selected_index=len(self._path_profiles) - 1)
+
+    def _remove_path_profile(self) -> None:
         row = self.paths_profile_list.currentRow()
         if row < 0 or row >= len(self._path_profiles):
             return
         del self._path_profiles[row]
-        if self._active_path_profile_index >= len(self._path_profiles):
-            self._active_path_profile_index = len(self._path_profiles) - 1
-        elif row < self._active_path_profile_index:
-            self._active_path_profile_index -= 1
-        selected_index = min(row, len(self._path_profiles) - 1)
+        if not self._path_profiles:
+            self._active_path_profile_index = -1
+            selected_index = -1
+        else:
+            if row < self._active_path_profile_index:
+                self._active_path_profile_index -= 1
+            elif row == self._active_path_profile_index:
+                self._active_path_profile_index = min(row, len(self._path_profiles) - 1)
+            if self._active_path_profile_index < 0:
+                self._active_path_profile_index = 0
+            selected_index = min(row, len(self._path_profiles) - 1)
         self._refresh_paths_profile_widgets(selected_index=selected_index)
 
     def _browse_path_profile_game_path(self) -> None:
@@ -901,11 +980,48 @@ class SettingsDialog(QDialog):
             return
         self.paths_dof_path_edit.setText(folder)
 
-    def _save_path_profiles_to_settings(self) -> None:
+    def _request_monster_name_rosetta_regeneration(self) -> None:
+        """Queue a runtime rosetta regeneration after settings are saved."""
+        self.monster_name_rosetta_regenerate_requested = True
+        if hasattr(self, "monster_name_status_label"):
+            self.monster_name_status_label.setText(
+                "Rosetta regeneration queued. Click Save to run it."
+            )
+            self.monster_name_status_label.setStyleSheet("color: #4da3ff; font-size: 9pt;")
+
+    def _update_monster_name_rosetta_controls(self) -> None:
+        """Refresh monster-name settings helper text and control state."""
+        if not hasattr(self, "monster_name_auto_refresh_check"):
+            return
+        enabled = self.monster_name_auto_refresh_check.isChecked()
+        if hasattr(self, "monster_name_regenerate_btn"):
+            self.monster_name_regenerate_btn.setEnabled(True)
+        if hasattr(self, "monster_name_status_label"):
+            if self.monster_name_rosetta_regenerate_requested:
+                self.monster_name_status_label.setText(
+                    "Rosetta regeneration queued. Click Save to run it."
+                )
+                self.monster_name_status_label.setStyleSheet("color: #4da3ff; font-size: 9pt;")
+            elif enabled:
+                self.monster_name_status_label.setText(
+                    "Auto-refresh is enabled. Runtime cache: ~/.cache/MSMAnimationViewer/rosetta"
+                )
+                self.monster_name_status_label.setStyleSheet("color: gray; font-size: 9pt;")
+            else:
+                self.monster_name_status_label.setText(
+                    "Auto-refresh is disabled. Viewer will use bundled rosetta unless you regenerate manually."
+                )
+                self.monster_name_status_label.setStyleSheet("color: gray; font-size: 9pt;")
+
+    def _save_path_profiles_to_settings(self) -> bool:
         self._commit_selected_path_profile_fields()
         if not self._path_profiles:
-            self._path_profiles = [self._default_path_profile()]
-            self._active_path_profile_index = 0
+            QMessageBox.warning(
+                self,
+                "Path Profiles Required",
+                "Create at least one path profile before saving Settings.",
+            )
+            return False
 
         if self._active_path_profile_index < 0:
             self._active_path_profile_index = 0
@@ -928,6 +1044,7 @@ class SettingsDialog(QDialog):
         active_game = self._sanitize_path_value(active.get("game_path", ""))
         self._game_path_str = active_game
         self.game_path = Path(active_game) if active_game else None
+        return True
 
     def _sync_dof_particle_cap_slider(self, value: int) -> None:
         if not hasattr(self, "dof_particle_cap_slider"):
@@ -1725,7 +1842,7 @@ class SettingsDialog(QDialog):
         self.dof_bundle_anim_edit = QLineEdit()
         self.dof_bundle_anim_edit.setPlaceholderText("e.g. A_tweedle_adult_03_cloud_01.ANIMBBB")
         self.dof_bundle_anim_edit.setToolTip(
-            "Required when converting a Unity bundle (__data) instead of a .ANIMBBB.asset."
+            "Required when converting a Unity bundle (__data/.unity3d) instead of a .ANIMBBB.asset."
         )
         dof_form.addRow("Bundle ANIMBBB:", self.dof_bundle_anim_edit)
 
@@ -1950,7 +2067,7 @@ class SettingsDialog(QDialog):
         dof_input_row = QHBoxLayout()
         self.dof_deploy_input_edit = QLineEdit()
         self.dof_deploy_input_edit.setPlaceholderText(
-            "Select a .ANIMBBB asset, __data bundle, or bundle://Name"
+            "Select a .ANIMBBB asset, __data/.unity3d bundle, or bundle://Name"
         )
         dof_input_row.addWidget(self.dof_deploy_input_edit)
         self.dof_deploy_input_browse = QPushButton("Browse...")
@@ -2600,6 +2717,43 @@ class SettingsDialog(QDialog):
         file_browser_group.setLayout(file_browser_layout)
         app_layout.addWidget(file_browser_group)
 
+        monster_name_group = QGroupBox("Monster Name Library")
+        monster_name_layout = QVBoxLayout()
+        self.monster_name_auto_refresh_check = QCheckBox(
+            "Auto-refresh from game dat/xml files on startup"
+        )
+        self.monster_name_auto_refresh_check.setToolTip(
+            "When enabled, the viewer scans configured downloads paths for monster_data, "
+            "gene_data, and island_data, then regenerates the name rosetta cache as needed."
+        )
+        self.monster_name_auto_refresh_check.toggled.connect(
+            self._update_monster_name_rosetta_controls
+        )
+        monster_name_layout.addWidget(self.monster_name_auto_refresh_check)
+
+        monster_name_actions_row = QHBoxLayout()
+        self.monster_name_regenerate_btn = QPushButton("Regenerate Rosetta Now")
+        self.monster_name_regenerate_btn.setToolTip(
+            "Regenerate the runtime monster name rosetta from detected game dat/xml files "
+            "after you click Save."
+        )
+        self.monster_name_regenerate_btn.clicked.connect(
+            self._request_monster_name_rosetta_regeneration
+        )
+        monster_name_actions_row.addWidget(self.monster_name_regenerate_btn)
+        monster_name_actions_row.addStretch(1)
+        monster_name_layout.addLayout(monster_name_actions_row)
+
+        self.monster_name_status_label = QLabel(
+            "Runtime cache location: ~/.cache/MSMAnimationViewer/rosetta"
+        )
+        self.monster_name_status_label.setWordWrap(True)
+        self.monster_name_status_label.setStyleSheet("color: gray; font-size: 9pt;")
+        monster_name_layout.addWidget(self.monster_name_status_label)
+
+        monster_name_group.setLayout(monster_name_layout)
+        app_layout.addWidget(monster_name_group)
+
         bin_group = QGroupBox("BIN Export")
         bin_layout = QVBoxLayout()
         self.update_source_json_check = QCheckBox("Update original JSON when saving animations")
@@ -2683,7 +2837,9 @@ class SettingsDialog(QDialog):
 
         hint = QLabel(
             "Create reusable path profiles for Game, Downloads, and DOF roots. "
-            "The active profile is used by the viewer and toolbar path buttons."
+            "The active profile is used by the viewer and toolbar path buttons. "
+            "Select a profile and click Set Selected Active (or double-click it) to switch quickly. "
+            "You can clear all profiles, but Settings cannot be saved until one exists."
         )
         hint.setWordWrap(True)
         hint.setStyleSheet("color: gray; font-size: 9pt;")
@@ -2693,24 +2849,32 @@ class SettingsDialog(QDialog):
         profile_layout = QVBoxLayout()
 
         active_row = QHBoxLayout()
-        active_row.addWidget(QLabel("Active Profile:"))
-        self.paths_active_profile_combo = QComboBox()
-        self.paths_active_profile_combo.currentIndexChanged.connect(
-            self._on_paths_active_profile_changed
-        )
-        active_row.addWidget(self.paths_active_profile_combo, 1)
+        active_row.addWidget(QLabel("Current Active:"))
+        self.paths_active_profile_value_label = QLabel("")
+        self.paths_active_profile_value_label.setStyleSheet("font-weight: 600;")
+        self.paths_active_profile_value_label.setWordWrap(True)
+        active_row.addWidget(self.paths_active_profile_value_label, 1)
+        self.paths_set_active_btn = QPushButton("Set Selected Active")
+        self.paths_set_active_btn.clicked.connect(self._set_selected_path_profile_active)
+        active_row.addWidget(self.paths_set_active_btn)
         profile_layout.addLayout(active_row)
 
         list_row = QHBoxLayout()
         self.paths_profile_list = QListWidget()
         self.paths_profile_list.setMinimumHeight(130)
         self.paths_profile_list.currentRowChanged.connect(self._on_paths_profile_selected)
+        self.paths_profile_list.itemDoubleClicked.connect(
+            lambda _item: self._set_selected_path_profile_active()
+        )
         list_row.addWidget(self.paths_profile_list, 1)
 
         side_buttons = QVBoxLayout()
-        self.paths_add_profile_btn = QPushButton("Add")
+        self.paths_add_profile_btn = QPushButton("Add Blank")
         self.paths_add_profile_btn.clicked.connect(self._add_path_profile)
         side_buttons.addWidget(self.paths_add_profile_btn)
+        self.paths_duplicate_profile_btn = QPushButton("Duplicate")
+        self.paths_duplicate_profile_btn.clicked.connect(self._duplicate_selected_path_profile)
+        side_buttons.addWidget(self.paths_duplicate_profile_btn)
         self.paths_remove_profile_btn = QPushButton("Remove")
         self.paths_remove_profile_btn.clicked.connect(self._remove_path_profile)
         side_buttons.addWidget(self.paths_remove_profile_btn)
@@ -3228,6 +3392,11 @@ class SettingsDialog(QDialog):
             self.dof_particle_sensitivity_spin.setValue(particle_sensitivity_value)
             self._sync_dof_particle_sensitivity_slider(particle_sensitivity_value)
         self.barebones_browser_check.setChecked(self.export_settings.use_barebones_file_browser)
+        if hasattr(self, "monster_name_auto_refresh_check"):
+            self.monster_name_auto_refresh_check.setChecked(
+                self.app_settings.value("monster_name/auto_refresh_from_dat", True, type=bool)
+            )
+            self._update_monster_name_rosetta_controls()
         self.anchor_debug_check.setChecked(self.export_settings.anchor_debug_logging)
         self.update_source_json_check.setChecked(getattr(self.export_settings, 'update_source_json_on_save', False))
         
@@ -3344,6 +3513,28 @@ class SettingsDialog(QDialog):
                 self.dof_bundle_anim_edit.setText(
                     self.app_settings.value("dof/bundle_anim_name", "", type=str) or ""
                 )
+            if hasattr(self, "dof_remote_base_url_edit"):
+                remote_base = self.app_settings.value(
+                    "dof/remote_base_url",
+                    DEFAULT_DOF_CDN_BASE_URL,
+                    type=str,
+                ) or DEFAULT_DOF_CDN_BASE_URL
+                self.dof_remote_base_url_edit.setText(
+                    normalize_dof_cdn_base_url(remote_base)
+                )
+                remote_platform = normalize_dof_bundle_platform(
+                    self.app_settings.value("dof/remote_platform", "ios", type=str) or "ios"
+                )
+                remote_platform_index = self.dof_remote_platform_combo.findData(remote_platform)
+                if remote_platform_index < 0:
+                    remote_platform_index = 0
+                self.dof_remote_platform_combo.setCurrentIndex(remote_platform_index)
+                self._populate_dof_remote_build_keys(
+                    preferred_key=self.app_settings.value("dof/remote_build_key", "", type=str) or ""
+                )
+                self._dof_remote_manifest_entries = []
+                self._dof_remote_manifest_url = ""
+                self._refresh_dof_remote_manifest_list()
             self._refresh_dof_input_options()
         if hasattr(self, "bin_copy_xml_check"):
             self.bin_copy_xml_check.setChecked(
@@ -3829,6 +4020,10 @@ class SettingsDialog(QDialog):
             if idx >= 0:
                 self.dof_sprite_shader_mode_combo.setCurrentIndex(idx)
         self.barebones_browser_check.setChecked(False)
+        if hasattr(self, "monster_name_auto_refresh_check"):
+            self.monster_name_auto_refresh_check.setChecked(True)
+            self.monster_name_rosetta_regenerate_requested = False
+            self._update_monster_name_rosetta_controls()
         self.update_source_json_check.setChecked(False)
         
         # PSD
@@ -3935,6 +4130,15 @@ class SettingsDialog(QDialog):
         if self.ffmpeg_install_running:
             QMessageBox.warning(self, "FFmpeg Installation",
                                 "Please wait for the FFmpeg install to finish.")
+            return
+        self._commit_selected_path_profile_fields(row=self._path_profile_selected_row)
+        if not self._path_profiles:
+            QMessageBox.warning(
+                self,
+                "Path Profiles Required",
+                "Create at least one path profile before saving Settings.",
+            )
+            self.set_active_tab("Paths")
             return
         # PNG
         self.export_settings.png_compression = self.png_compression_spin.value()
@@ -4107,6 +4311,11 @@ class SettingsDialog(QDialog):
                 float(self.dof_particle_sensitivity_spin.value()),
             )
         self.export_settings.use_barebones_file_browser = self.barebones_browser_check.isChecked()
+        if hasattr(self, "monster_name_auto_refresh_check"):
+            self.app_settings.setValue(
+                "monster_name/auto_refresh_from_dat",
+                self.monster_name_auto_refresh_check.isChecked(),
+            )
         self.export_settings.anchor_debug_logging = self.anchor_debug_check.isChecked()
         self.export_settings.update_source_json_on_save = self.update_source_json_check.isChecked()
 
@@ -4162,6 +4371,25 @@ class SettingsDialog(QDialog):
             )
             if hasattr(self, "dof_bundle_anim_edit"):
                 self.app_settings.setValue("dof/bundle_anim_name", self.dof_bundle_anim_edit.text().strip())
+            if hasattr(self, "dof_remote_base_url_edit"):
+                self.app_settings.setValue(
+                    "dof/remote_base_url",
+                    normalize_dof_cdn_base_url(self.dof_remote_base_url_edit.text()),
+                )
+                self.app_settings.setValue(
+                    "dof/remote_platform",
+                    normalize_dof_bundle_platform(
+                        str(self.dof_remote_platform_combo.currentData() or "ios")
+                    ),
+                )
+                self.app_settings.setValue(
+                    "dof/remote_build_key",
+                    self._current_dof_remote_build_key(),
+                )
+                self.app_settings.setValue(
+                    "dof/remote_build_history_json",
+                    json.dumps(self._read_dof_remote_build_history()),
+                )
         if hasattr(self, "bin_copy_xml_check"):
             self.app_settings.setValue(
                 "bin_converter/copy_xml_resources",
@@ -4243,7 +4471,9 @@ class SettingsDialog(QDialog):
         self.app_settings.setValue("shaders/overrides", overrides_blob)
         self.shader_registry.set_user_overrides(shader_overrides)
 
-        self._save_path_profiles_to_settings()
+        if not self._save_path_profiles_to_settings():
+            self.set_active_tab("Paths")
+            return
         self._save_keybind_settings()
         self.export_settings.save()
         self._save_diagnostics_settings()
@@ -4511,6 +4741,242 @@ class SettingsDialog(QDialog):
         stored = stored.strip()
         return stored or None
 
+    def _current_dof_remote_build_key(self) -> str:
+        if not hasattr(self, "dof_remote_build_key_combo"):
+            return ""
+        text = self.dof_remote_build_key_combo.currentText()
+        return str(text or "").strip()
+
+    def _read_dof_remote_build_history(self) -> List[Dict[str, str]]:
+        raw = self.app_settings.value("dof/remote_build_history_json", "", type=str) or ""
+        if not raw:
+            return []
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            return []
+        if not isinstance(parsed, list):
+            return []
+        history: List[Dict[str, str]] = []
+        seen: set[str] = set()
+        for entry in parsed:
+            if not isinstance(entry, dict):
+                continue
+            build_key = str(entry.get("build_key") or "").strip()
+            if not build_key:
+                continue
+            platform = normalize_dof_bundle_platform(entry.get("platform"))
+            dedupe_key = f"{build_key}|{platform}"
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            history.append({"build_key": build_key, "platform": platform})
+        return history
+
+    def _write_dof_remote_build_history(self, history: List[Dict[str, str]]) -> None:
+        try:
+            self.app_settings.setValue("dof/remote_build_history_json", json.dumps(history))
+        except Exception:
+            return
+
+    def _populate_dof_remote_build_keys(self, preferred_key: str = "") -> None:
+        if not hasattr(self, "dof_remote_build_key_combo"):
+            return
+        combo = self.dof_remote_build_key_combo
+        previous_text = preferred_key.strip() or combo.currentText().strip()
+        history = self._read_dof_remote_build_history()
+        keys: List[str] = []
+        seen: set[str] = set()
+        if previous_text:
+            keys.append(previous_text)
+            seen.add(previous_text.lower())
+        for item in history:
+            build_key = item.get("build_key", "").strip()
+            if not build_key:
+                continue
+            marker = build_key.lower()
+            if marker in seen:
+                continue
+            seen.add(marker)
+            keys.append(build_key)
+
+        combo.blockSignals(True)
+        combo.clear()
+        for key in keys:
+            combo.addItem(key, key)
+        combo.blockSignals(False)
+        combo.setEditText(previous_text)
+
+    def _remember_dof_remote_build_key(self, build_key: str, platform: str) -> None:
+        build_key_clean = str(build_key or "").strip()
+        if not build_key_clean:
+            return
+        platform_clean = normalize_dof_bundle_platform(platform)
+        existing = self._read_dof_remote_build_history()
+        updated: List[Dict[str, str]] = [{"build_key": build_key_clean, "platform": platform_clean}]
+        for entry in existing:
+            key = str(entry.get("build_key") or "").strip()
+            plat = normalize_dof_bundle_platform(entry.get("platform"))
+            if not key:
+                continue
+            if key == build_key_clean and plat == platform_clean:
+                continue
+            updated.append({"build_key": key, "platform": plat})
+        updated = updated[:30]
+        self._write_dof_remote_build_history(updated)
+        self._populate_dof_remote_build_keys(preferred_key=build_key_clean)
+
+    def _refresh_dof_remote_manifest_list(self) -> None:
+        if not hasattr(self, "dof_remote_bundle_list"):
+            return
+        checked_names = set(self._iter_checked_dof_remote_bundle_names())
+        staticinfo_only = bool(
+            getattr(self, "dof_remote_staticinfo_only_check", None)
+            and self.dof_remote_staticinfo_only_check.isChecked()
+        )
+        self.dof_remote_bundle_list.clear()
+        visible_count = 0
+        for entry in self._dof_remote_manifest_entries:
+            if staticinfo_only and not entry.name.lower().startswith("staticinfo_"):
+                continue
+            label = f"{entry.name}  ({self._format_dof_remote_bundle_size(entry.size)})"
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, entry.name)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            is_checked = entry.name in checked_names or (not checked_names and entry.name.lower().startswith("staticinfo_"))
+            item.setCheckState(Qt.CheckState.Checked if is_checked else Qt.CheckState.Unchecked)
+            self.dof_remote_bundle_list.addItem(item)
+            visible_count += 1
+        if visible_count == 0:
+            placeholder = QListWidgetItem("No bundles loaded")
+            placeholder.setFlags(placeholder.flags() & ~Qt.ItemFlag.ItemIsEnabled)
+            self.dof_remote_bundle_list.addItem(placeholder)
+
+    def _iter_checked_dof_remote_bundle_names(self) -> List[str]:
+        if not hasattr(self, "dof_remote_bundle_list"):
+            return []
+        names: List[str] = []
+        for index in range(self.dof_remote_bundle_list.count()):
+            item = self.dof_remote_bundle_list.item(index)
+            if item is None:
+                continue
+            bundle_name = item.data(Qt.ItemDataRole.UserRole)
+            if not bundle_name:
+                continue
+            if item.checkState() == Qt.CheckState.Checked:
+                names.append(str(bundle_name))
+        return names
+
+    @staticmethod
+    def _format_dof_remote_bundle_size(size: int) -> str:
+        if size <= 0:
+            return "unknown size"
+        value = float(size)
+        for suffix in ("B", "KB", "MB", "GB"):
+            if value < 1024.0 or suffix == "GB":
+                if suffix == "B":
+                    return f"{int(value)} {suffix}"
+                return f"{value:.2f} {suffix}"
+            value /= 1024.0
+        return f"{size} B"
+
+    def _load_dof_remote_manifest(self) -> None:
+        base_url = normalize_dof_cdn_base_url(
+            self.dof_remote_base_url_edit.text()
+            if hasattr(self, "dof_remote_base_url_edit")
+            else DEFAULT_DOF_CDN_BASE_URL
+        )
+        build_key = self._current_dof_remote_build_key()
+        platform = normalize_dof_bundle_platform(
+            str(self.dof_remote_platform_combo.currentData() or "ios")
+        )
+        if not build_key:
+            QMessageBox.warning(self, "Missing Build Key", "Enter a DOF build key first.")
+            return
+        try:
+            manifest_url, entries = fetch_dof_bundle_manifest(
+                base_url=base_url,
+                build_key=build_key,
+                platform=platform,
+            )
+        except DofBundleRemoteError as exc:
+            self._log_bin_convert(str(exc), "ERROR")
+            QMessageBox.warning(self, "Manifest Load Failed", str(exc))
+            return
+
+        self._dof_remote_manifest_url = manifest_url
+        self._dof_remote_manifest_entries = entries
+        self._refresh_dof_remote_manifest_list()
+        self._remember_dof_remote_build_key(build_key, platform)
+        self.app_settings.setValue("dof/remote_base_url", base_url)
+        self.app_settings.setValue("dof/remote_platform", platform)
+        self.app_settings.setValue("dof/remote_build_key", build_key)
+        self._log_bin_convert(
+            f"Loaded {len(entries)} bundles from {manifest_url}",
+            "SUCCESS",
+        )
+
+    def _download_dof_remote_manifest_entries(self, download_all: bool) -> None:
+        if not self._dof_remote_manifest_entries:
+            QMessageBox.information(self, "No Manifest Loaded", "Load a manifest first.")
+            return
+        base_url = normalize_dof_cdn_base_url(
+            self.dof_remote_base_url_edit.text() if hasattr(self, "dof_remote_base_url_edit") else ""
+        )
+        build_key = self._current_dof_remote_build_key()
+        platform = normalize_dof_bundle_platform(
+            str(self.dof_remote_platform_combo.currentData() or "ios")
+        )
+        if not build_key:
+            QMessageBox.warning(self, "Missing Build Key", "Enter a DOF build key first.")
+            return
+        target_root = self._resolve_dof_remote_download_root()
+        if not target_root:
+            return
+        target_dir = os.path.join(target_root, "remote_dlc", build_key, platform)
+        selected = None if download_all else self._iter_checked_dof_remote_bundle_names()
+        if selected is not None and not selected:
+            QMessageBox.information(self, "No Bundles Selected", "Check at least one bundle to download.")
+            return
+        try:
+            downloaded = download_dof_bundles(
+                self._dof_remote_manifest_entries,
+                target_dir=target_dir,
+                selected_names=selected,
+                skip_existing=True,
+            )
+        except DofBundleRemoteError as exc:
+            self._log_bin_convert(str(exc), "ERROR")
+            QMessageBox.warning(self, "Download Failed", str(exc))
+            return
+
+        self._remember_dof_remote_build_key(build_key, platform)
+        self.app_settings.setValue("dof/remote_base_url", base_url)
+        self.app_settings.setValue("dof/remote_platform", platform)
+        self.app_settings.setValue("dof/remote_build_key", build_key)
+        self._log_bin_convert(
+            f"Downloaded/verified {len(downloaded)} bundles to {target_dir}",
+            "SUCCESS",
+        )
+        self._refresh_dof_input_options(force=True)
+
+    def _resolve_dof_remote_download_root(self) -> Optional[str]:
+        root = self._get_dof_assets_root()
+        if root and os.path.isdir(root):
+            return root
+        start_dir = root or self.app_settings.value("dof_path", "", type=str) or str(Path.home())
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Select DOF Assets Root For Remote Bundles",
+            str(start_dir),
+        )
+        if not folder:
+            return None
+        if hasattr(self, "dof_assets_root_edit"):
+            self.dof_assets_root_edit.setText(folder)
+        self.app_settings.setValue("dof_path", folder)
+        return folder
+
     def _suggest_dof_output_dir(self, input_path: str) -> Optional[str]:
         if not input_path:
             return None
@@ -4539,7 +5005,7 @@ class SettingsDialog(QDialog):
     def _browse_bin_convert_input(self) -> None:
         mode = self.bin_convert_mode_combo.currentData()
         if mode == "dof_to_json":
-            filter_text = "DOF ANIMBBB (*.ANIMBBB.asset *.animbbb.asset);;All Files (*)"
+            filter_text = "DOF Input (*.ANIMBBB.asset *.animbbb.asset *.unity3d __data);;All Files (*)"
         elif mode == "json_to_bin":
             filter_text = "Animation JSON (*.json);;All Files (*)"
         else:
@@ -4820,7 +5286,7 @@ class SettingsDialog(QDialog):
             bundle_anim = getattr(self, "dof_bundle_anim_edit", None)
             bundle_anim = bundle_anim.text().strip() if bundle_anim else ""
             if not bundle_anim:
-                self._log_bin_convert("Bundle ANIMBBB name is required for __data bundle inputs.", "ERROR")
+                self._log_bin_convert("Bundle ANIMBBB name is required for __data/.unity3d bundle inputs.", "ERROR")
                 QMessageBox.warning(
                     self,
                     "Missing Bundle Name",
@@ -5689,11 +6155,16 @@ class SettingsDialog(QDialog):
     def _find_unity_bundle_data_files(self, root: str) -> List[str]:
         data_files: List[str] = []
         for base, _, files in os.walk(root):
-            if "__data" not in files:
-                continue
-            candidate = os.path.join(base, "__data")
-            if self._is_unity_bundle_file(candidate):
-                data_files.append(candidate)
+            candidates: List[str] = []
+            if "__data" in files:
+                candidates.append(os.path.join(base, "__data"))
+            for name in files:
+                if not name.lower().endswith(".unity3d"):
+                    continue
+                candidates.append(os.path.join(base, name))
+            for candidate in candidates:
+                if self._is_unity_bundle_file(candidate):
+                    data_files.append(candidate)
         return data_files
 
     def _copy_xml_resources_from_json(self, json_path: str, output_bin_path: str) -> None:
@@ -6830,7 +7301,7 @@ class SettingsDialog(QDialog):
             bundle_anim = getattr(self, "dof_bundle_anim_edit", None)
             bundle_anim = bundle_anim.text().strip() if bundle_anim else ""
             if not bundle_anim:
-                self._log_dof_deploy("Bundle ANIMBBB name is required for __data inputs.", "ERROR")
+                self._log_dof_deploy("Bundle ANIMBBB name is required for __data/.unity3d inputs.", "ERROR")
                 QMessageBox.warning(
                     self,
                     "Missing Bundle Name",

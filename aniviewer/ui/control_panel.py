@@ -12,7 +12,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QSize, QTimer
 from PyQt6.QtGui import QPixmap
-from typing import Any, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple, Optional
 
 
 class FullscreenSafeComboBox(QComboBox):
@@ -44,6 +44,7 @@ class ControlPanel(QWidget):
     bin_selected = pyqtSignal(int)
     convert_bin_clicked = pyqtSignal()
     convert_dof_clicked = pyqtSignal()
+    dof_asset_grabber_clicked = pyqtSignal()
     refresh_files_clicked = pyqtSignal()
     animation_selected = pyqtSignal(int)
     costume_selected = pyqtSignal(int)
@@ -66,6 +67,9 @@ class ControlPanel(QWidget):
     export_mp4_clicked = pyqtSignal()
     export_webm_clicked = pyqtSignal()
     export_gif_clicked = pyqtSignal()
+    export_layer_pass_auto_assign_requested = pyqtSignal()
+    export_layer_pass_auto_strict_requested = pyqtSignal()
+    export_layer_pass_auto_blend_requested = pyqtSignal()
     credits_clicked = pyqtSignal()
     file_search_changed = pyqtSignal(str)
     monster_browser_requested = pyqtSignal()
@@ -158,20 +162,34 @@ class ControlPanel(QWidget):
     joint_solver_bake_current_requested = pyqtSignal()
     joint_solver_bake_range_requested = pyqtSignal()
     compact_ui_toggled = pyqtSignal(bool)
+    section_changed = pyqtSignal(str)
     
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._bin_convert_label = "Convert BIN to JSON"
+        self._dof_convert_label = "Convert DOF to JSON"
+        self._bin_convert_active = False
+        self._dof_convert_active = False
+        self._bin_convert_busy_label_override: Optional[str] = None
+        self._dof_convert_busy_label_override: Optional[str] = None
+        self._convert_anim_index = 0
+        self._convert_anim_timer = QTimer(self)
+        self._convert_anim_timer.setInterval(350)
+        self._convert_anim_timer.timeout.connect(self._on_convert_anim_tick)
 
         self.section_tabs = QTabWidget()
         self.section_tabs.setDocumentMode(True)
         self.section_tabs.setTabPosition(QTabWidget.TabPosition.North)
         self.section_tabs.setMovable(False)
         self._section_layouts = {}
+        self._section_tab_keys: List[str] = []
         self._build_section_tabs()
+        self.section_tabs.currentChanged.connect(self._on_section_tab_changed)
 
         self.init_ui()
         self._updating_constraints_list = False
         self._compact_ui_enabled = False
+        self._export_layer_pass_rows: Dict[int, Dict[str, Any]] = {}
 
         # Set up the main layout
         container_layout = QVBoxLayout(self)
@@ -220,6 +238,30 @@ class ControlPanel(QWidget):
             scroll.setWidget(content)
             self.section_tabs.addTab(scroll, label)
             self._section_layouts[key] = layout
+            self._section_tab_keys.append(key)
+
+    def _on_section_tab_changed(self, index: int) -> None:
+        key = self.section_key_at(index)
+        if key:
+            self.section_changed.emit(key)
+
+    def section_key_at(self, index: int) -> str:
+        if index < 0 or index >= len(self._section_tab_keys):
+            return ""
+        return self._section_tab_keys[index]
+
+    def current_section_key(self) -> str:
+        return self.section_key_at(self.section_tabs.currentIndex())
+
+    def set_active_section(self, key: str) -> bool:
+        normalized = str(key or "").strip().lower()
+        if not normalized:
+            return False
+        for idx, candidate in enumerate(self._section_tab_keys):
+            if candidate == normalized:
+                self.section_tabs.setCurrentIndex(idx)
+                return True
+        return False
     
     def init_ui(self):
         """Initialize the UI"""
@@ -270,14 +312,20 @@ class ControlPanel(QWidget):
         self.dof_search_toggle.toggled.connect(self.dof_search_toggled.emit)
         barebones_layout.addWidget(self.dof_search_toggle)
         
-        self.convert_bin_btn = QPushButton("Convert BIN to JSON")
+        self.convert_bin_btn = QPushButton(self._bin_convert_label)
         self.convert_bin_btn.clicked.connect(self.convert_bin_clicked.emit)
         barebones_layout.addWidget(self.convert_bin_btn)
 
-        self._dof_convert_label = "Convert DOF to JSON"
         self.convert_dof_btn = QPushButton(self._dof_convert_label)
         self.convert_dof_btn.clicked.connect(self.convert_dof_clicked.emit)
         barebones_layout.addWidget(self.convert_dof_btn)
+
+        self.dof_asset_grabber_btn = QPushButton("Dawn of Fire Asset Grabber")
+        self.dof_asset_grabber_btn.setToolTip(
+            "Open remote DOF bundle downloader controls."
+        )
+        self.dof_asset_grabber_btn.clicked.connect(self.dof_asset_grabber_clicked.emit)
+        barebones_layout.addWidget(self.dof_asset_grabber_btn)
 
         self.dof_mesh_pivot_checkbox = QCheckBox("DOF: Use pivot-local mesh vertices")
         self.dof_mesh_pivot_checkbox.setToolTip(
@@ -1435,6 +1483,74 @@ class ControlPanel(QWidget):
             self.export_include_viewport_bg_changed.emit
         )
         export_layout.addWidget(self.export_include_viewport_bg_checkbox)
+
+        self.export_layer_pass_enable_checkbox = QCheckBox("Enable Layer Pass Assignments (Optional)")
+        self.export_layer_pass_enable_checkbox.setToolTip(
+            "Assign each layer to an export pass. Pass 1 is default when disabled."
+        )
+        self.export_layer_pass_enable_checkbox.toggled.connect(
+            self._on_export_layer_pass_toggled
+        )
+        export_layout.addWidget(self.export_layer_pass_enable_checkbox)
+
+        pass_button_row = QHBoxLayout()
+        pass_button_row.setSpacing(6)
+        self.export_layer_pass_auto_btn = QPushButton("Auto Assign (Hierarchy)")
+        self.export_layer_pass_auto_btn.setToolTip(
+            "Set pass numbers from hierarchy with draw-order-safe grouping "
+            "(prevents later layers from falling behind earlier passes)."
+        )
+        self.export_layer_pass_auto_btn.clicked.connect(
+            self.export_layer_pass_auto_assign_requested.emit
+        )
+        pass_button_row.addWidget(self.export_layer_pass_auto_btn)
+
+        self.export_layer_pass_auto_strict_btn = QPushButton("Auto Assign (Strict)")
+        self.export_layer_pass_auto_strict_btn.setToolTip(
+            "Give every layer its own pass in draw order (safest for compositing)."
+        )
+        self.export_layer_pass_auto_strict_btn.clicked.connect(
+            self.export_layer_pass_auto_strict_requested.emit
+        )
+        pass_button_row.addWidget(self.export_layer_pass_auto_strict_btn)
+
+        self.export_layer_pass_auto_blend_btn = QPushButton("Auto Assign (Blend-Smart)")
+        self.export_layer_pass_auto_blend_btn.setToolTip(
+            "Isolate risky blend layers and keep front/back order safe for compositing."
+        )
+        self.export_layer_pass_auto_blend_btn.clicked.connect(
+            self.export_layer_pass_auto_blend_requested.emit
+        )
+        pass_button_row.addWidget(self.export_layer_pass_auto_blend_btn)
+        pass_button_row.addStretch()
+        export_layout.addLayout(pass_button_row)
+
+        self.export_layer_pass_hint_label = QLabel(
+            "Assign a pass number for each layer. Exports can output one file per pass."
+        )
+        self.export_layer_pass_hint_label.setStyleSheet("color: gray; font-size: 8pt;")
+        self.export_layer_pass_hint_label.setWordWrap(True)
+        export_layout.addWidget(self.export_layer_pass_hint_label)
+
+        self.export_layer_pass_scroll = QScrollArea()
+        self.export_layer_pass_scroll.setWidgetResizable(True)
+        self.export_layer_pass_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.export_layer_pass_scroll.setMinimumHeight(180)
+        self.export_layer_pass_scroll.setMaximumHeight(280)
+        self.export_layer_pass_widget = QWidget()
+        self.export_layer_pass_layout = QVBoxLayout(self.export_layer_pass_widget)
+        self.export_layer_pass_layout.setContentsMargins(4, 4, 4, 4)
+        self.export_layer_pass_layout.setSpacing(4)
+        self.export_layer_pass_empty_label = QLabel("Load a monster to assign export passes.")
+        self.export_layer_pass_empty_label.setStyleSheet("color: gray; font-size: 8pt;")
+        self.export_layer_pass_empty_label.setWordWrap(True)
+        self.export_layer_pass_layout.addWidget(self.export_layer_pass_empty_label)
+        self.export_layer_pass_layout.addStretch()
+        self.export_layer_pass_scroll.setWidget(self.export_layer_pass_widget)
+        export_layout.addWidget(self.export_layer_pass_scroll)
+        self._on_export_layer_pass_toggled(False)
         
         export_group.setLayout(export_layout)
         export_section.addWidget(export_group)
@@ -1803,6 +1919,7 @@ class ControlPanel(QWidget):
         self.set_solid_bg_color(self._solid_bg_color)
         self.set_viewport_bg_color_mode("none")
         self.set_export_include_viewport_bg(False)
+        self.set_export_layer_pass_enabled(False)
         self.set_viewport_bg_image("", False)
         self.set_viewport_bg_keep_aspect(True)
         self.set_viewport_bg_zoom_fill(False)
@@ -2158,6 +2275,135 @@ class ControlPanel(QWidget):
         self.export_include_viewport_bg_checkbox.blockSignals(True)
         self.export_include_viewport_bg_checkbox.setChecked(bool(enabled))
         self.export_include_viewport_bg_checkbox.blockSignals(False)
+
+    def _on_export_layer_pass_toggled(self, enabled: bool):
+        self.export_layer_pass_scroll.setEnabled(bool(enabled))
+
+    def set_export_layer_pass_enabled(self, enabled: bool):
+        self.export_layer_pass_enable_checkbox.blockSignals(True)
+        self.export_layer_pass_enable_checkbox.setChecked(bool(enabled))
+        self.export_layer_pass_enable_checkbox.blockSignals(False)
+        self._on_export_layer_pass_toggled(bool(enabled))
+
+    def is_export_layer_pass_enabled(self) -> bool:
+        return bool(self.export_layer_pass_enable_checkbox.isChecked())
+
+    def _clear_export_layer_entries(self):
+        while self.export_layer_pass_layout.count():
+            item = self.export_layer_pass_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self._export_layer_pass_rows.clear()
+
+    def set_export_layer_entries(self, entries: List[Tuple[int, str, str]]):
+        existing_passes: Dict[int, int] = {
+            int(layer_id): int(row["pass_spin"].value())
+            for layer_id, row in self._export_layer_pass_rows.items()
+            if "pass_spin" in row
+        }
+        self._clear_export_layer_entries()
+
+        if not entries:
+            self.export_layer_pass_empty_label = QLabel("Load a monster to assign export passes.")
+            self.export_layer_pass_empty_label.setStyleSheet("color: gray; font-size: 8pt;")
+            self.export_layer_pass_empty_label.setWordWrap(True)
+            self.export_layer_pass_layout.addWidget(self.export_layer_pass_empty_label)
+            self.export_layer_pass_layout.addStretch()
+            return
+
+        for layer_id, layer_name, blend_label in entries:
+            row_widget = QWidget()
+            row_layout = QHBoxLayout(row_widget)
+            row_layout.setContentsMargins(2, 2, 2, 2)
+            row_layout.setSpacing(6)
+
+            thumb_label = QLabel("—")
+            thumb_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            thumb_label.setFixedSize(24, 24)
+            thumb_label.setStyleSheet(
+                "QLabel { border: 1px solid rgba(160, 160, 160, 0.45); "
+                "background: rgba(80, 80, 80, 0.2); font-size: 8pt; }"
+            )
+            row_layout.addWidget(thumb_label)
+
+            text_col = QVBoxLayout()
+            text_col.setSpacing(0)
+            name_label = QLabel(layer_name or f"Layer {layer_id}")
+            name_label.setToolTip(f"Layer ID: {layer_id}")
+            blend_text = blend_label or "Standard"
+            blend_info = QLabel(f"Blend: {blend_text}")
+            blend_info.setStyleSheet("color: gray; font-size: 8pt;")
+            text_col.addWidget(name_label)
+            text_col.addWidget(blend_info)
+            row_layout.addLayout(text_col, 1)
+
+            pass_label = QLabel("Pass")
+            pass_label.setStyleSheet("color: gray; font-size: 8pt;")
+            row_layout.addWidget(pass_label)
+
+            pass_spin = QSpinBox()
+            pass_spin.setRange(1, 999999)
+            pass_spin.setFixedWidth(74)
+            pass_spin.setValue(max(1, int(existing_passes.get(int(layer_id), 1))))
+            pass_spin.setToolTip("Export pass number (1+).")
+            row_layout.addWidget(pass_spin)
+
+            self.export_layer_pass_layout.addWidget(row_widget)
+            self._export_layer_pass_rows[int(layer_id)] = {
+                "row_widget": row_widget,
+                "thumbnail": thumb_label,
+                "pass_spin": pass_spin,
+            }
+
+        self.export_layer_pass_layout.addStretch()
+
+    def set_export_layer_thumbnail(self, layer_id: int, pixmap: Optional[QPixmap]):
+        row = self._export_layer_pass_rows.get(int(layer_id))
+        if not row:
+            return
+        thumb_label = row.get("thumbnail")
+        if not isinstance(thumb_label, QLabel):
+            return
+        if pixmap is not None and not pixmap.isNull():
+            scaled = pixmap.scaled(
+                thumb_label.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            thumb_label.setPixmap(scaled)
+            thumb_label.setText("")
+            thumb_label.setStyleSheet("QLabel { background-color: transparent; }")
+        else:
+            thumb_label.setPixmap(QPixmap())
+            thumb_label.setText("—")
+            thumb_label.setStyleSheet(
+                "QLabel { border: 1px solid rgba(160, 160, 160, 0.45); "
+                "background: rgba(80, 80, 80, 0.2); font-size: 8pt; }"
+            )
+
+    def clear_export_layer_thumbnails(self):
+        for layer_id in list(self._export_layer_pass_rows.keys()):
+            self.set_export_layer_thumbnail(int(layer_id), None)
+
+    def get_export_layer_pass_assignments(self) -> Dict[int, int]:
+        assignments: Dict[int, int] = {}
+        for layer_id, row in self._export_layer_pass_rows.items():
+            pass_spin = row.get("pass_spin")
+            if isinstance(pass_spin, QSpinBox):
+                assignments[int(layer_id)] = max(1, int(pass_spin.value()))
+        return assignments
+
+    def set_export_layer_pass_assignments(self, assignments: Dict[int, int], *, default_pass: int = 1):
+        fallback = max(1, int(default_pass))
+        for layer_id, row in self._export_layer_pass_rows.items():
+            pass_spin = row.get("pass_spin")
+            if not isinstance(pass_spin, QSpinBox):
+                continue
+            value = max(1, int(assignments.get(int(layer_id), fallback)))
+            pass_spin.blockSignals(True)
+            pass_spin.setValue(value)
+            pass_spin.blockSignals(False)
 
     def reset_placement_bias_settings(self):
         """Reset all placement bias controls to their default values."""
@@ -2569,14 +2815,58 @@ class ControlPanel(QWidget):
         """Enable/disable the costume conversion button."""
         self.costume_convert_btn.setEnabled(enabled)
 
+    def _conversion_busy_label(self) -> str:
+        dots = "." * (self._convert_anim_index + 1)
+        return f"Converting{dots}"
+
+    def _refresh_convert_button_labels(self) -> None:
+        if hasattr(self, "convert_bin_btn"):
+            if self._bin_convert_active:
+                label = self._bin_convert_busy_label_override or self._conversion_busy_label()
+                self.convert_bin_btn.setText(label)
+            else:
+                self.convert_bin_btn.setText(self._bin_convert_label)
+        if hasattr(self, "convert_dof_btn"):
+            if self._dof_convert_active:
+                label = self._dof_convert_busy_label_override or self._conversion_busy_label()
+                self.convert_dof_btn.setText(label)
+            else:
+                self.convert_dof_btn.setText(self._dof_convert_label)
+
+    def _sync_convert_anim_timer(self) -> None:
+        animated_active = (
+            (self._bin_convert_active and self._bin_convert_busy_label_override is None)
+            or (self._dof_convert_active and self._dof_convert_busy_label_override is None)
+        )
+        if animated_active:
+            if not self._convert_anim_timer.isActive():
+                self._convert_anim_timer.start()
+        else:
+            if self._convert_anim_timer.isActive():
+                self._convert_anim_timer.stop()
+            self._convert_anim_index = 0
+
+    def _on_convert_anim_tick(self) -> None:
+        self._convert_anim_index = (self._convert_anim_index + 1) % 3
+        self._refresh_convert_button_labels()
+
+    def set_bin_convert_state(self, enabled: bool, label=None):
+        """Enable/disable BIN conversion button and update its label."""
+        self._bin_convert_active = not bool(enabled)
+        self._bin_convert_busy_label_override = label if self._bin_convert_active else None
+        if hasattr(self, "convert_bin_btn"):
+            self.convert_bin_btn.setEnabled(bool(enabled))
+        self._refresh_convert_button_labels()
+        self._sync_convert_anim_timer()
+
     def set_dof_convert_state(self, enabled: bool, label=None):
         """Enable/disable the DOF conversion button and update its label."""
-        if not hasattr(self, "convert_dof_btn"):
-            return
-        if label is None:
-            label = self._dof_convert_label if enabled else "Converting DOF..."
-        self.convert_dof_btn.setText(label)
-        self.convert_dof_btn.setEnabled(enabled)
+        self._dof_convert_active = not bool(enabled)
+        self._dof_convert_busy_label_override = label if self._dof_convert_active else None
+        if hasattr(self, "convert_dof_btn"):
+            self.convert_dof_btn.setEnabled(bool(enabled))
+        self._refresh_convert_button_labels()
+        self._sync_convert_anim_timer()
         if hasattr(self, "dof_mesh_pivot_checkbox"):
             self.dof_mesh_pivot_checkbox.setEnabled(enabled)
         if hasattr(self, "dof_include_mesh_xml_checkbox"):

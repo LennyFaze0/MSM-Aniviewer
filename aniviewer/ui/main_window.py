@@ -37,7 +37,8 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog, QMessageBox,
     QSplitter, QProgressDialog, QDialog, QInputDialog, QToolButton,
-    QLineEdit, QTextEdit, QPlainTextEdit, QAbstractSpinBox, QComboBox
+    QLineEdit, QTextEdit, QPlainTextEdit, QAbstractSpinBox, QComboBox,
+    QStackedWidget
 )
 from PyQt6.QtCore import Qt, QSettings, QTimer, QEvent, QProcess
 from PyQt6.QtGui import QSurfaceFormat, QColor, QShortcut, QKeySequence, QPixmap, QImage, QIcon, QCursor
@@ -81,13 +82,14 @@ from .monster_browser_dialog import (
 )
 from .sprite_workshop_dialog import SpriteWorkshopDialog
 from .monster_migration_dialog import (
-    MonsterMigrationDialog,
+    MonsterMigrationPanel,
     MonsterMigrationRequest,
     MigrationSourceOption,
 )
 from .midi_editor_dialog import MidiEditorDialog
 from .sprite_picker_dialog import SpritePickerDialog
 from .constraints_dialog import ConstraintEditorDialog
+from .dof_asset_grabber_dialog import DofAssetGrabberDialog
 from utils.diagnostics import DiagnosticsManager, DiagnosticsConfig
 from utils.ffmpeg_installer import resolve_ffmpeg_path, query_ffmpeg_encoders
 from utils.pytoshop_installer import PytoshopInstaller, PythonPackageInstaller
@@ -111,6 +113,10 @@ from utils.dof_particles import (
     DofAnimNode,
 )
 from utils.midi_utils import read_midi_file
+from utils.monster_name_rosetta_refresh import (
+    build_rosetta_artifacts,
+    resolve_source_triplet,
+)
 from utils.keybinds import keybind_actions, default_keybinds, normalize_keybind_sequence
 
 try:
@@ -421,8 +427,17 @@ class MSMAnimationViewer(QMainWindow):
         self.dof_file_index: List[AnimationFileEntry] = []
         self.filtered_dof_file_index: List[AnimationFileEntry] = []
         self.monster_file_lookup: Dict[str, MonsterFileRecord] = {}
-        self._monster_name_rosetta_path: Path = self.project_root / "docs" / "monster_name_file_rosetta.txt"
-        self._monster_name_metadata_path: Path = self.project_root / "docs" / "monster_name_file_rosetta_metadata.txt"
+        self._monster_name_bundled_rosetta_path: Path = self.project_root / "docs" / "monster_name_file_rosetta.txt"
+        self._monster_name_bundled_metadata_path: Path = self.project_root / "docs" / "monster_name_file_rosetta_metadata.txt"
+        cache_root_default = Path.home() / ".cache" / "MSMAnimationViewer" / "rosetta"
+        cache_root_setting = self.settings.value("monster_name/cache_dir", str(cache_root_default), type=str)
+        self._monster_name_runtime_dir: Path = Path(str(cache_root_setting or str(cache_root_default))).expanduser()
+        self._monster_name_runtime_rosetta_path: Path = self._monster_name_runtime_dir / "monster_name_file_rosetta.txt"
+        self._monster_name_runtime_metadata_path: Path = self._monster_name_runtime_dir / "monster_name_file_rosetta_metadata.txt"
+        self._monster_name_source_signature: str = self.settings.value("monster_name/source_signature", "", type=str) or ""
+        self._monster_name_dat_refresh_attempted: bool = False
+        self._monster_name_rosetta_path: Path = self._monster_name_bundled_rosetta_path
+        self._monster_name_metadata_path: Path = self._monster_name_bundled_metadata_path
         self._monster_name_rosetta_mtime: Optional[float] = None
         self._monster_name_metadata_mtime: Optional[float] = None
         self._monster_common_name_by_stem: Dict[str, str] = {}
@@ -620,6 +635,9 @@ class MSMAnimationViewer(QMainWindow):
         self._last_terrain_alignment_signature: Optional[str] = None
         self._sprite_workshop_dialog: Optional[SpriteWorkshopDialog] = None
         self._migration_settings_bridge: Optional[SettingsDialog] = None
+        self._dof_asset_grabber_dialog: Optional[DofAssetGrabberDialog] = None
+        self._migration_panel_profiles: List[Dict[str, Any]] = []
+        self._migration_last_output_path: str = ""
         self._keyframe_clipboard: Optional[Dict[str, Any]] = None
         self._hang_watchdog_active: bool = False
         self.buddy_audio_tracks: Dict[str, str] = {}
@@ -646,6 +664,10 @@ class MSMAnimationViewer(QMainWindow):
         self._log_splitter_last_sizes: Optional[List[int]] = None
         self.viewport_tool_mode: str = "cursor"
         self.control_panel_host: Optional[QWidget] = None
+        self.right_panel_host: Optional[QWidget] = None
+        self.right_panel_stack: Optional[QStackedWidget] = None
+        self.monster_migration_panel: Optional[MonsterMigrationPanel] = None
+        self._active_right_panel_mode: str = "layers"
         self.viewport_tool_buttons: List[QToolButton] = []
         self.viewport_tool_cursor_btn: Optional[QToolButton] = None
         self.viewport_tool_zoom_btn: Optional[QToolButton] = None
@@ -770,10 +792,6 @@ class MSMAnimationViewer(QMainWindow):
         sprite_workshop_btn = QPushButton("Sprite Workshop")
         sprite_workshop_btn.clicked.connect(self.show_sprite_workshop)
         toolbar_layout.addWidget(sprite_workshop_btn)
-
-        monster_migration_btn = QPushButton("Monster Migration")
-        monster_migration_btn.clicked.connect(self.show_monster_migration)
-        toolbar_layout.addWidget(monster_migration_btn)
 
         midi_editor_btn = QPushButton("MIDI Editor")
         midi_editor_btn.clicked.connect(self.show_midi_editor)
@@ -950,12 +968,25 @@ class MSMAnimationViewer(QMainWindow):
         # Right panel - Layer visibility
         self.layer_panel = LayerPanel()
         self.connect_layer_panel_signals()
-        
+
+        self.monster_migration_panel = MonsterMigrationPanel(self)
+        self._configure_monster_migration_panel()
+
+        self.right_panel_stack = QStackedWidget()
+        self.right_panel_stack.addWidget(self.layer_panel)
+        self.right_panel_stack.addWidget(self.monster_migration_panel)
+
+        self.right_panel_host = QWidget()
+        right_panel_layout = QVBoxLayout(self.right_panel_host)
+        right_panel_layout.setContentsMargins(0, 0, 0, 0)
+        right_panel_layout.setSpacing(0)
+        right_panel_layout.addWidget(self.right_panel_stack)
+
         # Set size constraints for right panel
-        self.layer_panel.setMinimumWidth(200)
-        self.layer_panel.setMaximumWidth(350)
-        
-        self.main_splitter.addWidget(self.layer_panel)
+        self.right_panel_host.setMinimumWidth(200)
+        self.right_panel_host.setMaximumWidth(420)
+
+        self.main_splitter.addWidget(self.right_panel_host)
         
         self.main_splitter.setCollapsible(0, True)
         self.main_splitter.setCollapsible(1, False)
@@ -993,8 +1024,9 @@ class MSMAnimationViewer(QMainWindow):
         self.log_splitter.splitterMoved.connect(self._on_log_splitter_moved)
         
         main_layout.addWidget(self.log_splitter, stretch=1)
-        
+
         self.log_widget.log("Application started", "INFO")
+        self._update_right_panel_mode(force_refresh=True)
         app = QApplication.instance()
         if app:
             app.installEventFilter(self)
@@ -1081,7 +1113,10 @@ class MSMAnimationViewer(QMainWindow):
             self.control_panel_host.setVisible(left_visible)
         else:
             self.control_panel.setVisible(left_visible)
-        self.layer_panel.setVisible(right_visible)
+        if self.right_panel_host is not None:
+            self.right_panel_host.setVisible(right_visible)
+        else:
+            self.layer_panel.setVisible(right_visible)
         sizes = self.main_splitter.sizes()
         total = sum(sizes) if sizes else max(1, self.width())
         total = max(1, total)
@@ -1118,6 +1153,119 @@ class MSMAnimationViewer(QMainWindow):
             btn.blockSignals(True)
             btn.setChecked(value)
             btn.blockSignals(False)
+
+    def _configure_monster_migration_panel(self) -> None:
+        panel = getattr(self, "monster_migration_panel", None)
+        if panel is None:
+            return
+        panel.run_requested.connect(self._on_migration_panel_run_requested)
+        panel.preview_source_requested.connect(self._on_migration_panel_preview_source_requested)
+        panel.preview_output_requested.connect(self._on_migration_panel_preview_output_requested)
+        panel.refresh_requested.connect(self._on_migration_panel_refresh_requested)
+        panel.open_legacy_tools_requested.connect(self.show_settings)
+
+    def _refresh_monster_migration_panel_context(self) -> None:
+        panel = getattr(self, "monster_migration_panel", None)
+        if panel is None:
+            return
+        sources, profiles, active_profile_index = self._build_monster_migration_source_pool()
+        available_revisions = self._available_monster_migration_target_revisions()
+        self._migration_panel_profiles = list(profiles)
+        panel.set_context(
+            sources=sources,
+            profiles=profiles,
+            available_revisions=available_revisions,
+            active_profile_index=active_profile_index,
+        )
+        panel.set_last_output_path(self._migration_last_output_path)
+
+    def _set_right_panel_mode(self, mode: str) -> None:
+        panel_stack = getattr(self, "right_panel_stack", None)
+        if panel_stack is None:
+            return
+        normalized = "migration" if str(mode or "").strip().lower() == "migration" else "layers"
+        if normalized == "migration" and self.monster_migration_panel is not None:
+            panel_stack.setCurrentWidget(self.monster_migration_panel)
+        else:
+            panel_stack.setCurrentWidget(self.layer_panel)
+            normalized = "layers"
+        self._active_right_panel_mode = normalized
+
+    def _update_right_panel_mode(self, *, section_key: Optional[str] = None, force_refresh: bool = False) -> None:
+        control_panel = getattr(self, "control_panel", None)
+        if control_panel is None:
+            return
+        if section_key is None:
+            section_key = control_panel.current_section_key()
+        is_export = str(section_key or "").strip().lower() == "export"
+        target_mode = "migration" if is_export else "layers"
+        mode_changed = target_mode != self._active_right_panel_mode
+        if target_mode == "migration" and (mode_changed or force_refresh):
+            self._refresh_monster_migration_panel_context()
+        self._set_right_panel_mode(target_mode)
+
+    def on_control_panel_section_changed(self, section_key: str) -> None:
+        self._update_right_panel_mode(section_key=section_key)
+
+    def _on_migration_panel_refresh_requested(self) -> None:
+        self._refresh_monster_migration_panel_context()
+
+    def _on_migration_panel_run_requested(self, request: object) -> None:
+        if not isinstance(request, MonsterMigrationRequest):
+            return
+        profiles = list(self._migration_panel_profiles or [])
+        if not profiles:
+            QMessageBox.warning(
+                self,
+                "No Profiles",
+                "No path profiles are configured. Add one in Settings -> Paths first.",
+            )
+            return
+        success = self._run_monster_migration(request, profiles)
+        if not success:
+            return
+        if self.monster_migration_panel is not None:
+            self.monster_migration_panel.set_last_output_path(self._migration_last_output_path)
+        if self._migration_last_output_path:
+            self._on_migration_panel_preview_output_requested(self._migration_last_output_path)
+
+    def _on_migration_panel_preview_source_requested(self, source: object) -> None:
+        if not isinstance(source, MigrationSourceOption):
+            return
+        source_path = source.preferred_source_path
+        if not source_path:
+            QMessageBox.warning(self, "Missing Source", "Selected source has no readable BIN/JSON path.")
+            return
+        self._load_migration_preview_path(source_path, f"source {source.stem}")
+
+    def _on_migration_panel_preview_output_requested(self, output_path: str) -> None:
+        path = (output_path or "").strip()
+        if not path or not os.path.exists(path):
+            QMessageBox.warning(
+                self,
+                "Missing Output",
+                "Migrated output path does not exist yet. Run migration first.",
+            )
+            return
+        self._load_migration_preview_path(path, "migrated output")
+
+    def _load_migration_preview_path(self, path: str, label: str) -> bool:
+        payload = self._read_migration_payload(path)
+        if payload is None:
+            QMessageBox.warning(
+                self,
+                "Preview Failed",
+                f"Could not parse payload for {label}:\n{path}",
+            )
+            return False
+        self._apply_json_payload(path, payload, announce=False)
+        if self.control_panel.anim_combo.count() > 0:
+            self.control_panel.anim_combo.setCurrentIndex(0)
+        self.log_widget.log(
+            f"Loaded {label} in viewport for compatibility preview: {os.path.basename(path)}",
+            "SUCCESS",
+        )
+        return True
 
     def _set_panel_visibility(self, left_visible: bool, right_visible: bool, *, save: bool = True):
         prev_left = self._left_panel_visible
@@ -1414,6 +1562,12 @@ class MSMAnimationViewer(QMainWindow):
             self.control_panel.set_compact_ui(self._compact_ui_enabled)
         if hasattr(self, "layer_panel"):
             self.layer_panel.set_compact_ui(self._compact_ui_enabled)
+        if (
+            hasattr(self, "monster_migration_panel")
+            and self.monster_migration_panel
+            and hasattr(self.monster_migration_panel, "set_compact_ui")
+        ):
+            self.monster_migration_panel.set_compact_ui(self._compact_ui_enabled)
         if hasattr(self, "timeline"):
             self.timeline.set_compact_ui(self._compact_ui_enabled)
         if save:
@@ -1729,6 +1883,7 @@ class MSMAnimationViewer(QMainWindow):
         self.control_panel.bin_selected.connect(self.on_bin_selected)
         self.control_panel.convert_bin_clicked.connect(self.convert_bin_to_json)
         self.control_panel.convert_dof_clicked.connect(self.convert_dof_to_json)
+        self.control_panel.dof_asset_grabber_clicked.connect(self.open_dof_asset_grabber)
         self.control_panel.refresh_files_clicked.connect(self.refresh_active_file_list)
         self.control_panel.file_search_changed.connect(self.on_file_search_changed)
         self.control_panel.dof_search_toggled.connect(self.on_dof_search_toggled)
@@ -1784,6 +1939,15 @@ class MSMAnimationViewer(QMainWindow):
         self.control_panel.export_mp4_clicked.connect(self.export_as_mp4)
         self.control_panel.export_webm_clicked.connect(self.export_as_webm)
         self.control_panel.export_gif_clicked.connect(self.export_as_gif)
+        self.control_panel.export_layer_pass_auto_assign_requested.connect(
+            self.on_export_auto_assign_passes
+        )
+        self.control_panel.export_layer_pass_auto_strict_requested.connect(
+            self.on_export_auto_assign_passes_strict
+        )
+        self.control_panel.export_layer_pass_auto_blend_requested.connect(
+            self.on_export_auto_assign_passes_blend_smart
+        )
         self.control_panel.credits_clicked.connect(self.show_credits)
         self.control_panel.monster_browser_requested.connect(self.open_monster_browser)
         self.control_panel.solid_bg_enabled_changed.connect(self.on_solid_bg_enabled_changed)
@@ -1823,6 +1987,7 @@ class MSMAnimationViewer(QMainWindow):
         self.control_panel.export_include_viewport_bg_changed.connect(
             self.on_export_include_viewport_bg_changed
         )
+        self.control_panel.section_changed.connect(self.on_control_panel_section_changed)
         self.control_panel.audio_enabled_changed.connect(self.on_audio_enabled_changed)
         self.control_panel.audio_volume_changed.connect(self.on_audio_volume_changed)
         self.control_panel.audio_track_mute_changed.connect(self.on_audio_track_mute_changed)
@@ -2427,9 +2592,10 @@ class MSMAnimationViewer(QMainWindow):
             self.settings.value('dof_path', self.dof_path, type=str)
         )
 
+        downloads_path_changed = new_downloads_path != self.downloads_path
         changed = (
             new_game_path != self.game_path
-            or new_downloads_path != self.downloads_path
+            or downloads_path_changed
             or new_dof_path != self.dof_path
         )
         if not changed:
@@ -2441,6 +2607,8 @@ class MSMAnimationViewer(QMainWindow):
         self.downloads_path = new_downloads_path
         self.dof_path = new_dof_path
         self.shader_registry.set_game_path(self.game_path or None)
+        if downloads_path_changed:
+            self._invalidate_monster_name_rosetta_cache()
         self._downloads_xml_bin_roots = self._find_downloads_xml_bin_roots()
 
         if self.dof_path != old_dof_path:
@@ -2531,6 +2699,7 @@ class MSMAnimationViewer(QMainWindow):
         self.downloads_path = folder
         self.settings.setValue('downloads_path', folder)
         self._update_active_path_profile(downloads_path=folder)
+        self._invalidate_monster_name_rosetta_cache()
         self._downloads_xml_bin_roots = self._find_downloads_xml_bin_roots()
         self._update_path_label()
         self.log_widget.log(f"Downloads path set to: {folder}", "SUCCESS")
@@ -2755,6 +2924,17 @@ class MSMAnimationViewer(QMainWindow):
                                 full_path=full_path,
                             )
                         )
+            # Mixed roots can contain both extracted ANIMBBB assets and Unity bundles.
+            # Include bundle entries as well so remote DLC downloads are discoverable.
+            for anim_name in self._get_dof_bundle_anim_names(self.dof_path):
+                bundle_path = f"bundle://{anim_name}"
+                indexed_files.append(
+                    AnimationFileEntry(
+                        name=anim_name,
+                        relative_path=bundle_path,
+                        full_path=bundle_path,
+                    )
+                )
 
         output_root = os.path.join(self.dof_path, "Output")
         if os.path.isdir(output_root):
@@ -2775,7 +2955,13 @@ class MSMAnimationViewer(QMainWindow):
         indexed_files.sort(key=lambda entry: entry.relative_path.lower())
         self.dof_file_index = indexed_files
         if self.dof_search_enabled:
-            mode_label = "bundle" if bundle_mode else "asset"
+            has_bundle_entries = any(entry.full_path.startswith("bundle://") for entry in indexed_files)
+            if bundle_mode:
+                mode_label = "bundle"
+            elif has_bundle_entries:
+                mode_label = "asset+bundle"
+            else:
+                mode_label = "asset"
             self.log_widget.log(f"Indexed {len(indexed_files)} DOF {mode_label} entries", "INFO")
             self.apply_file_filter()
 
@@ -2791,11 +2977,16 @@ class MSMAnimationViewer(QMainWindow):
     def _find_unity_bundle_data_files(self, root: str) -> List[str]:
         data_files: List[str] = []
         for dirpath, _, filenames in os.walk(root):
-            if "__data" not in filenames:
-                continue
-            candidate = os.path.join(dirpath, "__data")
-            if self._looks_like_unity_bundle(candidate):
-                data_files.append(candidate)
+            candidates: List[str] = []
+            if "__data" in filenames:
+                candidates.append(os.path.join(dirpath, "__data"))
+            for filename in filenames:
+                if not filename.lower().endswith(".unity3d"):
+                    continue
+                candidates.append(os.path.join(dirpath, filename))
+            for candidate in candidates:
+                if self._looks_like_unity_bundle(candidate):
+                    data_files.append(candidate)
         return data_files
 
     def _is_dof_bundle_root(self, root: str) -> bool:
@@ -2983,8 +3174,251 @@ class MSMAnimationViewer(QMainWindow):
             return named
         return raw.replace("_", " ").strip().title()
 
+    def _monster_name_auto_refresh_enabled(self) -> bool:
+        """Return whether startup rosetta refresh from dat sources is enabled."""
+        return bool(self.settings.value("monster_name/auto_refresh_from_dat", True, type=bool))
+
+    def _invalidate_monster_name_rosetta_cache(self) -> None:
+        """Invalidate cached monster-name mappings so sources can be re-resolved."""
+        self._monster_name_dat_refresh_attempted = False
+        self._monster_name_rosetta_path = self._monster_name_bundled_rosetta_path
+        self._monster_name_metadata_path = self._monster_name_bundled_metadata_path
+        self._monster_name_rosetta_mtime = None
+        self._monster_name_metadata_mtime = None
+
+    def _iter_monster_name_downloads_paths(self) -> List[str]:
+        """Return deduplicated downloads paths across all configured profiles."""
+        paths: List[str] = []
+        seen: Set[str] = set()
+
+        def add_path(value: Any) -> None:
+            path_value = self._sanitize_path_setting_value(value)
+            if not path_value or not os.path.isdir(path_value):
+                return
+            norm = os.path.normcase(os.path.normpath(path_value))
+            if norm in seen:
+                return
+            seen.add(norm)
+            paths.append(path_value)
+
+        add_path(self.downloads_path)
+        profiles, _ = self._load_path_profiles_store()
+        for profile in profiles:
+            add_path(profile.get("downloads_path"))
+        return paths
+
+    @staticmethod
+    def _find_monster_data_roots_for_downloads_path(downloads_path: str) -> List[Path]:
+        """Locate candidate roots containing monster/gene/island data payloads."""
+        roots: List[Path] = []
+        seen: Set[str] = set()
+        max_depth = 6
+        max_matches = 8
+
+        def add_root(path: Path) -> None:
+            if not path or not path.is_dir():
+                return
+            norm = os.path.normcase(os.path.normpath(str(path)))
+            if norm in seen:
+                return
+            if resolve_source_triplet(path) is None:
+                return
+            seen.add(norm)
+            roots.append(path)
+
+        base = Path(downloads_path).expanduser()
+        search_bases: List[Path] = [base]
+        parent = base.parent if base.parent != base else None
+        if parent is not None:
+            search_bases.append(parent)
+            if base.name.strip().lower() in {"downloads", "download"} and parent.parent != parent:
+                search_bases.append(parent.parent)
+
+        normalized_search_bases: List[Path] = []
+        seen_bases: Set[str] = set()
+        for search_base in search_bases:
+            norm = os.path.normcase(os.path.normpath(str(search_base)))
+            if norm in seen_bases:
+                continue
+            seen_bases.add(norm)
+            normalized_search_bases.append(search_base)
+
+        direct_candidates: List[Path] = []
+        for search_base in normalized_search_bases:
+            direct_candidates.extend(
+                [
+                    search_base,
+                    search_base / "1",
+                    search_base / "data",
+                    search_base / "data" / "1",
+                    search_base / "AppData" / "LocalLow" / "Big Blue Bubble Inc" / "My Singing Monsters" / "1",
+                ]
+            )
+
+            base_name = search_base.name.strip().lower()
+            if base_name == "my singing monsters":
+                direct_candidates.append(search_base / "1")
+            elif base_name == "big blue bubble inc":
+                direct_candidates.append(search_base / "My Singing Monsters" / "1")
+            elif base_name == "locallow":
+                direct_candidates.append(search_base / "Big Blue Bubble Inc" / "My Singing Monsters" / "1")
+
+        for candidate in direct_candidates:
+            add_root(candidate)
+
+        for walk_base in normalized_search_bases:
+            if not walk_base.is_dir():
+                continue
+            for root, dirs, _ in os.walk(walk_base):
+                rel = os.path.relpath(root, walk_base)
+                depth = 0 if rel == "." else len(rel.split(os.sep))
+                if depth > max_depth:
+                    dirs[:] = []
+                    continue
+                root_path = Path(root)
+                if resolve_source_triplet(root_path) is not None:
+                    add_root(root_path)
+                    dirs[:] = []
+                    if len(roots) >= max_matches:
+                        break
+            if len(roots) >= max_matches:
+                break
+
+        return roots
+
+    def _select_monster_name_source_triplet(self) -> Optional[Tuple[Path, Path, Path]]:
+        """Pick the newest available monster/gene/island source triplet."""
+        candidates: List[Tuple[Path, Path, Path]] = []
+        seen: Set[str] = set()
+
+        for downloads_path in self._iter_monster_name_downloads_paths():
+            for root in self._find_monster_data_roots_for_downloads_path(downloads_path):
+                triplet = resolve_source_triplet(root)
+                if not triplet:
+                    continue
+                monster_source, gene_source, island_source = (Path(triplet[0]), Path(triplet[1]), Path(triplet[2]))
+                norm_key = "|".join(
+                    os.path.normcase(os.path.normpath(str(path)))
+                    for path in (monster_source, gene_source, island_source)
+                )
+                if norm_key in seen:
+                    continue
+                seen.add(norm_key)
+                candidates.append((monster_source, gene_source, island_source))
+
+        if not candidates:
+            return None
+
+        def newest_mtime(paths: Tuple[Path, Path, Path]) -> int:
+            mtimes: List[int] = []
+            for item in paths:
+                try:
+                    mtimes.append(int(item.stat().st_mtime_ns))
+                except OSError:
+                    mtimes.append(0)
+            return max(mtimes) if mtimes else 0
+
+        candidates.sort(key=newest_mtime, reverse=True)
+        return candidates[0]
+
+    def _refresh_monster_name_rosetta_from_dat_sources(self, force: bool = False) -> bool:
+        """Refresh runtime rosetta docs from detected dat/xml game payloads."""
+        auto_refresh_enabled = self._monster_name_auto_refresh_enabled()
+        if not auto_refresh_enabled and not force:
+            runtime_ready = (
+                self._monster_name_runtime_rosetta_path.is_file()
+                and self._monster_name_runtime_metadata_path.is_file()
+            )
+            if runtime_ready:
+                self._monster_name_rosetta_path = self._monster_name_runtime_rosetta_path
+                self._monster_name_metadata_path = self._monster_name_runtime_metadata_path
+                return True
+            self._monster_name_rosetta_path = self._monster_name_bundled_rosetta_path
+            self._monster_name_metadata_path = self._monster_name_bundled_metadata_path
+            return False
+
+        if self._monster_name_dat_refresh_attempted and not force:
+            return (
+                self._monster_name_rosetta_path == self._monster_name_runtime_rosetta_path
+                and self._monster_name_runtime_rosetta_path.is_file()
+                and self._monster_name_runtime_metadata_path.is_file()
+            )
+
+        self._monster_name_dat_refresh_attempted = True
+        selected = self._select_monster_name_source_triplet()
+        if selected is None:
+            self._monster_name_rosetta_path = self._monster_name_bundled_rosetta_path
+            self._monster_name_metadata_path = self._monster_name_bundled_metadata_path
+            return False
+
+        source_monster, source_gene, source_island = selected
+
+        signature_parts: List[str] = []
+        for source in selected:
+            try:
+                stat = source.stat()
+                signature_parts.append(f"{source}|{int(stat.st_size)}|{int(stat.st_mtime_ns)}")
+            except OSError:
+                signature_parts.append(f"{source}|0|0")
+        source_signature = "::".join(signature_parts)
+
+        runtime_ready = (
+            self._monster_name_runtime_rosetta_path.is_file()
+            and self._monster_name_runtime_metadata_path.is_file()
+        )
+        if (
+            not force
+            and runtime_ready
+            and source_signature == self._monster_name_source_signature
+        ):
+            self._monster_name_rosetta_path = self._monster_name_runtime_rosetta_path
+            self._monster_name_metadata_path = self._monster_name_runtime_metadata_path
+            return True
+
+        try:
+            artifacts = build_rosetta_artifacts(
+                source_monster,
+                source_gene,
+                source_island,
+            )
+        except Exception as exc:
+            if getattr(self, "log_widget", None) is not None:
+                self.log_widget.log(
+                    f"Failed to auto-refresh monster name library from dat files: {exc}",
+                    "WARNING",
+                )
+            self._monster_name_rosetta_path = self._monster_name_bundled_rosetta_path
+            self._monster_name_metadata_path = self._monster_name_bundled_metadata_path
+            return False
+
+        try:
+            self._monster_name_runtime_dir.mkdir(parents=True, exist_ok=True)
+            self._monster_name_runtime_rosetta_path.write_text(artifacts.rosetta_text, encoding="utf-8")
+            self._monster_name_runtime_metadata_path.write_text(artifacts.metadata_text, encoding="utf-8")
+        except OSError as exc:
+            if getattr(self, "log_widget", None) is not None:
+                self.log_widget.log(
+                    f"Failed to write runtime monster name cache: {exc}",
+                    "WARNING",
+                )
+            self._monster_name_rosetta_path = self._monster_name_bundled_rosetta_path
+            self._monster_name_metadata_path = self._monster_name_bundled_metadata_path
+            return False
+
+        self._monster_name_source_signature = source_signature
+        self.settings.setValue("monster_name/source_signature", source_signature)
+        self._monster_name_rosetta_path = self._monster_name_runtime_rosetta_path
+        self._monster_name_metadata_path = self._monster_name_runtime_metadata_path
+        if getattr(self, "log_widget", None) is not None:
+            self.log_widget.log(
+                f"Auto-refreshed monster name library from: {source_monster.parent}",
+                "INFO",
+            )
+        return True
+
     def _ensure_monster_name_rosetta_loaded(self, force: bool = False) -> None:
         """Load common-name mappings from docs rosetta + metadata files."""
+        self._refresh_monster_name_rosetta_from_dat_sources(force=force)
         rosetta_path = self._monster_name_rosetta_path
         metadata_path = self._monster_name_metadata_path
 
@@ -7330,7 +7764,11 @@ class MSMAnimationViewer(QMainWindow):
             self.log_widget.log(f"Missing BIN file: {bin_path}", "ERROR")
             return
 
-        json_path = self._convert_bin_file(bin_path, announce=True)
+        self._set_bin_conversion_active(True)
+        try:
+            json_path = self._convert_bin_file(bin_path, announce=True)
+        finally:
+            self._set_bin_conversion_active(False)
         if json_path and not self.select_file_by_path(json_path):
             self.log_widget.log("Could not auto-select converted JSON file", "WARNING")
 
@@ -7563,16 +8001,24 @@ class MSMAnimationViewer(QMainWindow):
 
     def _run_converter_command(self, cmd: List[str], cwd: Optional[str]) -> subprocess.CompletedProcess:
         """Execute a converter command, supporting embedded scripts in frozen builds."""
-        run_kwargs = {
-            "capture_output": True,
-            "text": True,
-            "cwd": cwd,
-        }
         if getattr(sys, "frozen", False) and len(cmd) >= 3 and cmd[0] == sys.executable and cmd[1] == "--run-script":
             script_path = cmd[2]
             script_args = cmd[3:]
             return self._run_embedded_script(script_path, script_args, cwd or os.path.dirname(script_path))
-        return subprocess.run(cmd, **run_kwargs)
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=cwd,
+        )
+        while True:
+            try:
+                stdout, stderr = process.communicate(timeout=0.12)
+                break
+            except subprocess.TimeoutExpired:
+                QApplication.processEvents()
+        return subprocess.CompletedProcess(cmd, process.returncode, stdout, stderr)
 
     def _run_embedded_script(
         self,
@@ -7703,6 +8149,11 @@ class MSMAnimationViewer(QMainWindow):
         """Toggle UI elements while a DOF conversion is running."""
         if hasattr(self, "control_panel") and hasattr(self.control_panel, "set_dof_convert_state"):
             self.control_panel.set_dof_convert_state(not active)
+
+    def _set_bin_conversion_active(self, active: bool) -> None:
+        """Toggle BIN conversion button while conversion is running."""
+        if hasattr(self, "control_panel") and hasattr(self.control_panel, "set_bin_convert_state"):
+            self.control_panel.set_bin_convert_state(not active)
 
     def _update_dof_index_for_paths(self, paths: List[str]) -> None:
         """Insert or update specific DOF assets/outputs without rescanning the full tree."""
@@ -12314,6 +12765,17 @@ class MSMAnimationViewer(QMainWindow):
             variant_layers = self._detect_layers_with_sprite_variants(animation.layers)
             self.layer_panel.set_layers_with_sprite_variants(variant_layers)
             self.layer_panel.set_selection_state(self.selected_layer_ids)
+            export_entries: List[Tuple[int, str, str]] = []
+            for layer in animation.layers:
+                layer_id = getattr(layer, "layer_id", None)
+                if layer_id is None:
+                    continue
+                layer_name = layer.name or f"Layer {layer_id}"
+                blend_label = self._describe_engine_blend_mode(
+                    int(getattr(layer, "blend_mode", BlendMode.STANDARD))
+                )
+                export_entries.append((int(layer_id), layer_name, blend_label))
+            self.control_panel.set_export_layer_entries(export_entries)
             self._refresh_constraints_ui()
             if self.joint_solver_enabled:
                 self.gl_widget.capture_joint_rest_lengths()
@@ -12323,6 +12785,7 @@ class MSMAnimationViewer(QMainWindow):
             self.layer_panel.update_layers([])
             self.layer_panel.set_layers_with_sprite_variants(set())
             self.layer_panel.set_selection_state(set())
+            self.control_panel.set_export_layer_entries([])
 
     def _sync_layer_constraint_toggles(self) -> None:
         """Update per-layer constraint toggles from stored disable list."""
@@ -12356,6 +12819,8 @@ class MSMAnimationViewer(QMainWindow):
         self._layer_sprite_preview_state.clear()
         if hasattr(self, "layer_panel") and self.layer_panel:
             self.layer_panel.clear_layer_thumbnails()
+        if hasattr(self, "control_panel") and self.control_panel:
+            self.control_panel.clear_export_layer_thumbnails()
 
     # --- Sprite workshop helpers -------------------------------------------------
 
@@ -13858,6 +14323,7 @@ class MSMAnimationViewer(QMainWindow):
         profiles: List[Dict[str, Any]],
     ) -> bool:
         """Execute a full source->target migration request from the dialog."""
+        self._migration_last_output_path = ""
         if request.target_profile_index < 0 or request.target_profile_index >= len(profiles):
             QMessageBox.warning(self, "Invalid Target", "Target profile selection is invalid.")
             return False
@@ -13984,6 +14450,7 @@ class MSMAnimationViewer(QMainWindow):
                     self.log_widget.log(f"Migration asset copy failed: {exc}", "WARNING")
 
         self.log_widget.log(f"Monster migration complete: {target_bin_path}", "SUCCESS")
+        self._migration_last_output_path = target_bin_path
 
         _, active_profile_index = self._load_path_profiles_store()
         if int(active_profile_index) == int(request.target_profile_index):
@@ -13992,43 +14459,15 @@ class MSMAnimationViewer(QMainWindow):
         return True
 
     def show_monster_migration(self) -> None:
-        """Open the beginner-friendly Monster Migration tool."""
-        sources, profiles, active_profile_index = self._build_monster_migration_source_pool()
-        if not profiles:
-            QMessageBox.warning(
-                self,
-                "No Profiles",
-                "No path profiles are configured. Add one in Settings -> Paths first.",
-            )
-            return
-        if not sources:
-            QMessageBox.warning(
-                self,
-                "No Monsters Found",
-                "No monster BIN/JSON files were found in configured profile paths.",
-            )
-            return
-
-        available_revisions = self._available_monster_migration_target_revisions()
-        dialog = MonsterMigrationDialog(
-            sources=sources,
-            profiles=profiles,
-            available_revisions=available_revisions,
-            active_profile_index=active_profile_index,
-            parent=self,
-        )
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-
-        request = dialog.build_request()
-        if request is None:
-            return
-
-        if request.open_legacy_tools:
-            self.show_settings()
-            return
-
-        self._run_monster_migration(request, profiles)
+        """Open the migration workspace inside the right-side panel."""
+        if hasattr(self, "control_panel") and self.control_panel:
+            self.control_panel.set_active_section("export")
+        if not self._right_panel_visible:
+            self._set_panel_visibility(self._left_panel_visible, True, save=True)
+        self._update_right_panel_mode(section_key="export", force_refresh=True)
+        if self.monster_migration_panel is not None:
+            self.monster_migration_panel.focus_source_filter()
+        self.log_widget.log("Monster Migration workspace opened in Export panel.", "INFO")
 
     def show_midi_editor(self):
         """Display the MSM MIDI editor dialog."""
@@ -14149,6 +14588,8 @@ class MSMAnimationViewer(QMainWindow):
         animation = getattr(self.gl_widget.player, "animation", None)
         if not animation:
             self.layer_panel.clear_layer_thumbnails()
+            if hasattr(self, "control_panel") and self.control_panel:
+                self.control_panel.clear_export_layer_thumbnails()
             self._layer_sprite_preview_state.clear()
             return
         current_time = self.gl_widget.player.current_time
@@ -14174,6 +14615,8 @@ class MSMAnimationViewer(QMainWindow):
                 continue
             pixmap = self._get_layer_thumbnail_pixmap(sprite_name, tint=tint)
             self.layer_panel.set_layer_thumbnail(layer.layer_id, pixmap)
+            if hasattr(self, "control_panel") and self.control_panel:
+                self.control_panel.set_export_layer_thumbnail(layer.layer_id, pixmap)
             self._layer_sprite_preview_state[layer.layer_id] = preview_key
         self._refresh_timeline_lane_thumbnails()
 
@@ -19397,6 +19840,7 @@ class MSMAnimationViewer(QMainWindow):
         background_color: Optional[Tuple[int, int, int, int]] = None,
         include_viewport_background: bool = False,
         motion_blur_frame_dt: Optional[float] = None,
+        included_layer_ids: Optional[Set[int]] = None,
     ) -> Optional[Image.Image]:
         """
         Render the current frame to a PIL Image.
@@ -19410,6 +19854,7 @@ class MSMAnimationViewer(QMainWindow):
             background_color=background_color,
             include_viewport_background=include_viewport_background,
             motion_blur_frame_dt=motion_blur_frame_dt,
+            included_layer_ids=included_layer_ids,
         )
         if rgba is None:
             return None
@@ -19426,6 +19871,7 @@ class MSMAnimationViewer(QMainWindow):
         background_color: Optional[Tuple[int, int, int, int]] = None,
         include_viewport_background: bool = False,
         motion_blur_frame_dt: Optional[float] = None,
+        included_layer_ids: Optional[Set[int]] = None,
     ) -> Optional[np.ndarray]:
         """
         Render the current frame to a top-down straight-alpha RGBA numpy array.
@@ -19438,6 +19884,11 @@ class MSMAnimationViewer(QMainWindow):
         viewport_before = (0, 0, self.gl_widget.width(), self.gl_widget.height())
         projection_pushed = False
         modelview_pushed = False
+        normalized_layer_filter = (
+            {int(layer_id) for layer_id in included_layer_ids}
+            if included_layer_ids is not None
+            else None
+        )
         try:
             self.gl_widget.makeCurrent()
             default_fbo = self.gl_widget.defaultFramebufferObject()
@@ -19514,6 +19965,7 @@ class MSMAnimationViewer(QMainWindow):
                         float(sample_time),
                         apply_constraints=False,
                         render_particles=True,
+                        included_layer_ids=normalized_layer_filter,
                     )
 
             def _accumulate_scene_texture(weight: float, additive: bool) -> None:
@@ -20016,6 +20468,299 @@ class MSMAnimationViewer(QMainWindow):
         out[..., 3:4] = np.clip(out_a, 0.0, 1.0)
         return np.clip(out * 255.0, 0.0, 255.0).astype(np.uint8)
 
+    @staticmethod
+    def _with_export_pass_suffix(path: str, pass_number: int, total_passes: int) -> str:
+        """Append a pass suffix to export outputs when multiple passes are active."""
+        if total_passes <= 1:
+            return path
+        root, ext = os.path.splitext(path)
+        return f"{root}_pass{int(pass_number):03d}{ext}"
+
+    def _collect_export_pass_specs(self) -> List[Tuple[int, Optional[Set[int]]]]:
+        """
+        Build a sorted list of export passes.
+
+        Returns:
+            List of (pass_number, included_layer_ids).
+            When pass assignment mode is disabled, returns a single pass with
+            ``included_layer_ids=None`` to preserve current behavior.
+        """
+        animation = getattr(self.gl_widget.player, "animation", None)
+        if not animation:
+            return [(1, None)]
+        if not hasattr(self, "control_panel") or not self.control_panel:
+            return [(1, None)]
+        if not self.control_panel.is_export_layer_pass_enabled():
+            return [(1, None)]
+
+        assignments = self.control_panel.get_export_layer_pass_assignments()
+        grouped: Dict[int, Set[int]] = {}
+        for layer in animation.layers:
+            layer_id = getattr(layer, "layer_id", None)
+            if layer_id is None:
+                continue
+            layer_id = int(layer_id)
+            pass_number = max(1, int(assignments.get(layer_id, 1)))
+            grouped.setdefault(pass_number, set()).add(layer_id)
+
+        if not grouped:
+            return [(1, None)]
+
+        return [
+            (pass_number, grouped[pass_number])
+            for pass_number in sorted(grouped.keys())
+        ]
+
+    def _get_ordered_export_layer_context(
+        self, animation: AnimationData
+    ) -> Tuple[List[int], Dict[int, LayerData]]:
+        """Return layer ids in active render order plus a lookup map."""
+        layer_map: Dict[int, LayerData] = {}
+        for layer in getattr(animation, "layers", []) or []:
+            layer_id = getattr(layer, "layer_id", None)
+            if layer_id is None:
+                continue
+            layer_map[int(layer_id)] = layer
+        if not layer_map:
+            return [], {}
+
+        render_order_ids: List[int] = []
+        try:
+            sample_time = float(getattr(self.gl_widget.player, "current_time", 0.0))
+            layer_states = self.gl_widget._build_layer_world_states(
+                sample_time,
+                apply_constraints=False,
+            )
+            render_layers = self.gl_widget._get_render_layers(layer_states)
+            for layer in render_layers:
+                layer_id = getattr(layer, "layer_id", None)
+                if layer_id is None:
+                    continue
+                layer_id = int(layer_id)
+                if layer_id in layer_map:
+                    render_order_ids.append(layer_id)
+        except Exception:
+            render_order_ids = []
+
+        if not render_order_ids:
+            for layer in getattr(animation, "layers", []) or []:
+                layer_id = getattr(layer, "layer_id", None)
+                if layer_id is None:
+                    continue
+                layer_id = int(layer_id)
+                if layer_id in layer_map:
+                    render_order_ids.append(layer_id)
+
+        ordered_unique_ids: List[int] = []
+        seen_ids: Set[int] = set()
+        for layer_id in render_order_ids:
+            if layer_id in seen_ids:
+                continue
+            seen_ids.add(layer_id)
+            ordered_unique_ids.append(layer_id)
+        for layer_id in layer_map.keys():
+            if layer_id not in seen_ids:
+                ordered_unique_ids.append(layer_id)
+        return ordered_unique_ids, layer_map
+
+    @staticmethod
+    def _blend_mode_requires_isolated_pass(blend_mode: int) -> bool:
+        """Return True when a blend mode should be isolated for compositing safety."""
+        normal_like = {
+            BlendMode.STANDARD,
+            BlendMode.PREMULT_ALPHA,
+            BlendMode.PREMULT_ALPHA_ALT,
+            BlendMode.PREMULT_ALPHA_ALT2,
+            BlendMode.INHERIT,
+        }
+        try:
+            mode = int(blend_mode)
+        except Exception:
+            return True
+        return mode not in normal_like
+
+    def _build_hierarchy_export_pass_assignments(self, animation: AnimationData) -> Dict[int, int]:
+        """Build hierarchy-driven pass assignments with draw-order safety."""
+        ordered_ids, layer_map = self._get_ordered_export_layer_context(animation)
+        if not ordered_ids:
+            return {}
+
+        def normalized_parent_id(layer_id: int) -> int:
+            layer = layer_map.get(layer_id)
+            if layer is None:
+                return -1
+            try:
+                parent_id = int(getattr(layer, "parent_id", -1))
+            except (TypeError, ValueError):
+                return -1
+            if parent_id < 0 or parent_id == layer_id or parent_id not in layer_map:
+                return -1
+            return parent_id
+
+        depth_cache: Dict[int, int] = {}
+        root_cache: Dict[int, int] = {}
+        visiting: Set[int] = set()
+
+        def resolve_depth(layer_id: int) -> int:
+            if layer_id in depth_cache:
+                return depth_cache[layer_id]
+            if layer_id in visiting:
+                return 0
+            visiting.add(layer_id)
+            try:
+                parent_id = normalized_parent_id(layer_id)
+                if parent_id < 0:
+                    depth = 0
+                else:
+                    depth = max(0, resolve_depth(parent_id) + 1)
+                depth_cache[layer_id] = depth
+                return depth
+            finally:
+                visiting.discard(layer_id)
+
+        def resolve_root(layer_id: int) -> int:
+            if layer_id in root_cache:
+                return root_cache[layer_id]
+            parent_id = normalized_parent_id(layer_id)
+            if parent_id < 0 or parent_id == layer_id:
+                root_cache[layer_id] = layer_id
+                return layer_id
+            root = resolve_root(parent_id)
+            root_cache[layer_id] = root
+            return root
+
+        assignments: Dict[int, int] = {}
+        previous_pass = 0
+        previous_root: Optional[int] = None
+        for layer_id in ordered_ids:
+            base_pass = max(1, resolve_depth(layer_id) + 1)
+            pass_number = max(base_pass, previous_pass)
+            parent_id = normalized_parent_id(layer_id)
+            if parent_id in assignments:
+                pass_number = max(pass_number, assignments[parent_id] + 1)
+            root_id = resolve_root(layer_id)
+            if previous_root is not None and root_id != previous_root and pass_number == previous_pass:
+                pass_number += 1
+            assignments[layer_id] = max(1, int(pass_number))
+            previous_pass = assignments[layer_id]
+            previous_root = root_id
+        return assignments
+
+    def _build_strict_export_pass_assignments(self, animation: AnimationData) -> Dict[int, int]:
+        """Build strict one-layer-per-pass assignments in active draw order."""
+        ordered_ids, _layer_map = self._get_ordered_export_layer_context(animation)
+        return {layer_id: idx + 1 for idx, layer_id in enumerate(ordered_ids)}
+
+    def _build_blend_smart_export_pass_assignments(self, animation: AnimationData) -> Dict[int, int]:
+        """
+        Build blend-aware assignments:
+        - isolate risky blend layers
+        - keep front/back order monotonic
+        - enforce parent->child separation when both are present
+        """
+        ordered_ids, layer_map = self._get_ordered_export_layer_context(animation)
+        if not ordered_ids:
+            return {}
+
+        def normalized_parent_id(layer_id: int) -> int:
+            layer = layer_map.get(layer_id)
+            if layer is None:
+                return -1
+            try:
+                parent_id = int(getattr(layer, "parent_id", -1))
+            except (TypeError, ValueError):
+                return -1
+            if parent_id < 0 or parent_id == layer_id or parent_id not in layer_map:
+                return -1
+            return parent_id
+
+        special_flags: List[bool] = []
+        for layer_id in ordered_ids:
+            layer = layer_map.get(layer_id)
+            blend_mode = int(getattr(layer, "blend_mode", BlendMode.STANDARD)) if layer else BlendMode.STANDARD
+            special_flags.append(self._blend_mode_requires_isolated_pass(blend_mode))
+
+        assignments: Dict[int, int] = {}
+        current_pass = 1
+        for idx, layer_id in enumerate(ordered_ids):
+            is_special = special_flags[idx]
+            prev_special = bool(idx > 0 and special_flags[idx - 1])
+            next_special = bool(idx + 1 < len(special_flags) and special_flags[idx + 1])
+
+            if idx == 0:
+                proposed_pass = 1
+            elif is_special:
+                proposed_pass = current_pass + 1
+            elif prev_special:
+                proposed_pass = current_pass + 1
+            elif next_special:
+                proposed_pass = current_pass
+            else:
+                proposed_pass = current_pass
+
+            parent_id = normalized_parent_id(layer_id)
+            if parent_id in assignments:
+                proposed_pass = max(proposed_pass, assignments[parent_id] + 1)
+
+            current_pass = max(current_pass, int(proposed_pass))
+            assignments[layer_id] = max(1, current_pass)
+
+        return assignments
+
+    def _apply_auto_export_pass_assignments(self, assignments: Dict[int, int], label: str):
+        """Apply generated assignments to UI and report stats."""
+        if not assignments:
+            self.log_widget.log("No eligible layers were found for export pass assignment.", "WARNING")
+            return
+        if not hasattr(self, "control_panel") or not self.control_panel:
+            return
+        self.control_panel.set_export_layer_pass_enabled(True)
+        self.control_panel.set_export_layer_pass_assignments(assignments, default_pass=1)
+        max_pass = max(assignments.values()) if assignments else 1
+        self.log_widget.log(
+            f"{label}: {len(assignments)} layers across {max_pass} pass(es).",
+            "SUCCESS",
+        )
+
+    def on_export_auto_assign_passes(self):
+        """Auto-assign export passes from hierarchy."""
+        animation = getattr(self.gl_widget.player, "animation", None)
+        if not animation or not getattr(animation, "layers", None):
+            self.log_widget.log("Load an animation before auto-assigning export passes.", "WARNING")
+            return
+        assignments = self._build_hierarchy_export_pass_assignments(animation)
+        self._apply_auto_export_pass_assignments(assignments, "Auto-assigned hierarchy passes")
+
+    def on_export_auto_assign_passes_strict(self):
+        """Auto-assign strict one-layer-per-pass export layout."""
+        animation = getattr(self.gl_widget.player, "animation", None)
+        if not animation or not getattr(animation, "layers", None):
+            self.log_widget.log("Load an animation before auto-assigning export passes.", "WARNING")
+            return
+        assignments = self._build_strict_export_pass_assignments(animation)
+        self._apply_auto_export_pass_assignments(assignments, "Auto-assigned strict passes")
+
+    def on_export_auto_assign_passes_blend_smart(self):
+        """Auto-assign blend-aware export passes for safer compositing."""
+        animation = getattr(self.gl_widget.player, "animation", None)
+        if not animation or not getattr(animation, "layers", None):
+            self.log_widget.log("Load an animation before auto-assigning export passes.", "WARNING")
+            return
+        assignments = self._build_blend_smart_export_pass_assignments(animation)
+        isolated_count = 0
+        ordered_ids, layer_map = self._get_ordered_export_layer_context(animation)
+        for layer_id in ordered_ids:
+            layer = layer_map.get(layer_id)
+            if not layer:
+                continue
+            blend_mode = int(getattr(layer, "blend_mode", BlendMode.STANDARD))
+            if self._blend_mode_requires_isolated_pass(blend_mode):
+                isolated_count += 1
+        self._apply_auto_export_pass_assignments(
+            assignments,
+            f"Auto-assigned blend-smart passes (isolated blend layers: {isolated_count})",
+        )
+
     def _create_unique_export_folder(self, root: str, base_name: str) -> str:
         """Create a unique directory inside root with base_name."""
         safe_name = re.sub(r'[^0-9a-zA-Z_-]+', '_', base_name).strip('_') or "animation"
@@ -20067,22 +20812,41 @@ class MSMAnimationViewer(QMainWindow):
             try:
                 background_color = self._active_background_color()
                 include_viewport_bg = bool(self.export_include_viewport_background)
-                image = self.render_frame_to_image(
-                    export_width,
-                    export_height,
-                    camera_override=camera_override,
-                    render_scale_override=render_scale_override,
-                    apply_centering=apply_centering,
-                    background_color=background_color,
-                    include_viewport_background=include_viewport_bg,
-                    motion_blur_frame_dt=1.0 / max(1.0, float(self.control_panel.fps_spin.value())),
-                )
-                
-                if image:
-                    image.save(filename, 'PNG')
-                    self.log_widget.log(f"Frame exported to: {filename}", "SUCCESS")
-                else:
+                pass_specs = self._collect_export_pass_specs()
+                exported_files: List[str] = []
+                total_passes = len(pass_specs)
+                for pass_number, included_layer_ids in pass_specs:
+                    output_path = self._with_export_pass_suffix(filename, pass_number, total_passes)
+                    image = self.render_frame_to_image(
+                        export_width,
+                        export_height,
+                        camera_override=camera_override,
+                        render_scale_override=render_scale_override,
+                        apply_centering=apply_centering,
+                        background_color=background_color,
+                        include_viewport_background=include_viewport_bg,
+                        motion_blur_frame_dt=1.0 / max(
+                            1.0, float(self.control_panel.fps_spin.value())
+                        ),
+                        included_layer_ids=included_layer_ids,
+                    )
+                    if image is None:
+                        self.log_widget.log(
+                            f"Failed to render frame for pass {pass_number}",
+                            "ERROR",
+                        )
+                        continue
+                    image.save(output_path, 'PNG')
+                    exported_files.append(output_path)
+                    self.log_widget.log(f"Frame exported to: {output_path}", "SUCCESS")
+
+                if not exported_files:
                     self.log_widget.log("Failed to render frame", "ERROR")
+                elif total_passes > 1:
+                    self.log_widget.log(
+                        f"Exported {len(exported_files)} frame pass files.",
+                        "SUCCESS",
+                    )
             
             except Exception as e:
                 self.log_widget.log(f"Error exporting frame: {e}", "ERROR")
@@ -20114,8 +20878,17 @@ class MSMAnimationViewer(QMainWindow):
         fps = float(max(1, self.control_panel.fps_spin.value()))
         real_duration = self._get_export_real_duration()
         total_frames = max(1, int(real_duration * fps))
+        pass_specs = self._collect_export_pass_specs()
+        total_passes = len(pass_specs)
+        total_steps = max(1, total_frames * max(1, total_passes))
+        pass_dirs: Dict[int, str] = {}
+        if total_passes > 1:
+            for pass_number, _ in pass_specs:
+                pass_dir = os.path.join(export_root, f"pass_{pass_number:03d}")
+                os.makedirs(pass_dir, exist_ok=True)
+                pass_dirs[pass_number] = pass_dir
 
-        progress = QProgressDialog("Exporting frames...", "Cancel", 0, total_frames, self)
+        progress = QProgressDialog("Exporting frames...", "Cancel", 0, total_steps, self)
         progress.setWindowTitle("PNG Frames Export")
         progress.setWindowModality(Qt.WindowModality.WindowModal)
         progress.setAutoClose(False)
@@ -20127,38 +20900,57 @@ class MSMAnimationViewer(QMainWindow):
         self._set_player_playing(False)
 
         exported = 0
+        step_index = 0
         try:
             background_color = self._active_background_color()
             include_viewport_bg = bool(self.export_include_viewport_background)
             for frame_idx in range(total_frames):
-                if progress.wasCanceled():
-                    self.log_widget.log("Frame export cancelled by user", "WARNING")
-                    break
-
                 frame_time = self._get_export_frame_time(frame_idx, fps)
                 self.gl_widget.player.current_time = frame_time
-                image = self.render_frame_to_image(
-                    width,
-                    height,
-                    camera_override=camera_override,
-                    render_scale_override=render_scale_override,
-                    apply_centering=apply_centering,
-                    background_color=background_color,
-                    include_viewport_background=include_viewport_bg,
-                    motion_blur_frame_dt=1.0 / max(1e-6, float(fps)),
-                )
-                if image:
-                    filename = os.path.join(
-                        export_root, f"{sanitized_name}_{frame_idx + 1:05d}.png"
-                    )
-                    image.save(filename, "PNG")
-                    exported += 1
-                else:
-                    self.log_widget.log(f"Failed to render frame {frame_idx}", "WARNING")
+                for pass_number, included_layer_ids in pass_specs:
+                    if progress.wasCanceled():
+                        self.log_widget.log("Frame export cancelled by user", "WARNING")
+                        break
 
-                progress.setValue(frame_idx + 1)
-                progress.setLabelText(f"Rendering frame {frame_idx + 1} of {total_frames}...")
-                QApplication.processEvents()
+                    image = self.render_frame_to_image(
+                        width,
+                        height,
+                        camera_override=camera_override,
+                        render_scale_override=render_scale_override,
+                        apply_centering=apply_centering,
+                        background_color=background_color,
+                        include_viewport_background=include_viewport_bg,
+                        motion_blur_frame_dt=1.0 / max(1e-6, float(fps)),
+                        included_layer_ids=included_layer_ids,
+                    )
+                    if image:
+                        if total_passes > 1:
+                            frame_folder = pass_dirs.get(pass_number, export_root)
+                        else:
+                            frame_folder = export_root
+                        filename = os.path.join(
+                            frame_folder, f"{sanitized_name}_{frame_idx + 1:05d}.png"
+                        )
+                        image.save(filename, "PNG")
+                        exported += 1
+                    else:
+                        self.log_widget.log(
+                            f"Failed to render frame {frame_idx} for pass {pass_number}",
+                            "WARNING",
+                        )
+
+                    step_index += 1
+                    progress.setValue(step_index)
+                    if total_passes > 1:
+                        progress.setLabelText(
+                            f"Rendering frame {frame_idx + 1}/{total_frames}, pass {pass_number}..."
+                        )
+                    else:
+                        progress.setLabelText(f"Rendering frame {frame_idx + 1} of {total_frames}...")
+                    QApplication.processEvents()
+
+                if progress.wasCanceled():
+                    break
         finally:
             progress.close()
             self.gl_widget.player.current_time = original_time
@@ -20169,10 +20961,24 @@ class MSMAnimationViewer(QMainWindow):
             QMessageBox.information(
                 self,
                 "Frames Exported",
-                f"Saved {exported} frames to:\n{export_root}"
+                (
+                    f"Saved {exported} frames to:\n{export_root}"
+                    if total_passes <= 1
+                    else (
+                        f"Saved {exported} frames across {total_passes} passes to:\n{export_root}"
+                    )
+                )
             )
             self.log_widget.log(
-                f"PNG frames exported to {export_root} ({exported} files)", "SUCCESS"
+                (
+                    f"PNG frames exported to {export_root} ({exported} files)"
+                    if total_passes <= 1
+                    else (
+                        f"PNG frame passes exported to {export_root} "
+                        f"({exported} files across {total_passes} passes)"
+                    )
+                ),
+                "SUCCESS",
             )
         else:
             shutil.rmtree(export_root, ignore_errors=True)
@@ -21190,6 +21996,7 @@ class MSMAnimationViewer(QMainWindow):
         extra_scale: float,
         *,
         export_label: str = "Video",
+        included_layer_ids: Optional[Set[int]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Render animation frames (and optional audio) for a video export."""
         animation = getattr(self.gl_widget.player, "animation", None)
@@ -21264,6 +22071,7 @@ class MSMAnimationViewer(QMainWindow):
                     background_color=background_color,
                     include_viewport_background=include_viewport_bg,
                     motion_blur_frame_dt=1.0 / max(1e-6, float(fps)),
+                    included_layer_ids=included_layer_ids,
                 )
                 if image:
                     frame_path = os.path.join(temp_dir, f"frame_{frame_num:06d}.png")
@@ -21367,44 +22175,8 @@ class MSMAnimationViewer(QMainWindow):
 
         mov_codec = self.export_settings.mov_codec
         mov_quality = getattr(self.export_settings, 'mov_quality', 'high') or 'high'
-        output_file = filename.replace('\\', '/')
-        
         fps = self.control_panel.fps_spin.value()
         mov_extra_scale = max(1.0, float(getattr(self.export_settings, 'mov_full_scale_multiplier', 1.0)))
-        frame_info = self._render_video_frames(
-            fps,
-            include_audio=self.export_settings.mov_include_audio,
-            use_full_res=self.export_settings.mov_full_resolution,
-            extra_scale=mov_extra_scale,
-            export_label="MOV",
-        )
-        if not frame_info:
-            return
-
-        temp_dir = frame_info["temp_dir"]
-        audio_track_path = frame_info["audio_path"]
-        input_pattern = frame_info["input_pattern"]
-        output_file = filename.replace('\\', '/')
-        mov_codec = self.export_settings.mov_codec
-
-        self.log_widget.log(f"Input pattern: {input_pattern}", "INFO")
-        self.log_widget.log(f"Output file: {output_file}", "INFO")
-        self.log_widget.log(f"Using codec: {mov_codec}", "INFO")
-
-        def build_ffmpeg_cmd(extra_args, audio_codec='pcm_s16le'):
-            cmd = [
-                ffmpeg_path,
-                '-y',
-                '-framerate', str(frame_info["fps"]),
-                '-i', input_pattern,
-            ]
-            if audio_track_path:
-                cmd += ['-i', audio_track_path]
-            cmd += extra_args
-            if audio_track_path:
-                cmd += ['-c:a', audio_codec, '-shortest']
-            return cmd
-
         def build_mov_codec_args(codec_name: str) -> List[str]:
             normalized = (codec_name or "").strip().lower()
             if normalized in {"h264_nvenc", "hevc_nvenc"}:
@@ -21421,14 +22193,13 @@ class MSMAnimationViewer(QMainWindow):
                     "lossless": "veryslow",
                 }
                 lossless = mov_quality == "lossless"
-                args = self._build_nvenc_video_args(
+                return self._build_nvenc_video_args(
                     normalized,
                     quality_value=quality_to_cq.get(mov_quality, 19),
                     preset_name=quality_to_preset.get(mov_quality, "medium"),
                     pix_fmt="yuv420p",
                     lossless=lossless,
                 )
-                return args
             if normalized in {"prores_ks", "prores"}:
                 return [
                     '-c:v', 'prores_ks',
@@ -21443,111 +22214,190 @@ class MSMAnimationViewer(QMainWindow):
             return ['-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-crf', '18']
 
         if mov_codec == 'h264_nvenc' and not self._ffmpeg_supports_encoder(ffmpeg_path, 'h264_nvenc'):
-            self.log_widget.log("Selected MOV codec h264_nvenc is unavailable in this FFmpeg build; falling back to libx264.", "WARNING")
+            self.log_widget.log(
+                "Selected MOV codec h264_nvenc is unavailable in this FFmpeg build; falling back to libx264.",
+                "WARNING",
+            )
             mov_codec = 'libx264'
         elif mov_codec == 'hevc_nvenc' and not self._ffmpeg_supports_encoder(ffmpeg_path, 'hevc_nvenc'):
-            self.log_widget.log("Selected MOV codec hevc_nvenc is unavailable in this FFmpeg build; falling back to libx264.", "WARNING")
+            self.log_widget.log(
+                "Selected MOV codec hevc_nvenc is unavailable in this FFmpeg build; falling back to libx264.",
+                "WARNING",
+            )
             mov_codec = 'libx264'
 
-        export_success = False
+        pass_specs = self._collect_export_pass_specs()
+        total_passes = len(pass_specs)
+        completed_outputs: List[str] = []
 
-        try:
-            # Try ProRes 4444 first - best Adobe compatibility with alpha
-            if mov_codec == 'prores_ks' or mov_codec == 'prores':
-                self.log_widget.log("Trying ProRes 4444 (best Adobe compatibility)...", "INFO")
-                ffmpeg_cmd = build_ffmpeg_cmd(build_mov_codec_args('prores_ks') + [output_file])
-                
-                result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
-                
-                if result.returncode == 0 and os.path.exists(filename):
-                    file_size = os.path.getsize(filename)
-                    self.log_widget.log(f"Animation exported (ProRes 4444) to: {filename} ({file_size} bytes)", "SUCCESS")
-                    export_success = True
-            
-            # Try PNG codec - good compatibility, lossless with alpha
-            if not export_success and (mov_codec == 'png' or mov_codec == 'prores_ks'):
-                self.log_widget.log("Trying PNG codec...", "INFO")
-                ffmpeg_cmd = build_ffmpeg_cmd(build_mov_codec_args('png') + [output_file])
-                
-                result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
-                
-                if result.returncode == 0 and os.path.exists(filename):
-                    file_size = os.path.getsize(filename)
-                    self.log_widget.log(f"Animation exported (PNG codec) to: {filename} ({file_size} bytes)", "SUCCESS")
-                    export_success = True
-            
-            # Try QuickTime Animation (qtrle) with rgba pixel format
-            if not export_success and mov_codec == 'qtrle':
-                self.log_widget.log("Trying QuickTime Animation codec...", "INFO")
-                ffmpeg_cmd = build_ffmpeg_cmd(build_mov_codec_args('qtrle') + [output_file])
-                
-                result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
-                
-                if result.returncode == 0 and os.path.exists(filename):
-                    file_size = os.path.getsize(filename)
-                    self.log_widget.log(f"Animation exported (QuickTime Animation) to: {filename} ({file_size} bytes)", "SUCCESS")
-                    export_success = True
+        for pass_number, included_layer_ids in pass_specs:
+            pass_output = self._with_export_pass_suffix(filename, pass_number, total_passes)
+            pass_output_file = pass_output.replace('\\', '/')
+            pass_label = f"MOV Pass {pass_number}" if total_passes > 1 else "MOV"
+            frame_info = self._render_video_frames(
+                fps,
+                include_audio=self.export_settings.mov_include_audio,
+                use_full_res=self.export_settings.mov_full_resolution,
+                extra_scale=mov_extra_scale,
+                export_label=pass_label,
+                included_layer_ids=included_layer_ids,
+            )
+            if not frame_info:
+                if not completed_outputs:
+                    return
+                break
 
-            if not export_success and mov_codec in {'libx264', 'h264_nvenc', 'hevc_nvenc'}:
-                self.log_widget.log(f"Trying {mov_codec} MOV export...", "INFO")
-                ffmpeg_cmd = build_ffmpeg_cmd(build_mov_codec_args(mov_codec) + [output_file], audio_codec='aac')
-                result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
-                if result.returncode == 0 and os.path.exists(filename):
-                    file_size = os.path.getsize(filename)
-                    self.log_widget.log(f"Animation exported ({mov_codec}) to: {filename} ({file_size} bytes)", "SUCCESS")
-                    export_success = True
-            
-            # Fallback chain if preferred codec failed
-            if not export_success:
-                self.log_widget.log("Preferred codec failed, trying fallback chain...", "WARNING")
-                
-                # Try ProRes 4444 as first fallback
-                self.log_widget.log("Fallback: Trying ProRes 4444...", "INFO")
-                ffmpeg_cmd = build_ffmpeg_cmd(build_mov_codec_args('prores_ks') + [output_file])
-                
-                result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
-                
-                if result.returncode == 0 and os.path.exists(filename):
-                    file_size = os.path.getsize(filename)
-                    self.log_widget.log(f"Animation exported (ProRes 4444 fallback) to: {filename} ({file_size} bytes)", "SUCCESS")
-                    export_success = True
-                else:
-                    # Try PNG as second fallback
-                    self.log_widget.log("Fallback: Trying PNG codec...", "INFO")
-                    ffmpeg_cmd = build_ffmpeg_cmd(build_mov_codec_args('png') + [output_file])
-                    
+            temp_dir = frame_info["temp_dir"]
+            audio_track_path = frame_info["audio_path"]
+            input_pattern = frame_info["input_pattern"]
+
+            self.log_widget.log(f"Input pattern: {input_pattern}", "INFO")
+            self.log_widget.log(f"Output file: {pass_output_file}", "INFO")
+            self.log_widget.log(f"Using codec: {mov_codec}", "INFO")
+
+            def build_ffmpeg_cmd(extra_args, audio_codec='pcm_s16le'):
+                cmd = [
+                    ffmpeg_path,
+                    '-y',
+                    '-framerate', str(frame_info["fps"]),
+                    '-i', input_pattern,
+                ]
+                if audio_track_path:
+                    cmd += ['-i', audio_track_path]
+                cmd += extra_args
+                if audio_track_path:
+                    cmd += ['-c:a', audio_codec, '-shortest']
+                return cmd
+
+            export_success = False
+            try:
+                if mov_codec in {'prores_ks', 'prores'}:
+                    self.log_widget.log("Trying ProRes 4444 (best Adobe compatibility)...", "INFO")
+                    ffmpeg_cmd = build_ffmpeg_cmd(build_mov_codec_args('prores_ks') + [pass_output_file])
                     result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
-                    
-                    if result.returncode == 0 and os.path.exists(filename):
-                        file_size = os.path.getsize(filename)
-                        self.log_widget.log(f"Animation exported (PNG fallback) to: {filename} ({file_size} bytes)", "SUCCESS")
+                    if result.returncode == 0 and os.path.exists(pass_output):
+                        file_size = os.path.getsize(pass_output)
+                        self.log_widget.log(
+                            f"Animation exported (ProRes 4444) to: {pass_output} ({file_size} bytes)",
+                            "SUCCESS",
+                        )
+                        export_success = True
+
+                if not export_success and mov_codec in {'png', 'prores_ks'}:
+                    self.log_widget.log("Trying PNG codec...", "INFO")
+                    ffmpeg_cmd = build_ffmpeg_cmd(build_mov_codec_args('png') + [pass_output_file])
+                    result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
+                    if result.returncode == 0 and os.path.exists(pass_output):
+                        file_size = os.path.getsize(pass_output)
+                        self.log_widget.log(
+                            f"Animation exported (PNG codec) to: {pass_output} ({file_size} bytes)",
+                            "SUCCESS",
+                        )
+                        export_success = True
+
+                if not export_success and mov_codec == 'qtrle':
+                    self.log_widget.log("Trying QuickTime Animation codec...", "INFO")
+                    ffmpeg_cmd = build_ffmpeg_cmd(build_mov_codec_args('qtrle') + [pass_output_file])
+                    result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
+                    if result.returncode == 0 and os.path.exists(pass_output):
+                        file_size = os.path.getsize(pass_output)
+                        self.log_widget.log(
+                            f"Animation exported (QuickTime Animation) to: {pass_output} ({file_size} bytes)",
+                            "SUCCESS",
+                        )
+                        export_success = True
+
+                if not export_success and mov_codec in {'libx264', 'h264_nvenc', 'hevc_nvenc'}:
+                    self.log_widget.log(f"Trying {mov_codec} MOV export...", "INFO")
+                    ffmpeg_cmd = build_ffmpeg_cmd(
+                        build_mov_codec_args(mov_codec) + [pass_output_file],
+                        audio_codec='aac',
+                    )
+                    result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
+                    if result.returncode == 0 and os.path.exists(pass_output):
+                        file_size = os.path.getsize(pass_output)
+                        self.log_widget.log(
+                            f"Animation exported ({mov_codec}) to: {pass_output} ({file_size} bytes)",
+                            "SUCCESS",
+                        )
+                        export_success = True
+
+                if not export_success:
+                    self.log_widget.log("Preferred codec failed, trying fallback chain...", "WARNING")
+                    self.log_widget.log("Fallback: Trying ProRes 4444...", "INFO")
+                    ffmpeg_cmd = build_ffmpeg_cmd(build_mov_codec_args('prores_ks') + [pass_output_file])
+                    result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
+                    if result.returncode == 0 and os.path.exists(pass_output):
+                        file_size = os.path.getsize(pass_output)
+                        self.log_widget.log(
+                            f"Animation exported (ProRes 4444 fallback) to: {pass_output} ({file_size} bytes)",
+                            "SUCCESS",
+                        )
                         export_success = True
                     else:
-                        # Final fallback - H.264 without alpha
-                        self.log_widget.log("All alpha codecs failed, exporting without transparency...", "WARNING")
-                        
-                        mp4_file = filename.replace('.mov', '.mp4')
-                        ffmpeg_cmd = build_ffmpeg_cmd(build_mov_codec_args('libx264') + [mp4_file], audio_codec='aac')
-                        
+                        self.log_widget.log("Fallback: Trying PNG codec...", "INFO")
+                        ffmpeg_cmd = build_ffmpeg_cmd(build_mov_codec_args('png') + [pass_output_file])
                         result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
-                        
-                        if result.returncode == 0 and os.path.exists(mp4_file):
-                            file_size = os.path.getsize(mp4_file)
-                            self.log_widget.log(f"Animation exported (no alpha) to: {mp4_file} ({file_size} bytes)", "SUCCESS")
+                        if result.returncode == 0 and os.path.exists(pass_output):
+                            file_size = os.path.getsize(pass_output)
+                            self.log_widget.log(
+                                f"Animation exported (PNG fallback) to: {pass_output} ({file_size} bytes)",
+                                "SUCCESS",
+                            )
                             export_success = True
                         else:
-                            self.log_widget.log(f"All encoding attempts failed. Error: {result.stderr}", "ERROR")
-            
-        except Exception as e:
-            self.log_widget.log(f"Error exporting animation: {e}", "ERROR")
-            import traceback
-            traceback.print_exc()
-        finally:
-            self.log_widget.log("Cleaning up temporary files...", "INFO")
-            shutil.rmtree(temp_dir, ignore_errors=True)
-        self.gl_widget.player.current_time = frame_info["original_time"]
-        self._set_player_playing(frame_info["original_playing"])
-        self.gl_widget.update()
+                            self.log_widget.log(
+                                "All alpha codecs failed, exporting without transparency...",
+                                "WARNING",
+                            )
+                            mp4_file = f"{os.path.splitext(pass_output)[0]}.mp4"
+                            ffmpeg_cmd = build_ffmpeg_cmd(
+                                build_mov_codec_args('libx264') + [mp4_file.replace('\\', '/')],
+                                audio_codec='aac',
+                            )
+                            result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
+                            if result.returncode == 0 and os.path.exists(mp4_file):
+                                file_size = os.path.getsize(mp4_file)
+                                self.log_widget.log(
+                                    f"Animation exported (no alpha) to: {mp4_file} ({file_size} bytes)",
+                                    "SUCCESS",
+                                )
+                                export_success = True
+                            else:
+                                self.log_widget.log(
+                                    f"All encoding attempts failed. Error: {result.stderr}",
+                                    "ERROR",
+                                )
+            except Exception as e:
+                self.log_widget.log(f"Error exporting animation: {e}", "ERROR")
+                import traceback
+                traceback.print_exc()
+            finally:
+                self.log_widget.log("Cleaning up temporary files...", "INFO")
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                self.gl_widget.player.current_time = frame_info["original_time"]
+                self._set_player_playing(frame_info["original_playing"])
+                self.gl_widget.update()
+
+            if export_success:
+                completed_outputs.append(pass_output)
+            else:
+                if total_passes > 1:
+                    QMessageBox.warning(
+                        self,
+                        "MOV Export Failed",
+                        (
+                            f"Pass {pass_number} could not be encoded.\n\n"
+                            "Check the log for FFmpeg details."
+                        ),
+                    )
+                break
+
+        if total_passes > 1 and completed_outputs:
+            self.log_widget.log(
+                f"MOV multi-pass export completed: {len(completed_outputs)} file(s).",
+                "SUCCESS",
+            )
 
     def export_as_mp4(self):
         """Export animation as MP4 video."""
@@ -21575,110 +22425,137 @@ class MSMAnimationViewer(QMainWindow):
         if not filename.lower().endswith('.mp4'):
             filename += '.mp4'
 
-        codec = getattr(self.export_settings, 'mp4_codec', 'libx264') or 'libx264'
-        crf = int(getattr(self.export_settings, 'mp4_crf', 18))
-        preset = getattr(self.export_settings, 'mp4_preset', 'medium') or 'medium'
-        bitrate = int(getattr(self.export_settings, 'mp4_bitrate', 0))
-        pix_fmt = getattr(self.export_settings, 'mp4_pixel_format', 'yuv420p') or 'yuv420p'
-        faststart = bool(getattr(self.export_settings, 'mp4_faststart', True))
         fps = self.control_panel.fps_spin.value()
         mp4_extra_scale = max(1.0, float(getattr(self.export_settings, 'mp4_full_scale_multiplier', 1.0)))
-        frame_info = self._render_video_frames(
-            fps,
-            include_audio=getattr(self.export_settings, 'mp4_include_audio', True),
-            use_full_res=getattr(self.export_settings, 'mp4_full_resolution', False),
-            extra_scale=mp4_extra_scale,
-            export_label="MP4",
-        )
-        if not frame_info:
-            return
+        pass_specs = self._collect_export_pass_specs()
+        total_passes = len(pass_specs)
+        completed_outputs: List[str] = []
+        export_failed = False
 
-        temp_dir = frame_info["temp_dir"]
-        audio_track_path = frame_info["audio_path"]
-        input_pattern = frame_info["input_pattern"]
-        output_file = filename.replace('\\', '/')
-        thread_args = self._ffmpeg_thread_args()
-
-        codec = getattr(self.export_settings, 'mp4_codec', 'libx264') or 'libx264'
-        crf = int(getattr(self.export_settings, 'mp4_crf', 18))
-        preset = getattr(self.export_settings, 'mp4_preset', 'medium') or 'medium'
-        bitrate = int(getattr(self.export_settings, 'mp4_bitrate', 0))
-        pix_fmt = getattr(self.export_settings, 'mp4_pixel_format', 'yuv420p') or 'yuv420p'
-        faststart = bool(getattr(self.export_settings, 'mp4_faststart', True))
-
-        if codec == 'h264_nvenc' and not self._ffmpeg_supports_encoder(ffmpeg_path, 'h264_nvenc'):
-            self.log_widget.log("Selected MP4 codec h264_nvenc is unavailable in this FFmpeg build; falling back to libx264.", "WARNING")
-            codec = 'libx264'
-        elif codec == 'hevc_nvenc' and not self._ffmpeg_supports_encoder(ffmpeg_path, 'hevc_nvenc'):
-            self.log_widget.log("Selected MP4 codec hevc_nvenc is unavailable in this FFmpeg build; falling back to libx265.", "WARNING")
-            codec = 'libx265'
-
-        self.log_widget.log(f"MP4 codec: {codec}, preset={preset}, CRF={crf}", "INFO")
-        self.log_widget.log(f"Input pattern: {input_pattern}", "INFO")
-        self.log_widget.log(f"Output file: {output_file}", "INFO")
-
-        cmd = [
-            ffmpeg_path,
-            '-y',
-            '-framerate', str(frame_info["fps"]),
-            '-i', input_pattern,
-        ]
-        cmd += thread_args
-        if audio_track_path:
-            cmd += ['-i', audio_track_path]
-
-        if codec in {'h264_nvenc', 'hevc_nvenc'}:
-            cmd += self._build_nvenc_video_args(
-                codec,
-                quality_value=crf,
-                preset_name=preset,
-                pix_fmt=pix_fmt,
-                bitrate_kbps=bitrate,
-                lossless=False,
+        for pass_number, included_layer_ids in pass_specs:
+            pass_output = self._with_export_pass_suffix(filename, pass_number, total_passes)
+            output_file = pass_output.replace('\\', '/')
+            pass_label = f"MP4 Pass {pass_number}" if total_passes > 1 else "MP4"
+            frame_info = self._render_video_frames(
+                fps,
+                include_audio=getattr(self.export_settings, 'mp4_include_audio', True),
+                use_full_res=getattr(self.export_settings, 'mp4_full_resolution', False),
+                extra_scale=mp4_extra_scale,
+                export_label=pass_label,
+                included_layer_ids=included_layer_ids,
             )
-        else:
-            cmd += ['-c:v', codec, '-preset', preset, '-crf', str(crf)]
-            if bitrate > 0:
-                cmd += ['-b:v', f"{bitrate}k"]
-            if pix_fmt:
-                cmd += ['-pix_fmt', pix_fmt]
-        if codec in {'libx265', 'hevc_nvenc'}:
-            cmd += ['-tag:v', 'hvc1']
-        if faststart:
-            cmd += ['-movflags', '+faststart']
+            if not frame_info:
+                if not completed_outputs:
+                    return
+                break
 
-        if audio_track_path:
-            cmd += ['-c:a', 'aac', '-b:a', '192k', '-shortest']
-        else:
-            cmd += ['-an']
+            temp_dir = frame_info["temp_dir"]
+            audio_track_path = frame_info["audio_path"]
+            input_pattern = frame_info["input_pattern"]
+            thread_args = self._ffmpeg_thread_args()
 
-        cmd.append(output_file)
+            codec = getattr(self.export_settings, 'mp4_codec', 'libx264') or 'libx264'
+            crf = int(getattr(self.export_settings, 'mp4_crf', 18))
+            preset = getattr(self.export_settings, 'mp4_preset', 'medium') or 'medium'
+            bitrate = int(getattr(self.export_settings, 'mp4_bitrate', 0))
+            pix_fmt = getattr(self.export_settings, 'mp4_pixel_format', 'yuv420p') or 'yuv420p'
+            faststart = bool(getattr(self.export_settings, 'mp4_faststart', True))
 
-        export_success = False
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            if result.returncode == 0 and os.path.exists(filename):
-                file_size = os.path.getsize(filename)
-                self.log_widget.log(f"Animation exported (MP4) to: {filename} ({file_size} bytes)", "SUCCESS")
-                export_success = True
+            if codec == 'h264_nvenc' and not self._ffmpeg_supports_encoder(ffmpeg_path, 'h264_nvenc'):
+                self.log_widget.log(
+                    "Selected MP4 codec h264_nvenc is unavailable in this FFmpeg build; "
+                    "falling back to libx264.",
+                    "WARNING",
+                )
+                codec = 'libx264'
+            elif codec == 'hevc_nvenc' and not self._ffmpeg_supports_encoder(ffmpeg_path, 'hevc_nvenc'):
+                self.log_widget.log(
+                    "Selected MP4 codec hevc_nvenc is unavailable in this FFmpeg build; "
+                    "falling back to libx265.",
+                    "WARNING",
+                )
+                codec = 'libx265'
+
+            self.log_widget.log(f"MP4 codec: {codec}, preset={preset}, CRF={crf}", "INFO")
+            self.log_widget.log(f"Input pattern: {input_pattern}", "INFO")
+            self.log_widget.log(f"Output file: {output_file}", "INFO")
+
+            cmd = [
+                ffmpeg_path,
+                '-y',
+                '-framerate', str(frame_info["fps"]),
+                '-i', input_pattern,
+            ]
+            cmd += thread_args
+            if audio_track_path:
+                cmd += ['-i', audio_track_path]
+
+            if codec in {'h264_nvenc', 'hevc_nvenc'}:
+                cmd += self._build_nvenc_video_args(
+                    codec,
+                    quality_value=crf,
+                    preset_name=preset,
+                    pix_fmt=pix_fmt,
+                    bitrate_kbps=bitrate,
+                    lossless=False,
+                )
             else:
-                message = result.stderr.strip() or "Unknown error"
-                self.log_widget.log(f"MP4 encoding failed: {message}", "ERROR")
-        except Exception as exc:
-            self.log_widget.log(f"Error exporting MP4: {exc}", "ERROR")
-            import traceback
-            traceback.print_exc()
-        finally:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-            self.gl_widget.player.current_time = frame_info["original_time"]
-            self._set_player_playing(frame_info["original_playing"])
-            self.gl_widget.update()
+                cmd += ['-c:v', codec, '-preset', preset, '-crf', str(crf)]
+                if bitrate > 0:
+                    cmd += ['-b:v', f"{bitrate}k"]
+                if pix_fmt:
+                    cmd += ['-pix_fmt', pix_fmt]
+            if codec in {'libx265', 'hevc_nvenc'}:
+                cmd += ['-tag:v', 'hvc1']
+            if faststart:
+                cmd += ['-movflags', '+faststart']
 
-        if not export_success:
+            if audio_track_path:
+                cmd += ['-c:a', 'aac', '-b:a', '192k', '-shortest']
+            else:
+                cmd += ['-an']
+
+            cmd.append(output_file)
+
+            export_success = False
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                if result.returncode == 0 and os.path.exists(pass_output):
+                    file_size = os.path.getsize(pass_output)
+                    self.log_widget.log(
+                        f"Animation exported (MP4) to: {pass_output} ({file_size} bytes)",
+                        "SUCCESS",
+                    )
+                    export_success = True
+                else:
+                    message = result.stderr.strip() or "Unknown error"
+                    self.log_widget.log(f"MP4 encoding failed: {message}", "ERROR")
+            except Exception as exc:
+                self.log_widget.log(f"Error exporting MP4: {exc}", "ERROR")
+                import traceback
+                traceback.print_exc()
+            finally:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                self.gl_widget.player.current_time = frame_info["original_time"]
+                self._set_player_playing(frame_info["original_playing"])
+                self.gl_widget.update()
+
+            if export_success:
+                completed_outputs.append(pass_output)
+            else:
+                export_failed = True
+                break
+
+        if not completed_outputs or export_failed:
             QMessageBox.warning(
                 self,
                 "MP4 Export Failed",
-                "FFmpeg was unable to encode the MP4 file. Check the log for details.",
+                "FFmpeg was unable to encode one or more MP4 outputs. Check the log for details.",
+            )
+        elif total_passes > 1:
+            self.log_widget.log(
+                f"MP4 multi-pass export completed: {len(completed_outputs)} file(s).",
+                "SUCCESS",
             )
 
     def export_as_webm(self):
@@ -21713,134 +22590,206 @@ class MSMAnimationViewer(QMainWindow):
 
         fps = self.control_panel.fps_spin.value()
         webm_extra_scale = max(1.0, float(getattr(self.export_settings, 'webm_full_scale_multiplier', 1.0)))
-        frame_info = self._render_video_frames(
-            fps,
-            include_audio=self.export_settings.webm_include_audio,
-            use_full_res=getattr(self.export_settings, 'webm_full_resolution', False),
-            extra_scale=webm_extra_scale,
-            export_label="WEBM",
-        )
-        if not frame_info:
-            return
+        pass_specs = self._collect_export_pass_specs()
+        total_passes = len(pass_specs)
+        completed_outputs: List[str] = []
+        export_failed = False
 
-        temp_dir = frame_info["temp_dir"]
-        audio_track_path = frame_info["audio_path"]
-        input_pattern = frame_info["input_pattern"]
-        codec_pref = getattr(self.export_settings, 'webm_codec', 'libvpx-vp9')
-        crf = int(getattr(self.export_settings, 'webm_crf', 28))
-        speed = int(getattr(self.export_settings, 'webm_speed', 4))
-        output_file = filename.replace('\\', '/')
-        thread_args = self._ffmpeg_thread_args()
+        for pass_number, included_layer_ids in pass_specs:
+            pass_output = self._with_export_pass_suffix(filename, pass_number, total_passes)
+            output_file = pass_output.replace('\\', '/')
+            pass_label = f"WEBM Pass {pass_number}" if total_passes > 1 else "WEBM"
+            frame_info = self._render_video_frames(
+                fps,
+                include_audio=self.export_settings.webm_include_audio,
+                use_full_res=getattr(self.export_settings, 'webm_full_resolution', False),
+                extra_scale=webm_extra_scale,
+                export_label=pass_label,
+                included_layer_ids=included_layer_ids,
+            )
+            if not frame_info:
+                if not completed_outputs:
+                    return
+                break
 
-        self.log_widget.log(f"Input pattern: {input_pattern}", "INFO")
-        self.log_widget.log(f"Output file: {output_file}", "INFO")
-        self.log_widget.log(f"Preferred WEBM codec: {codec_pref}", "INFO")
+            temp_dir = frame_info["temp_dir"]
+            audio_track_path = frame_info["audio_path"]
+            input_pattern = frame_info["input_pattern"]
+            codec_pref = getattr(self.export_settings, 'webm_codec', 'libvpx-vp9')
+            crf = int(getattr(self.export_settings, 'webm_crf', 28))
+            speed = int(getattr(self.export_settings, 'webm_speed', 4))
+            thread_args = self._ffmpeg_thread_args()
 
-        def build_video_args(codec_name: str) -> Tuple[List[str], bool]:
-            normalized = codec_name.lower()
-            supports_alpha = normalized in ('libvpx-vp9', 'libaom-av1')
-            pix_fmt = 'yuva420p' if supports_alpha else 'yuv420p'
-            args = ['-c:v', normalized, '-pix_fmt', pix_fmt]
-            if normalized == 'libvpx-vp9':
-                args += ['-b:v', '0', '-crf', str(crf), '-row-mt', '1', '-tile-columns', '2', '-frame-parallel', '1', '-speed', str(speed)]
-                if supports_alpha:
-                    args += ['-auto-alt-ref', '0']
-            elif normalized == 'libaom-av1':
-                args += ['-b:v', '0', '-crf', str(crf), '-cpu-used', str(speed), '-row-mt', '1']
-            else:
-                args += ['-b:v', '0', '-crf', str(crf), '-quality', 'good', '-cpu-used', str(speed)]
-            return args, supports_alpha
+            self.log_widget.log(f"Input pattern: {input_pattern}", "INFO")
+            self.log_widget.log(f"Output file: {output_file}", "INFO")
+            self.log_widget.log(f"Preferred WEBM codec: {codec_pref}", "INFO")
 
-        def build_ffmpeg_cmd(video_args: List[str], audio_codec: str = 'libopus') -> List[str]:
-            cmd = [
-                ffmpeg_path,
-                '-y',
-                '-framerate', str(frame_info["fps"]),
-                '-i', input_pattern,
-            ]
-            cmd += thread_args
-            if audio_track_path:
-                cmd += ['-i', audio_track_path]
-            cmd += video_args
-            if audio_track_path:
-                cmd += ['-c:a', audio_codec, '-b:a', '160k', '-shortest']
-            else:
-                cmd += ['-an']
-            cmd.append(output_file)
-            return cmd
-
-        encode_order: List[str] = [codec_pref]
-        if 'libvpx-vp9' not in [c.lower() for c in encode_order]:
-            encode_order.append('libvpx-vp9')
-        if 'libvpx' not in [c.lower() for c in encode_order]:
-            encode_order.append('libvpx')
-
-        export_success = False
-        try:
-            for codec_name in encode_order:
-                video_args, supports_alpha = build_video_args(codec_name)
-                if not supports_alpha:
-                    self.log_widget.log(
-                        f"Codec '{codec_name}' does not support alpha; output will be opaque.",
-                        "WARNING",
-                    )
-                self.log_widget.log(f"Encoding WEBM using {codec_name}...", "INFO")
-                ffmpeg_cmd = build_ffmpeg_cmd(video_args)
-                result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
-                if result.returncode == 0 and os.path.exists(filename):
-                    file_size = os.path.getsize(filename)
-                    self.log_widget.log(
-                        f"Animation exported ({codec_name}) to: {filename} ({file_size} bytes)",
-                        "SUCCESS",
-                    )
-                    export_success = True
-                    break
+            def build_video_args(codec_name: str) -> Tuple[List[str], bool]:
+                normalized = codec_name.lower()
+                supports_alpha = normalized in ('libvpx-vp9', 'libaom-av1')
+                pix_fmt = 'yuva420p' if supports_alpha else 'yuv420p'
+                args = ['-c:v', normalized, '-pix_fmt', pix_fmt]
+                if normalized == 'libvpx-vp9':
+                    args += [
+                        '-b:v', '0',
+                        '-crf', str(crf),
+                        '-row-mt', '1',
+                        '-tile-columns', '2',
+                        '-frame-parallel', '1',
+                        '-speed', str(speed),
+                    ]
+                    if supports_alpha:
+                        args += ['-auto-alt-ref', '0']
+                elif normalized == 'libaom-av1':
+                    args += ['-b:v', '0', '-crf', str(crf), '-cpu-used', str(speed), '-row-mt', '1']
                 else:
-                    self.log_widget.log(
-                        f"{codec_name} encoding failed: {result.stderr.strip()}",
-                        "WARNING",
-                    )
+                    args += ['-b:v', '0', '-crf', str(crf), '-quality', 'good', '-cpu-used', str(speed)]
+                return args, supports_alpha
 
-            if not export_success:
-                self.log_widget.log(
-                    "WEBM encoding failed, exporting fallback MP4 without alpha.",
-                    "WARNING",
-                )
-                mp4_file = filename.replace('.webm', '.mp4')
-                ffmpeg_cmd = [
+            def build_ffmpeg_cmd(video_args: List[str], audio_codec: str = 'libopus') -> List[str]:
+                cmd = [
                     ffmpeg_path,
                     '-y',
                     '-framerate', str(frame_info["fps"]),
                     '-i', input_pattern,
                 ]
-                ffmpeg_cmd += thread_args
+                cmd += thread_args
                 if audio_track_path:
-                    ffmpeg_cmd += ['-i', audio_track_path]
-                ffmpeg_cmd += ['-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-crf', '18', mp4_file.replace('\\', '/')]
+                    cmd += ['-i', audio_track_path]
+                cmd += video_args
                 if audio_track_path:
-                    ffmpeg_cmd += ['-c:a', 'aac', '-b:a', '160k', '-shortest']
-                result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
-                if result.returncode == 0 and os.path.exists(mp4_file):
-                    file_size = os.path.getsize(mp4_file)
-                    self.log_widget.log(
-                        f"Animation exported (MP4 fallback) to: {mp4_file} ({file_size} bytes)",
-                        "SUCCESS",
-                    )
-                    export_success = True
+                    cmd += ['-c:a', audio_codec, '-b:a', '160k', '-shortest']
                 else:
+                    cmd += ['-an']
+                cmd.append(output_file)
+                return cmd
+
+            encode_order: List[str] = [codec_pref]
+            if 'libvpx-vp9' not in [c.lower() for c in encode_order]:
+                encode_order.append('libvpx-vp9')
+            if 'libvpx' not in [c.lower() for c in encode_order]:
+                encode_order.append('libvpx')
+
+            export_success = False
+            try:
+                for codec_name in encode_order:
+                    video_args, supports_alpha = build_video_args(codec_name)
+                    if not supports_alpha:
+                        self.log_widget.log(
+                            f"Codec '{codec_name}' does not support alpha; output will be opaque.",
+                            "WARNING",
+                        )
+                    self.log_widget.log(f"Encoding WEBM using {codec_name}...", "INFO")
+                    ffmpeg_cmd = build_ffmpeg_cmd(video_args)
+                    result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
+                    if result.returncode == 0 and os.path.exists(pass_output):
+                        file_size = os.path.getsize(pass_output)
+                        self.log_widget.log(
+                            f"Animation exported ({codec_name}) to: {pass_output} ({file_size} bytes)",
+                            "SUCCESS",
+                        )
+                        export_success = True
+                        break
+                    else:
+                        self.log_widget.log(
+                            f"{codec_name} encoding failed: {result.stderr.strip()}",
+                            "WARNING",
+                        )
+
+                if not export_success:
                     self.log_widget.log(
-                        f"MP4 fallback also failed: {result.stderr.strip()}",
-                        "ERROR",
+                        "WEBM encoding failed, exporting fallback MP4 without alpha.",
+                        "WARNING",
                     )
-        finally:
-            self.log_widget.log("Cleaning up temporary files...", "INFO")
-            shutil.rmtree(temp_dir, ignore_errors=True)
-            self.gl_widget.player.current_time = frame_info["original_time"]
-            self._set_player_playing(frame_info["original_playing"])
-            self.gl_widget.update()
+                    mp4_file = f"{os.path.splitext(pass_output)[0]}.mp4"
+                    ffmpeg_cmd = [
+                        ffmpeg_path,
+                        '-y',
+                        '-framerate', str(frame_info["fps"]),
+                        '-i', input_pattern,
+                    ]
+                    ffmpeg_cmd += thread_args
+                    if audio_track_path:
+                        ffmpeg_cmd += ['-i', audio_track_path]
+                    ffmpeg_cmd += [
+                        '-c:v', 'libx264',
+                        '-pix_fmt', 'yuv420p',
+                        '-crf', '18',
+                        mp4_file.replace('\\', '/'),
+                    ]
+                    if audio_track_path:
+                        ffmpeg_cmd += ['-c:a', 'aac', '-b:a', '160k', '-shortest']
+                    result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
+                    if result.returncode == 0 and os.path.exists(mp4_file):
+                        file_size = os.path.getsize(mp4_file)
+                        self.log_widget.log(
+                            f"Animation exported (MP4 fallback) to: {mp4_file} ({file_size} bytes)",
+                            "SUCCESS",
+                        )
+                        export_success = True
+                    else:
+                        self.log_widget.log(
+                            f"MP4 fallback also failed: {result.stderr.strip()}",
+                            "ERROR",
+                        )
+            finally:
+                self.log_widget.log("Cleaning up temporary files...", "INFO")
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                self.gl_widget.player.current_time = frame_info["original_time"]
+                self._set_player_playing(frame_info["original_playing"])
+                self.gl_widget.update()
+
+            if export_success:
+                completed_outputs.append(pass_output)
+            else:
+                export_failed = True
+                break
+
+        if export_failed:
+            QMessageBox.warning(
+                self,
+                "WEBM Export Failed",
+                "WEBM export failed for one or more passes. Check the log for details.",
+            )
+        elif total_passes > 1 and completed_outputs:
+            self.log_widget.log(
+                f"WEBM multi-pass export completed: {len(completed_outputs)} file(s).",
+                "SUCCESS",
+            )
+
+    def open_dof_asset_grabber(self) -> None:
+        """Open the standalone Dawn of Fire asset downloader."""
+        dialog = self._dof_asset_grabber_dialog
+        if dialog is None:
+            dialog = DofAssetGrabberDialog(self.settings, self)
+            dialog.download_completed.connect(self._on_dof_asset_grabber_download_completed)
+            self._dof_asset_grabber_dialog = dialog
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _on_dof_asset_grabber_download_completed(self, dof_root: str, downloaded_count: int) -> None:
+        root = os.path.normpath(str(dof_root or "").strip())
+        if not root or not os.path.isdir(root):
+            return
+        if root != self.dof_path:
+            self.dof_path = root
+            self.settings.setValue("dof_path", root)
+            self._update_active_path_profile(dof_path=root)
+            self._clear_dof_runtime_caches()
+            self._update_path_label()
+            self.log_widget.log(f"DOF Assets path set to: {root}", "SUCCESS")
+        if downloaded_count > 0:
+            self.log_widget.log(
+                f"Dawn of Fire Asset Grabber downloaded/verified {downloaded_count} bundle(s).",
+                "SUCCESS",
+            )
+        self.build_dof_audio_library()
+        self.refresh_dof_file_list()
 
     def show_settings(self):
         """Show settings dialog"""
+        auto_refresh_before = self._monster_name_auto_refresh_enabled()
         dialog = SettingsDialog(
             self.export_settings,
             self.settings,
@@ -21853,6 +22802,31 @@ class MSMAnimationViewer(QMainWindow):
             paths_changed = self._reload_primary_paths_from_settings(refresh=True)
             if paths_changed:
                 self.log_widget.log("Applied active path profile from Settings.", "INFO")
+            auto_refresh_after = self._monster_name_auto_refresh_enabled()
+            regenerate_requested = bool(
+                getattr(dialog, "monster_name_rosetta_regenerate_requested", False)
+            )
+            if auto_refresh_before != auto_refresh_after:
+                state_label = "enabled" if auto_refresh_after else "disabled"
+                self.log_widget.log(f"Monster name auto-refresh {state_label}.", "INFO")
+                self._invalidate_monster_name_rosetta_cache()
+
+            if regenerate_requested:
+                self._invalidate_monster_name_rosetta_cache()
+                refreshed_from_sources = self._refresh_monster_name_rosetta_from_dat_sources(force=True)
+                self._ensure_monster_name_rosetta_loaded(force=False)
+                if refreshed_from_sources:
+                    self.log_widget.log(
+                        "Regenerated monster name rosetta from dat/xml sources.",
+                        "SUCCESS",
+                    )
+                else:
+                    self.log_widget.log(
+                        "Rosetta regeneration fell back to bundled docs (no sources found).",
+                        "WARNING",
+                    )
+            elif auto_refresh_before != auto_refresh_after:
+                self._ensure_monster_name_rosetta_loaded(force=False)
             self.gl_widget.set_zoom_to_cursor(self.export_settings.camera_zoom_to_cursor)
             sprite_filter = self.settings.value("viewport/sprite_filter", "bilinear", type=str)
             self.gl_widget.set_sprite_filter_mode(sprite_filter)
@@ -22137,7 +23111,6 @@ class MSMAnimationViewer(QMainWindow):
             filename += '.gif'
         
         try:
-            # Get settings from export_settings
             gif_fps = self.export_settings.gif_fps
             gif_colors = self.export_settings.gif_colors
             gif_scale = self.export_settings.gif_scale / 100.0
@@ -22145,7 +23118,6 @@ class MSMAnimationViewer(QMainWindow):
             gif_optimize = self.export_settings.gif_optimize
             gif_loop = self.export_settings.gif_loop
             
-            # Get animation parameters
             real_duration = self._get_export_real_duration()
             total_frames = int(real_duration * gif_fps)
             
@@ -22172,185 +23144,186 @@ class MSMAnimationViewer(QMainWindow):
             output_height = output_height if output_height % 2 == 0 else output_height + 1
             
             self.log_widget.log(f"Output dimensions: {output_width}x{output_height}", "INFO")
-            
-            # Store original state
+
             original_time = self.gl_widget.player.current_time
             original_playing = self.gl_widget.player.playing
             self._set_player_playing(False)
-            
-            # Create progress dialog
-            progress = QProgressDialog("Exporting GIF...", "Cancel", 0, total_frames + 1, self)
-            progress.setWindowTitle("GIF Export Progress")
-            progress.setWindowModality(Qt.WindowModality.WindowModal)
-            progress.setMinimumDuration(0)
-            progress.setAutoClose(False)
-            progress.setAutoReset(False)
-            progress.show()
-            
-            # Render frames
-            frames = []
-            was_canceled = False
+
             background_color = self._active_background_color()
             include_viewport_bg = bool(self.export_include_viewport_background)
-            
-            for frame_num in range(total_frames):
-                if progress.wasCanceled():
-                    self.log_widget.log("Export cancelled by user", "WARNING")
-                    was_canceled = True
-                    break
-                
-                # Set animation time
-                frame_time = self._get_export_frame_time(frame_num, gif_fps)
-                self.gl_widget.player.current_time = frame_time
-                
-                # Render frame at base size
-                image = self.render_frame_to_image(
-                    base_width,
-                    base_height,
-                    camera_override=camera_override,
-                    render_scale_override=render_scale_override,
-                    apply_centering=apply_centering,
-                    background_color=background_color,
-                    include_viewport_background=include_viewport_bg,
-                    motion_blur_frame_dt=1.0 / max(1e-6, float(gif_fps)),
-                )
-                
-                if image:
-                    # Scale if needed
-                    if gif_scale != 1.0:
-                        image = image.resize((output_width, output_height), Image.Resampling.LANCZOS)
-                    
-                    # Convert RGBA to palette mode with proper transparency handling
-                    # GIF only supports 1-bit transparency (fully transparent or fully opaque)
-                    
-                    # Get alpha channel
-                    alpha = image.split()[3]
-                    
-                    # Create a mask for transparent pixels (alpha < 128 = transparent)
-                    # This threshold can be adjusted - 128 is a good middle ground
-                    transparency_threshold = 128
-                    
-                    # Convert to RGB first (drop alpha temporarily)
-                    rgb_image = image.convert('RGB')
-                    
-                    # Convert to palette mode
-                    if gif_dither:
-                        palette_image = rgb_image.convert('P', palette=Image.Palette.ADAPTIVE, 
-                                                         colors=gif_colors - 1,  # Reserve one color for transparency
-                                                         dither=Image.Dither.FLOYDSTEINBERG)
-                    else:
-                        palette_image = rgb_image.convert('P', palette=Image.Palette.ADAPTIVE, 
-                                                         colors=gif_colors - 1,
-                                                         dither=Image.Dither.NONE)
-                    
-                    # Create a new palette image with transparency
-                    # We need to set transparent pixels to a specific palette index
-                    # First, find or create a transparent color index
-                    
-                    # Get the palette
-                    palette = palette_image.getpalette()
-                    
-                    # Add a transparent color at the end of the palette (we reserved space)
-                    # Use a color that's unlikely to appear in the image (magenta)
+
+            pass_specs = self._collect_export_pass_specs()
+            total_passes = len(pass_specs)
+            completed_outputs: List[str] = []
+            was_canceled = False
+
+            for pass_number, included_layer_ids in pass_specs:
+                pass_filename = self._with_export_pass_suffix(filename, pass_number, total_passes)
+                progress = QProgressDialog("Exporting GIF...", "Cancel", 0, total_frames + 1, self)
+                progress.setWindowTitle("GIF Export Progress")
+                progress.setWindowModality(Qt.WindowModality.WindowModal)
+                progress.setMinimumDuration(0)
+                progress.setAutoClose(False)
+                progress.setAutoReset(False)
+                progress.show()
+
+                try:
+                    frames: List[Image.Image] = []
+                    for frame_num in range(total_frames):
+                        if progress.wasCanceled():
+                            self.log_widget.log("Export cancelled by user", "WARNING")
+                            was_canceled = True
+                            break
+
+                        frame_time = self._get_export_frame_time(frame_num, gif_fps)
+                        self.gl_widget.player.current_time = frame_time
+
+                        image = self.render_frame_to_image(
+                            base_width,
+                            base_height,
+                            camera_override=camera_override,
+                            render_scale_override=render_scale_override,
+                            apply_centering=apply_centering,
+                            background_color=background_color,
+                            include_viewport_background=include_viewport_bg,
+                            motion_blur_frame_dt=1.0 / max(1e-6, float(gif_fps)),
+                            included_layer_ids=included_layer_ids,
+                        )
+
+                        if image:
+                            if gif_scale != 1.0:
+                                image = image.resize((output_width, output_height), Image.Resampling.LANCZOS)
+
+                            alpha = image.split()[3]
+                            transparency_threshold = 128
+                            rgb_image = image.convert('RGB')
+                            if gif_dither:
+                                palette_image = rgb_image.convert(
+                                    'P',
+                                    palette=Image.Palette.ADAPTIVE,
+                                    colors=gif_colors - 1,
+                                    dither=Image.Dither.FLOYDSTEINBERG,
+                                )
+                            else:
+                                palette_image = rgb_image.convert(
+                                    'P',
+                                    palette=Image.Palette.ADAPTIVE,
+                                    colors=gif_colors - 1,
+                                    dither=Image.Dither.NONE,
+                                )
+
+                            palette = palette_image.getpalette()
+                            transparent_index = gif_colors - 1
+                            if palette:
+                                while len(palette) < transparent_index * 3 + 3:
+                                    palette.extend([0, 0, 0])
+                                palette[transparent_index * 3] = 255
+                                palette[transparent_index * 3 + 1] = 0
+                                palette[transparent_index * 3 + 2] = 255
+                                palette_image.putpalette(palette)
+
+                            palette_array = np.array(palette_image)
+                            alpha_array = np.array(alpha)
+                            palette_array[alpha_array < transparency_threshold] = transparent_index
+
+                            final_image = Image.fromarray(palette_array, mode='P')
+                            final_image.putpalette(palette)
+                            final_image.info['transparency'] = transparent_index
+                            frames.append(final_image)
+                        else:
+                            self.log_widget.log(
+                                f"Failed to render frame {frame_num} for pass {pass_number}",
+                                "WARNING",
+                            )
+
+                        progress.setValue(frame_num + 1)
+                        if total_passes > 1:
+                            progress.setLabelText(
+                                f"Rendering pass {pass_number}: frame {frame_num + 1}/{total_frames}..."
+                            )
+                        else:
+                            progress.setLabelText(f"Rendering frame {frame_num + 1} of {total_frames}...")
+
+                        from PyQt6.QtWidgets import QApplication
+                        QApplication.processEvents()
+
+                    if was_canceled or len(frames) == 0:
+                        break
+
+                    progress.setLabelText("Encoding GIF...")
+                    progress.setValue(total_frames)
+                    from PyQt6.QtWidgets import QApplication
+                    QApplication.processEvents()
+
+                    frame_duration = int(1000 / gif_fps)
+                    self.log_widget.log(f"Saving GIF with {len(frames)} frames...", "INFO")
                     transparent_index = gif_colors - 1
-                    if palette:
-                        # Extend palette if needed
-                        while len(palette) < transparent_index * 3 + 3:
-                            palette.extend([0, 0, 0])
-                        palette[transparent_index * 3] = 255      # R
-                        palette[transparent_index * 3 + 1] = 0    # G  
-                        palette[transparent_index * 3 + 2] = 255  # B (magenta)
-                        palette_image.putpalette(palette)
-                    
-                    # Now apply transparency mask
-                    # Convert palette image to array for manipulation
-                    palette_array = np.array(palette_image)
-                    alpha_array = np.array(alpha)
-                    
-                    # Set transparent pixels to the transparent index
-                    palette_array[alpha_array < transparency_threshold] = transparent_index
-                    
-                    # Create new palette image from array
-                    final_image = Image.fromarray(palette_array, mode='P')
-                    final_image.putpalette(palette)
-                    
-                    # Store the transparent index for this frame
-                    final_image.info['transparency'] = transparent_index
-                    
-                    frames.append(final_image)
-                else:
-                    self.log_widget.log(f"Failed to render frame {frame_num}", "WARNING")
-                
-                progress.setValue(frame_num + 1)
-                progress.setLabelText(f"Rendering frame {frame_num + 1} of {total_frames}...")
-                
-                # Process events
-                from PyQt6.QtWidgets import QApplication
-                QApplication.processEvents()
-            
-            if was_canceled or len(frames) == 0:
-                self.log_widget.log(f"Export aborted. Frames rendered: {len(frames)}", "WARNING")
-                self.gl_widget.player.current_time = original_time
-                self._set_player_playing(original_playing)
-                progress.close()
+                    frames[0].save(
+                        pass_filename,
+                        save_all=True,
+                        append_images=frames[1:] if len(frames) > 1 else [],
+                        duration=frame_duration,
+                        loop=gif_loop,
+                        optimize=gif_optimize,
+                        transparency=transparent_index,
+                        disposal=2,
+                    )
+
+                    file_size = os.path.getsize(pass_filename)
+                    if file_size > 1024 * 1024:
+                        size_str = f"{file_size / (1024*1024):.2f} MB"
+                    else:
+                        size_str = f"{file_size / 1024:.1f} KB"
+                    self.log_widget.log(f"GIF exported to: {pass_filename} ({size_str})", "SUCCESS")
+                    completed_outputs.append(pass_filename)
+                finally:
+                    progress.close()
+
+            if was_canceled or not completed_outputs:
+                self.log_widget.log(
+                    f"Export aborted. Passes completed: {len(completed_outputs)}",
+                    "WARNING",
+                )
                 return
-            
-            progress.setLabelText("Encoding GIF...")
-            progress.setValue(total_frames)
-            from PyQt6.QtWidgets import QApplication
-            QApplication.processEvents()
-            
-            # Calculate frame duration in milliseconds
-            frame_duration = int(1000 / gif_fps)
-            
-            # Save as GIF
-            self.log_widget.log(f"Saving GIF with {len(frames)} frames...", "INFO")
-            
-            # Get the transparent index from the first frame
-            transparent_index = gif_colors - 1
-            
-            # Use the first frame as base, append the rest
-            frames[0].save(
-                filename,
-                save_all=True,
-                append_images=frames[1:] if len(frames) > 1 else [],
-                duration=frame_duration,
-                loop=gif_loop,
-                optimize=gif_optimize,
-                transparency=transparent_index,
-                disposal=2  # Restore to background between frames
-            )
-            
-            progress.close()
-            
-            # Get file size
-            file_size = os.path.getsize(filename)
-            if file_size > 1024 * 1024:
-                size_str = f"{file_size / (1024*1024):.2f} MB"
+
+            if total_passes <= 1:
+                final_output = completed_outputs[0]
+                file_size = os.path.getsize(final_output)
+                if file_size > 1024 * 1024:
+                    size_str = f"{file_size / (1024*1024):.2f} MB"
+                else:
+                    size_str = f"{file_size / 1024:.1f} KB"
+                QMessageBox.information(
+                    self, "Export Complete",
+                    f"GIF exported successfully!\n\n"
+                    f"File: {final_output}\n"
+                    f"Size: {size_str}\n"
+                    f"Frames: {total_frames}\n"
+                    f"Dimensions: {output_width}x{output_height}"
+                )
             else:
-                size_str = f"{file_size / 1024:.1f} KB"
-            
-            self.log_widget.log(f"GIF exported to: {filename} ({size_str})", "SUCCESS")
-            
-            # Restore original state
-            self.gl_widget.player.current_time = original_time
-            self._set_player_playing(original_playing)
-            self.gl_widget.update()
-            
-            QMessageBox.information(
-                self, "Export Complete",
-                f"GIF exported successfully!\n\n"
-                f"File: {filename}\n"
-                f"Size: {size_str}\n"
-                f"Frames: {len(frames)}\n"
-                f"Dimensions: {output_width}x{output_height}"
-            )
+                QMessageBox.information(
+                    self, "Export Complete",
+                    f"GIF multi-pass export complete.\n\n"
+                    f"Files: {len(completed_outputs)}\n"
+                    f"Frames per pass: {total_frames}\n"
+                    f"Dimensions: {output_width}x{output_height}"
+                )
+                self.log_widget.log(
+                    f"GIF multi-pass export completed: {len(completed_outputs)} file(s).",
+                    "SUCCESS",
+                )
             
         except Exception as e:
             self.log_widget.log(f"Error exporting GIF: {e}", "ERROR")
             import traceback
             traceback.print_exc()
             QMessageBox.warning(self, "Export Error", f"Failed to export GIF: {e}")
+        finally:
+            self.gl_widget.player.current_time = original_time if 'original_time' in locals() else self.gl_widget.player.current_time
+            if 'original_playing' in locals():
+                self._set_player_playing(original_playing)
+            self.gl_widget.update()
     
     def show_credits(self):
         """Show credits and acknowledgments dialog"""
@@ -22586,6 +23559,7 @@ All game assets and content are owned by Big Blue Bubble Inc.
                 widget.set_dof_alpha_smoothing_mode(self.dof_alpha_edge_smoothing_mode)
                 widget.set_dof_sprite_shader_mode(self.dof_sprite_shader_mode)
         self._update_path_label()
+        self._ensure_monster_name_rosetta_loaded(force=False)
         if self.game_path or self.downloads_path:
             self.build_audio_library()
             self.refresh_file_list()

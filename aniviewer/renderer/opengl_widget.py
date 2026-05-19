@@ -3164,6 +3164,7 @@ class OpenGLAnimationWidget(QOpenGLWidget):
         apply_constraints: bool = True,
         render_attachments: bool = True,
         render_particles: bool = False,
+        included_layer_ids: Optional[Set[int]] = None,
     ):
         """
         Render all layers in correct order with hierarchy
@@ -3212,6 +3213,10 @@ class OpenGLAnimationWidget(QOpenGLWidget):
         particle_idx = 0
 
         for layer in render_layers:
+            layer_id = getattr(layer, "layer_id", None)
+            if included_layer_ids is not None:
+                if layer_id is None or int(layer_id) not in included_layer_ids:
+                    continue
             if layer.visible:
                 world_state = layer_world_states[layer.layer_id]
                 if has_depth and particle_draws:

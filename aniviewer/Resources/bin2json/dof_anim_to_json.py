@@ -4234,16 +4234,20 @@ def _resolve_bundle_paths(bundle_root: Path) -> List[Path]:
         return [bundle_root]
     bundle_paths: List[Path] = []
     for root, _, files in os.walk(bundle_root):
-        if "__data" not in files:
-            continue
-        candidate = Path(root) / "__data"
-        try:
-            with candidate.open("rb") as handle:
-                magic = handle.read(8)
-        except OSError:
-            continue
-        if magic.startswith((b"UnityFS", b"UnityRaw", b"UnityWeb")):
-            bundle_paths.append(candidate)
+        candidates: List[Path] = []
+        if "__data" in files:
+            candidates.append(Path(root) / "__data")
+        for name in files:
+            if name.lower().endswith(".unity3d"):
+                candidates.append(Path(root) / name)
+        for candidate in candidates:
+            try:
+                with candidate.open("rb") as handle:
+                    magic = handle.read(8)
+            except OSError:
+                continue
+            if magic.startswith((b"UnityFS", b"UnityRaw", b"UnityWeb")):
+                bundle_paths.append(candidate)
     return bundle_paths
 
 
