@@ -543,6 +543,7 @@ class MSMAnimationViewer(QMainWindow):
         self.base_layer_cache: Optional[List[LayerData]] = None
         self.base_texture_atlases: List[TextureAtlas] = []
         self.costume_atlas_cache: Dict[str, TextureAtlas] = {}
+        self.animation_shader_runtime_overrides: Dict[str, Dict[str, Any]] = {}
         self.active_costume_attachments: List[Dict[str, Any]] = []
         self.costume_sheet_aliases: Dict[str, List[str]] = {}
         self.current_base_bpm: float = 120.0
@@ -6544,10 +6545,10 @@ class MSMAnimationViewer(QMainWindow):
             return xml_file
         relative_variants = self._resource_relative_variants(xml_file)
         candidates: List[str] = []
-        for data_root in self._candidate_data_roots():
-            for variant in relative_variants:
-                candidates.append(os.path.join(data_root, *variant.split("/")))
         if json_dir:
+            # Prefer manifests adjacent to the loaded JSON before falling back to
+            # global game/download roots. This keeps converted DOF atlases local.
+            candidates.append(os.path.join(json_dir, xml_file))
             json_root = Path(json_dir)
             json_roots: List[Path] = [json_root]
             saw_data_dir = False
@@ -6565,6 +6566,9 @@ class MSMAnimationViewer(QMainWindow):
                     candidates.append(
                         os.path.join(str(root), *variant.split("/"))
                     )
+        for data_root in self._candidate_data_roots():
+            for variant in relative_variants:
+                candidates.append(os.path.join(data_root, *variant.split("/")))
         candidates.append(os.path.join(str(self.project_root), xml_file))
         seen: Set[str] = set()
         for candidate in candidates:
@@ -8633,6 +8637,77 @@ class MSMAnimationViewer(QMainWindow):
             self.log_widget.log(f"Error loading JSON: {e}", "ERROR")
             self.log_widget.log(tb, "ERROR")
 
+    def _resolve_shader_override_resource_path(
+        self,
+        raw_path: Any,
+        json_path: Optional[str],
+    ) -> Optional[str]:
+        """Resolve LUT/sequence paths from shader overrides to absolute paths when possible."""
+        if not isinstance(raw_path, str):
+            return None
+        candidate = raw_path.strip()
+        if not candidate:
+            return None
+        if os.path.isabs(candidate):
+            return candidate
+
+        probes: List[str] = []
+        if json_path:
+            json_dir = os.path.dirname(json_path)
+            probes.append(os.path.join(json_dir, candidate))
+        for data_root in self._candidate_data_roots():
+            probes.append(os.path.join(data_root, candidate))
+        probes.append(os.path.join(str(self.project_root), candidate))
+
+        seen: Set[str] = set()
+        for probe in probes:
+            norm = os.path.normcase(os.path.normpath(probe))
+            if norm in seen:
+                continue
+            seen.add(norm)
+            if os.path.exists(probe):
+                return probe
+        return candidate
+
+    def _extract_animation_shader_runtime_overrides(
+        self,
+        json_path: Optional[str],
+        payload: Optional[Dict[str, Any]],
+    ) -> Dict[str, Dict[str, Any]]:
+        """Collect runtime shader overrides declared by an animation JSON payload."""
+        if not isinstance(payload, dict):
+            return {}
+        raw_overrides = payload.get("shader_overrides")
+        if not isinstance(raw_overrides, dict):
+            return {}
+
+        overrides: Dict[str, Dict[str, Any]] = {}
+        for shader_name, raw_entry in raw_overrides.items():
+            if not isinstance(shader_name, str) or not shader_name.strip():
+                continue
+            if not isinstance(raw_entry, dict):
+                continue
+            entry = copy.deepcopy(raw_entry)
+            if isinstance(entry.get("lut"), str):
+                resolved = self._resolve_shader_override_resource_path(entry.get("lut"), json_path)
+                if resolved:
+                    entry["lut"] = resolved
+            metadata = entry.get("metadata")
+            if isinstance(metadata, dict):
+                if isinstance(metadata.get("lut"), str):
+                    resolved = self._resolve_shader_override_resource_path(metadata.get("lut"), json_path)
+                    if resolved:
+                        metadata["lut"] = resolved
+                if isinstance(metadata.get("sequence_texture"), str):
+                    resolved = self._resolve_shader_override_resource_path(
+                        metadata.get("sequence_texture"),
+                        json_path,
+                    )
+                    if resolved:
+                        metadata["sequence_texture"] = resolved
+            overrides[shader_name.lower()] = entry
+        return overrides
+
     def _apply_json_payload(self, json_path: str, payload: Dict[str, Any], announce: bool = True) -> None:
         """Apply a parsed JSON payload to the UI and animation combo."""
         # Reset animation selection state early so combo updates cannot persist
@@ -8653,6 +8728,10 @@ class MSMAnimationViewer(QMainWindow):
         )
         self._apply_dof_anchor_flip_defaults(json_path, payload)
         self.source_atlas_lookup = {}
+        self.animation_shader_runtime_overrides = self._extract_animation_shader_runtime_overrides(
+            json_path,
+            payload,
+        )
         if announce:
             display_name = os.path.basename(json_path) if json_path else "animation data"
             self.log_widget.log(f"Loaded JSON file: {display_name}", "SUCCESS")
@@ -8683,6 +8762,11 @@ class MSMAnimationViewer(QMainWindow):
                 self.control_panel.anim_combo.addItems(anim_names)
                 if announce:
                     self.log_widget.log(f"Found {len(anim_names)} animations", "INFO")
+            if self.animation_shader_runtime_overrides:
+                self.log_widget.log(
+                    f"Applied {len(self.animation_shader_runtime_overrides)} animation shader override(s).",
+                    "INFO",
+                )
         self.current_animation_index = -1
 
     @staticmethod
@@ -24668,12 +24752,13 @@ All game assets and content are owned by Big Blue Bubble Inc.
         return prioritized + remaining
     def _configure_costume_shaders(self, entry: Optional[CostumeEntry], costume_data: Optional[Dict[str, Any]]):
         """Automatic shader texture overrides derived from costume metadata."""
+        base_overrides = copy.deepcopy(self.animation_shader_runtime_overrides)
         if not entry or not costume_data:
-            self.shader_registry.set_runtime_overrides({})
+            self.shader_registry.set_runtime_overrides(base_overrides)
             return
         shader_defs = costume_data.get('apply_shader') or []
         if not shader_defs:
-            self.shader_registry.set_runtime_overrides({})
+            self.shader_registry.set_runtime_overrides(base_overrides)
             return
 
         layer_sheet_lookup, fallback_sheets = self._build_shader_sheet_lookup(costume_data)
@@ -24718,7 +24803,9 @@ All game assets and content are owned by Big Blue Bubble Inc.
             overrides[resource.lower()] = {
                 "metadata": metadata
             }
-        self.shader_registry.set_runtime_overrides(overrides)
+        merged_overrides = dict(base_overrides)
+        merged_overrides.update(overrides)
+        self.shader_registry.set_runtime_overrides(merged_overrides)
 
     def _build_shader_sheet_lookup(
         self, costume_data: Dict[str, Any]

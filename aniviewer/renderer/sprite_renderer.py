@@ -1324,6 +1324,9 @@ class SpriteRenderer:
         self.mask_debug_target: str = (
             os.environ.get("ANIVIEWER_MASK_DEBUG_TARGET", "monster_gjlm").strip().lower()
         )
+        gradient_debug_flag = os.environ.get("ANIVIEWER_GRADIENT_DEBUG", "1").strip().lower()
+        self.gradient_debug_enabled: bool = gradient_debug_flag not in {"0", "false", "off", "no"}
+        self._gradient_debug_seen: Set[str] = set()
         self._mask_debug_frame_index: int = 0
         self._mask_debug_draw_order: int = 0
         self._mask_debug_frame_active: bool = False
@@ -2829,6 +2832,14 @@ class SpriteRenderer:
         shader_behavior = self._get_shader_behavior(shader_name)
         blend_override = self._blend_value_from_preset(shader_preset)
         effective_blend = self._resolve_effective_layer_blend(layer.blend_mode, blend_override)
+        self._log_gradient_layer_diagnostic(
+            layer,
+            world_state,
+            atlases,
+            shader_name,
+            shader_preset,
+            shader_behavior,
+        )
 
         if mask_role in {"mask_source", "mask_source_visible"} and mask_key:
             mask_written = self._render_mask_source_layer(
@@ -2935,6 +2946,59 @@ class SpriteRenderer:
             stencil_write=False,
             stencil_read=bool(mask_consumer_mode != "none"),
             stencil_read_attempted=stencil_read_attempted,
+        )
+
+    def _log_gradient_layer_diagnostic(
+        self,
+        layer: LayerData,
+        world_state: Dict[str, Any],
+        atlases: List[TextureAtlas],
+        shader_name: Optional[str],
+        shader_preset: Optional[ShaderPreset],
+        shader_behavior: Optional[ShaderBehavior],
+    ) -> None:
+        """Emit one-time debug lines for gradient-map shader layers."""
+        if not self.gradient_debug_enabled:
+            return
+        normalized_shader = (shader_name or "").strip().lower()
+        if "shadergradientmap" not in normalized_shader:
+            return
+        sprite_name = str(world_state.get("sprite_name") or "").strip()
+        if not sprite_name:
+            return
+
+        sprite, atlas, resolved_name = self._find_sprite_in_atlases(sprite_name, atlases)
+        atlas_xml = getattr(atlas, "xml_path", None) if atlas else None
+        atlas_img = getattr(atlas, "image_path", None) if atlas else None
+        atlas_src = getattr(atlas, "source_name", None) if atlas else None
+        resolved_sprite_name = resolved_name or (sprite.name if sprite else sprite_name)
+        signature = (
+            f"{layer.layer_id}|{normalized_shader}|{resolved_sprite_name}|"
+            f"{atlas_xml or '-'}|{atlas_img or '-'}"
+        )
+        if signature in self._gradient_debug_seen:
+            return
+        self._gradient_debug_seen.add(signature)
+
+        preset_lut = shader_preset.lut if shader_preset else None
+        preset_metadata = (shader_preset.metadata if shader_preset else {}) or {}
+        metadata_lut = preset_metadata.get("lut")
+        metadata_sequence = preset_metadata.get("sequence_texture")
+        behavior_name = shader_behavior.name if shader_behavior else None
+
+        runtime_override = None
+        if self.shader_registry:
+            runtime_map = getattr(self.shader_registry, "_runtime_overrides", {}) or {}
+            runtime_override = runtime_map.get(normalized_shader)
+
+        print(
+            "[GradientDebug] "
+            f"layer='{layer.name}' id={layer.layer_id} shader='{shader_name}' "
+            f"sprite='{sprite_name}' resolved_sprite='{resolved_sprite_name}' "
+            f"atlas_xml='{atlas_xml}' atlas_image='{atlas_img}' atlas_source='{atlas_src}' "
+            f"preset_lut='{preset_lut}' metadata_lut='{metadata_lut}' "
+            f"metadata_sequence='{metadata_sequence}' behavior='{behavior_name}' "
+            f"runtime_override={runtime_override}"
         )
     
     def render_sprite(
