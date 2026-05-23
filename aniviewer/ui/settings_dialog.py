@@ -26,10 +26,10 @@ from PyQt6.QtWidgets import (
     QSlider, QCheckBox, QGroupBox, QTabWidget,
     QWidget, QFormLayout, QFrame, QProgressBar, QMessageBox, QScrollArea,
     QSizePolicy, QLineEdit, QFileDialog, QListWidget, QPlainTextEdit,
-    QInputDialog, QKeySequenceEdit, QListWidgetItem
+    QInputDialog, QKeySequenceEdit, QListWidgetItem, QColorDialog
 )
 from PyQt6.QtCore import Qt, QSettings, QThread, QObject, pyqtSignal, QEventLoop, QProcess
-from PyQt6.QtGui import QKeySequence
+from PyQt6.QtGui import QKeySequence, QColor
 
 from utils.ffmpeg_installer import (
     install_ffmpeg,
@@ -659,9 +659,121 @@ class SettingsDialog(QDialog):
         self.ffmpeg_worker: FFmpegInstallWorker | None = None
         self.ffmpeg_install_running = False
         self.monster_name_rosetta_regenerate_requested: bool = False
+        self._ui_theme_primary_default_hex: str = ""
+        self._ui_theme_secondary_default_hex: str = ""
+        self._ui_theme_tertiary_default_hex: str = ""
+        self._ui_theme_primary_hex: str = ""
+        self._ui_theme_secondary_hex: str = ""
+        self._ui_theme_tertiary_hex: str = ""
         
         self.init_ui()
         self.load_current_settings()
+
+    @staticmethod
+    def _normalize_theme_hex(value: Any, fallback: str) -> str:
+        color = QColor(str(value or "").strip())
+        if not color.isValid():
+            color = QColor(str(fallback or "").strip())
+        if not color.isValid():
+            color = QColor("#808080")
+        return color.name(QColor.NameFormat.HexRgb).upper()
+
+    def _pick_ui_theme_color(self, role: str) -> None:
+        role_norm = str(role).strip().lower()
+        if role_norm == "secondary":
+            role_key = "secondary"
+            current_hex = self._ui_theme_secondary_hex
+        elif role_norm == "tertiary":
+            role_key = "tertiary"
+            current_hex = self._ui_theme_tertiary_hex
+        else:
+            role_key = "primary"
+            current_hex = self._ui_theme_primary_hex
+        selected = QColorDialog.getColor(
+            QColor(current_hex),
+            self,
+            (
+                "Choose Secondary UI Color"
+                if role_key == "secondary"
+                else "Choose Tertiary UI Color"
+                if role_key == "tertiary"
+                else "Choose Primary UI Color"
+            ),
+        )
+        if not selected.isValid():
+            return
+        normalized = selected.name(QColor.NameFormat.HexRgb).upper()
+        if role_key == "secondary":
+            self._ui_theme_secondary_hex = normalized
+        elif role_key == "tertiary":
+            self._ui_theme_tertiary_hex = normalized
+        else:
+            self._ui_theme_primary_hex = normalized
+        self._update_ui_theme_color_controls()
+
+    def _reset_ui_theme_color(self, role: str) -> None:
+        role_norm = str(role).strip().lower()
+        if role_norm == "secondary":
+            role_key = "secondary"
+        elif role_norm == "tertiary":
+            role_key = "tertiary"
+        else:
+            role_key = "primary"
+        if role_key == "secondary":
+            self._ui_theme_secondary_hex = self._ui_theme_secondary_default_hex
+        elif role_key == "tertiary":
+            self._ui_theme_tertiary_hex = self._ui_theme_tertiary_default_hex
+        else:
+            self._ui_theme_primary_hex = self._ui_theme_primary_default_hex
+        self._update_ui_theme_color_controls()
+
+    def _update_ui_theme_color_controls(self) -> None:
+        role_specs = (
+            (
+                "primary",
+                getattr(self, "ui_theme_primary_enabled_check", None),
+                getattr(self, "ui_theme_primary_pick_btn", None),
+                getattr(self, "ui_theme_primary_reset_btn", None),
+                getattr(self, "ui_theme_primary_swatch", None),
+                getattr(self, "ui_theme_primary_value_label", None),
+                self._ui_theme_primary_hex,
+            ),
+            (
+                "secondary",
+                getattr(self, "ui_theme_secondary_enabled_check", None),
+                getattr(self, "ui_theme_secondary_pick_btn", None),
+                getattr(self, "ui_theme_secondary_reset_btn", None),
+                getattr(self, "ui_theme_secondary_swatch", None),
+                getattr(self, "ui_theme_secondary_value_label", None),
+                self._ui_theme_secondary_hex,
+            ),
+            (
+                "tertiary",
+                getattr(self, "ui_theme_tertiary_enabled_check", None),
+                getattr(self, "ui_theme_tertiary_pick_btn", None),
+                getattr(self, "ui_theme_tertiary_reset_btn", None),
+                getattr(self, "ui_theme_tertiary_swatch", None),
+                getattr(self, "ui_theme_tertiary_value_label", None),
+                self._ui_theme_tertiary_hex,
+            ),
+        )
+        for _role, enabled_check, pick_btn, reset_btn, swatch, value_label, hex_value in role_specs:
+            if enabled_check is None:
+                continue
+            enabled = enabled_check.isChecked()
+            if pick_btn is not None:
+                pick_btn.setEnabled(enabled)
+            if reset_btn is not None:
+                reset_btn.setEnabled(enabled)
+            if value_label is not None:
+                value_label.setText(hex_value)
+                value_label.setEnabled(enabled)
+            if swatch is not None:
+                swatch.setStyleSheet(
+                    "border: 1px solid #555; border-radius: 3px; "
+                    f"background-color: {hex_value};"
+                )
+                swatch.setEnabled(enabled)
 
     @staticmethod
     def _sanitize_path_value(value: Any) -> str:
@@ -2191,6 +2303,94 @@ class SettingsDialog(QDialog):
         camera_group.setLayout(camera_form)
         app_layout.addWidget(camera_group)
 
+        theme_group = QGroupBox("UI Theme Colors")
+        theme_form = QFormLayout()
+
+        primary_row = QWidget()
+        primary_layout = QHBoxLayout(primary_row)
+        primary_layout.setContentsMargins(0, 0, 0, 0)
+        primary_layout.setSpacing(6)
+        self.ui_theme_primary_enabled_check = QCheckBox("Override")
+        self.ui_theme_primary_enabled_check.toggled.connect(self._update_ui_theme_color_controls)
+        self.ui_theme_primary_pick_btn = QPushButton("Choose…")
+        self.ui_theme_primary_pick_btn.clicked.connect(
+            lambda: self._pick_ui_theme_color("primary")
+        )
+        self.ui_theme_primary_reset_btn = QPushButton("Reset")
+        self.ui_theme_primary_reset_btn.clicked.connect(
+            lambda: self._reset_ui_theme_color("primary")
+        )
+        self.ui_theme_primary_swatch = QFrame()
+        self.ui_theme_primary_swatch.setFixedSize(28, 18)
+        self.ui_theme_primary_value_label = QLabel("")
+        primary_layout.addWidget(self.ui_theme_primary_enabled_check)
+        primary_layout.addWidget(self.ui_theme_primary_pick_btn)
+        primary_layout.addWidget(self.ui_theme_primary_reset_btn)
+        primary_layout.addWidget(self.ui_theme_primary_swatch)
+        primary_layout.addWidget(self.ui_theme_primary_value_label)
+        primary_layout.addStretch(1)
+        theme_form.addRow("Primary (UI Neutral):", primary_row)
+
+        secondary_row = QWidget()
+        secondary_layout = QHBoxLayout(secondary_row)
+        secondary_layout.setContentsMargins(0, 0, 0, 0)
+        secondary_layout.setSpacing(6)
+        self.ui_theme_secondary_enabled_check = QCheckBox("Override")
+        self.ui_theme_secondary_enabled_check.toggled.connect(self._update_ui_theme_color_controls)
+        self.ui_theme_secondary_pick_btn = QPushButton("Choose…")
+        self.ui_theme_secondary_pick_btn.clicked.connect(
+            lambda: self._pick_ui_theme_color("secondary")
+        )
+        self.ui_theme_secondary_reset_btn = QPushButton("Reset")
+        self.ui_theme_secondary_reset_btn.clicked.connect(
+            lambda: self._reset_ui_theme_color("secondary")
+        )
+        self.ui_theme_secondary_swatch = QFrame()
+        self.ui_theme_secondary_swatch.setFixedSize(28, 18)
+        self.ui_theme_secondary_value_label = QLabel("")
+        secondary_layout.addWidget(self.ui_theme_secondary_enabled_check)
+        secondary_layout.addWidget(self.ui_theme_secondary_pick_btn)
+        secondary_layout.addWidget(self.ui_theme_secondary_reset_btn)
+        secondary_layout.addWidget(self.ui_theme_secondary_swatch)
+        secondary_layout.addWidget(self.ui_theme_secondary_value_label)
+        secondary_layout.addStretch(1)
+        theme_form.addRow("Secondary (Accent):", secondary_row)
+
+        tertiary_row = QWidget()
+        tertiary_layout = QHBoxLayout(tertiary_row)
+        tertiary_layout.setContentsMargins(0, 0, 0, 0)
+        tertiary_layout.setSpacing(6)
+        self.ui_theme_tertiary_enabled_check = QCheckBox("Override")
+        self.ui_theme_tertiary_enabled_check.toggled.connect(self._update_ui_theme_color_controls)
+        self.ui_theme_tertiary_pick_btn = QPushButton("Choose…")
+        self.ui_theme_tertiary_pick_btn.clicked.connect(
+            lambda: self._pick_ui_theme_color("tertiary")
+        )
+        self.ui_theme_tertiary_reset_btn = QPushButton("Reset")
+        self.ui_theme_tertiary_reset_btn.clicked.connect(
+            lambda: self._reset_ui_theme_color("tertiary")
+        )
+        self.ui_theme_tertiary_swatch = QFrame()
+        self.ui_theme_tertiary_swatch.setFixedSize(28, 18)
+        self.ui_theme_tertiary_value_label = QLabel("")
+        tertiary_layout.addWidget(self.ui_theme_tertiary_enabled_check)
+        tertiary_layout.addWidget(self.ui_theme_tertiary_pick_btn)
+        tertiary_layout.addWidget(self.ui_theme_tertiary_reset_btn)
+        tertiary_layout.addWidget(self.ui_theme_tertiary_swatch)
+        tertiary_layout.addWidget(self.ui_theme_tertiary_value_label)
+        tertiary_layout.addStretch(1)
+        theme_form.addRow("Tertiary (Markers/Tool State):", tertiary_row)
+
+        theme_hint = QLabel(
+            "Overrides global neutral/accent colors plus tertiary highlights for marker/tool states. Dark/light mode behavior is preserved."
+        )
+        theme_hint.setWordWrap(True)
+        theme_hint.setStyleSheet("color: gray; font-size: 9pt;")
+        theme_form.addRow("", theme_hint)
+
+        theme_group.setLayout(theme_form)
+        app_layout.addWidget(theme_group)
+
         export_group = QGroupBox("Universal Export Framing")
         export_form = QFormLayout()
         self.universal_export_scope_combo = QComboBox()
@@ -3176,6 +3376,45 @@ class SettingsDialog(QDialog):
         )
         self._update_universal_export_controls()
         self._on_universal_export_resolution_changed()
+
+        app_palette = self.palette()
+        self._ui_theme_primary_default_hex = self._normalize_theme_hex(
+            app_palette.color(app_palette.ColorRole.Button).name(),
+            "#4A4A4A",
+        )
+        self._ui_theme_secondary_default_hex = self._normalize_theme_hex(
+            app_palette.color(app_palette.ColorRole.Highlight).name(),
+            "#4DA3FF",
+        )
+        self._ui_theme_tertiary_default_hex = self._normalize_theme_hex(
+            app_palette.color(app_palette.ColorRole.Mid).name(),
+            "#B4B4B4",
+        )
+        self._ui_theme_primary_hex = self._normalize_theme_hex(
+            self.app_settings.value("ui/theme/primary_color", self._ui_theme_primary_default_hex, type=str),
+            self._ui_theme_primary_default_hex,
+        )
+        self._ui_theme_secondary_hex = self._normalize_theme_hex(
+            self.app_settings.value("ui/theme/secondary_color", self._ui_theme_secondary_default_hex, type=str),
+            self._ui_theme_secondary_default_hex,
+        )
+        self._ui_theme_tertiary_hex = self._normalize_theme_hex(
+            self.app_settings.value("ui/theme/tertiary_color", self._ui_theme_tertiary_default_hex, type=str),
+            self._ui_theme_tertiary_default_hex,
+        )
+        if hasattr(self, "ui_theme_primary_enabled_check"):
+            self.ui_theme_primary_enabled_check.setChecked(
+                self.app_settings.value("ui/theme/primary_enabled", False, type=bool)
+            )
+        if hasattr(self, "ui_theme_secondary_enabled_check"):
+            self.ui_theme_secondary_enabled_check.setChecked(
+                self.app_settings.value("ui/theme/secondary_enabled", False, type=bool)
+            )
+        if hasattr(self, "ui_theme_tertiary_enabled_check"):
+            self.ui_theme_tertiary_enabled_check.setChecked(
+                self.app_settings.value("ui/theme/tertiary_enabled", False, type=bool)
+            )
+        self._update_ui_theme_color_controls()
 
         # Camera
         self.camera_zoom_cursor_check.setChecked(self.export_settings.camera_zoom_to_cursor)
@@ -4196,6 +4435,42 @@ class SettingsDialog(QDialog):
         self.export_settings.universal_export_padding = self.universal_export_padding_spin.value()
 
         self.export_settings.camera_zoom_to_cursor = self.camera_zoom_cursor_check.isChecked()
+        if hasattr(self, "ui_theme_primary_enabled_check"):
+            self.app_settings.setValue(
+                "ui/theme/primary_enabled",
+                self.ui_theme_primary_enabled_check.isChecked(),
+            )
+            self.app_settings.setValue(
+                "ui/theme/primary_color",
+                self._normalize_theme_hex(
+                    self._ui_theme_primary_hex,
+                    self._ui_theme_primary_default_hex,
+                ),
+            )
+        if hasattr(self, "ui_theme_secondary_enabled_check"):
+            self.app_settings.setValue(
+                "ui/theme/secondary_enabled",
+                self.ui_theme_secondary_enabled_check.isChecked(),
+            )
+            self.app_settings.setValue(
+                "ui/theme/secondary_color",
+                self._normalize_theme_hex(
+                    self._ui_theme_secondary_hex,
+                    self._ui_theme_secondary_default_hex,
+                ),
+            )
+        if hasattr(self, "ui_theme_tertiary_enabled_check"):
+            self.app_settings.setValue(
+                "ui/theme/tertiary_enabled",
+                self.ui_theme_tertiary_enabled_check.isChecked(),
+            )
+            self.app_settings.setValue(
+                "ui/theme/tertiary_color",
+                self._normalize_theme_hex(
+                    self._ui_theme_tertiary_hex,
+                    self._ui_theme_tertiary_default_hex,
+                ),
+            )
         if hasattr(self, "sprite_filter_combo"):
             self.app_settings.setValue(
                 "viewport/sprite_filter",

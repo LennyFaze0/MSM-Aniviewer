@@ -8,6 +8,7 @@ from PyQt6.QtWidgets import (
     QComboBox, QPushButton, QSpinBox, QDoubleSpinBox,
     QSlider, QCheckBox, QGroupBox, QScrollArea, QLineEdit,
     QListView, QListWidget, QListWidgetItem, QSizePolicy, QColorDialog, QTabWidget,
+    QStackedWidget,
     QFileDialog
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QSize, QTimer
@@ -162,6 +163,7 @@ class ControlPanel(QWidget):
     joint_solver_bake_current_requested = pyqtSignal()
     joint_solver_bake_range_requested = pyqtSignal()
     compact_ui_toggled = pyqtSignal(bool)
+    simple_mode_toggled = pyqtSignal(bool)
     section_changed = pyqtSignal(str)
     
     def __init__(self, parent=None):
@@ -183,18 +185,41 @@ class ControlPanel(QWidget):
         self.section_tabs.setMovable(False)
         self._section_layouts = {}
         self._section_tab_keys: List[str] = []
+        self._section_entries: List[Dict[str, Any]] = []
         self._build_section_tabs()
         self.section_tabs.currentChanged.connect(self._on_section_tab_changed)
+
+        self.simple_mode_scroll = QScrollArea()
+        self.simple_mode_scroll.setWidgetResizable(True)
+        self.simple_mode_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.simple_mode_scroll.setMinimumWidth(0)
+        self.simple_mode_content = QWidget()
+        self.simple_mode_content.setMinimumWidth(0)
+        self.simple_mode_content.setSizePolicy(
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Preferred,
+        )
+        self.simple_mode_layout = QVBoxLayout(self.simple_mode_content)
+        self.simple_mode_layout.setContentsMargins(8, 8, 8, 8)
+        self.simple_mode_layout.setSpacing(8)
+        self.simple_mode_scroll.setWidget(self.simple_mode_content)
+
+        self.section_mode_stack = QStackedWidget()
+        self.section_mode_stack.setMinimumWidth(0)
+        self.section_mode_stack.addWidget(self.section_tabs)
+        self.section_mode_stack.addWidget(self.simple_mode_scroll)
 
         self.init_ui()
         self._updating_constraints_list = False
         self._compact_ui_enabled = False
+        self._simple_mode_enabled = False
+        self._simple_mode_mounted = False
         self._export_layer_pass_rows: Dict[int, Dict[str, Any]] = {}
 
         # Set up the main layout
         container_layout = QVBoxLayout(self)
         container_layout.setContentsMargins(0, 0, 0, 0)
-        container_layout.addWidget(self.section_tabs, stretch=1)
+        container_layout.addWidget(self.section_mode_stack, stretch=1)
         self._preferred_width = 440
         self._max_width = 600
         size_policy = QSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
@@ -212,6 +237,19 @@ class ControlPanel(QWidget):
         if max_width:
             width = min(width, max_width)
         base_hint.setWidth(width)
+        return base_hint
+
+    def minimumSizeHint(self):
+        """Keep splitter-resize behavior consistent between tabbed and simple modes."""
+        base_hint = super().minimumSizeHint()
+        if not base_hint.isValid():
+            return QSize(0, 0)
+        if getattr(self, "_simple_mode_enabled", False) and hasattr(self, "section_tabs"):
+            tab_min_hint = self.section_tabs.minimumSizeHint()
+            if tab_min_hint.isValid():
+                base_hint.setWidth(max(0, int(tab_min_hint.width())))
+            else:
+                base_hint.setWidth(0)
         return base_hint
 
     def _build_section_tabs(self) -> None:
@@ -239,11 +277,63 @@ class ControlPanel(QWidget):
             self.section_tabs.addTab(scroll, label)
             self._section_layouts[key] = layout
             self._section_tab_keys.append(key)
+            self._section_entries.append(
+                {
+                    "label": label,
+                    "key": key,
+                    "scroll": scroll,
+                    "content": content,
+                    "layout": layout,
+                    "simple_heading": None,
+                    "content_policy": QSizePolicy(content.sizePolicy()),
+                    "content_min_width": int(content.minimumWidth()),
+                }
+            )
 
     def _on_section_tab_changed(self, index: int) -> None:
         key = self.section_key_at(index)
         if key:
             self.section_changed.emit(key)
+
+    def _mount_simple_mode_sections(self) -> None:
+        if self._simple_mode_mounted:
+            return
+        for entry in self._section_entries:
+            heading = QLabel(str(entry.get("label", "")).strip())
+            heading.setObjectName("simpleModeSectionHeading")
+            content = entry["scroll"].takeWidget() or entry["content"]
+            content.setMinimumWidth(0)
+            content.setSizePolicy(
+                QSizePolicy.Policy.Ignored,
+                QSizePolicy.Policy.Preferred,
+            )
+            entry["simple_heading"] = heading
+            self.simple_mode_layout.addWidget(heading)
+            self.simple_mode_layout.addWidget(content)
+        self.simple_mode_layout.addStretch(1)
+        self._simple_mode_mounted = True
+
+    def _unmount_simple_mode_sections(self) -> None:
+        if not self._simple_mode_mounted:
+            return
+        stretch_item = self.simple_mode_layout.takeAt(self.simple_mode_layout.count() - 1)
+        if stretch_item is not None:
+            del stretch_item
+        for entry in self._section_entries:
+            heading = entry.get("simple_heading")
+            if heading is not None:
+                self.simple_mode_layout.removeWidget(heading)
+                heading.deleteLater()
+                entry["simple_heading"] = None
+            content = entry["content"]
+            self.simple_mode_layout.removeWidget(content)
+            saved_policy = entry.get("content_policy")
+            if isinstance(saved_policy, QSizePolicy):
+                content.setSizePolicy(saved_policy)
+            saved_min_width = int(entry.get("content_min_width", 0))
+            content.setMinimumWidth(saved_min_width)
+            entry["scroll"].setWidget(content)
+        self._simple_mode_mounted = False
 
     def section_key_at(self, index: int) -> str:
         if index < 0 or index >= len(self._section_tab_keys):
@@ -1896,6 +1986,13 @@ class ControlPanel(QWidget):
         self.compact_ui_checkbox.toggled.connect(self.compact_ui_toggled.emit)
         interface_layout.addWidget(self.compact_ui_checkbox)
 
+        self.simple_mode_checkbox = QCheckBox("Simple Mode (Single Scroll List)")
+        self.simple_mode_checkbox.setToolTip(
+            "Show all control sections in one scrollable list instead of tabs."
+        )
+        self.simple_mode_checkbox.toggled.connect(self.simple_mode_toggled.emit)
+        interface_layout.addWidget(self.simple_mode_checkbox)
+
         interface_group.setLayout(interface_layout)
         system_section.addWidget(interface_group)
         
@@ -3046,12 +3143,29 @@ class ControlPanel(QWidget):
             self.compact_ui_checkbox.blockSignals(False)
         self._apply_compact_ui_styles()
 
+    def set_simple_mode(self, enabled: bool):
+        """Switch between tabbed and single-scroll control panel modes."""
+        self._simple_mode_enabled = bool(enabled)
+        if hasattr(self, "simple_mode_checkbox"):
+            self.simple_mode_checkbox.blockSignals(True)
+            self.simple_mode_checkbox.setChecked(self._simple_mode_enabled)
+            self.simple_mode_checkbox.blockSignals(False)
+        if self._simple_mode_enabled:
+            self._mount_simple_mode_sections()
+            self.section_mode_stack.setCurrentWidget(self.simple_mode_scroll)
+        else:
+            self.section_mode_stack.setCurrentWidget(self.section_tabs)
+            self._unmount_simple_mode_sections()
+        self._apply_compact_ui_styles()
+
     def _apply_compact_ui_styles(self):
         spacing = 4 if self._compact_ui_enabled else 8
         margins = (6, 6, 6, 6) if self._compact_ui_enabled else (8, 8, 8, 8)
         for layout in self._section_layouts.values():
             layout.setSpacing(spacing)
             layout.setContentsMargins(*margins)
+        self.simple_mode_layout.setSpacing(spacing)
+        self.simple_mode_layout.setContentsMargins(*margins)
         for group in self.findChildren(QGroupBox):
             layout = group.layout()
             if layout:
@@ -3067,6 +3181,9 @@ class ControlPanel(QWidget):
         else:
             self.setStyleSheet("")
             self.section_tabs.setStyleSheet("")
+        heading_font_size = "10pt" if not self._compact_ui_enabled else "9pt"
+        for heading in self.simple_mode_content.findChildren(QLabel, "simpleModeSectionHeading"):
+            heading.setStyleSheet(f"font-weight: 600; font-size: {heading_font_size};")
     
     def update_offset_display(self, layer_offsets, get_layer_by_id_func, layer_rotations=None, layer_scales=None):
         """

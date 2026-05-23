@@ -66,6 +66,8 @@ class KeyframeMarkerBar(QWidget):
         self._beat_drag_index: int = -1
         self._beat_drag_origin: float = 0.0
         self._beat_drag_preview: float = 0.0
+        self._marker_color_override: Optional[QColor] = None
+        self._selected_marker_color_override: Optional[QColor] = None
 
     def set_markers(self, markers: List[float], duration: float):
         self._markers = sorted(markers or [])
@@ -104,6 +106,15 @@ class KeyframeMarkerBar(QWidget):
             self.setMaximumHeight(28)
         self.update()
 
+    def set_marker_colors(
+        self,
+        marker_color: Optional[QColor],
+        selected_color: Optional[QColor] = None,
+    ):
+        self._marker_color_override = QColor(marker_color) if marker_color else None
+        self._selected_marker_color_override = QColor(selected_color) if selected_color else None
+        self.update()
+
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
@@ -122,10 +133,20 @@ class KeyframeMarkerBar(QWidget):
         if self._view_duration <= 0.0 or not self._markers:
             return
 
-        highlight_color = self.palette().color(self.palette().ColorRole.Highlight)
+        highlight_color = (
+            QColor(self._selected_marker_color_override)
+            if self._selected_marker_color_override is not None
+            else self.palette().color(self.palette().ColorRole.Highlight)
+        )
         highlight_pen = QPen(highlight_color)
         highlight_pen.setWidth(2)
-        marker_brush = QColor(180, 180, 180)
+        marker_brush = (
+            QColor(self._marker_color_override)
+            if self._marker_color_override is not None
+            else QColor(180, 180, 180)
+        )
+        marker_pen = QPen(marker_brush.darker(160))
+        marker_pen.setWidth(1)
         highlight_brush = highlight_color
         tolerance = max(1e-6, self._view_duration * 1e-4)
 
@@ -137,7 +158,7 @@ class KeyframeMarkerBar(QWidget):
                 render_time = self._clamp_time(marker + self._drag_preview_delta)
             x = self._time_to_x(render_time)
             selected = self._is_selected(marker)
-            painter.setPen(highlight_pen if selected else pen)
+            painter.setPen(highlight_pen if selected else marker_pen)
             painter.setBrush(highlight_brush if selected else marker_brush)
             path = self._triangle_path(x, baseline_y - 1, 6)
             painter.drawPath(path)
@@ -741,6 +762,8 @@ class TimelineWidget(QWidget):
         self._beat_grid_enabled: bool = False
         self._beat_edit_enabled: bool = False
         self._compact_ui: bool = False
+        self._marker_color_override: Optional[QColor] = None
+        self._marker_selected_color_override: Optional[QColor] = None
         self.init_ui()
 
     def init_ui(self):
@@ -904,6 +927,10 @@ class TimelineWidget(QWidget):
                 row.bar.set_beat_markers(self._beat_markers, self._duration_ms / 1000.0)
                 row.bar.set_beat_grid_enabled(self._beat_grid_enabled)
                 row.bar.set_beat_edit_enabled(self._beat_edit_enabled)
+                row.bar.set_marker_colors(
+                    self._marker_color_override,
+                    self._marker_selected_color_override,
+                )
                 selection = self._lane_selections.get(lane_spec.key, [])
                 if selection:
                     row.bar.set_selected_markers(selection)
@@ -940,6 +967,19 @@ class TimelineWidget(QWidget):
         self._beat_edit_enabled = bool(enabled)
         for row in self._lane_rows.values():
             row.bar.set_beat_edit_enabled(enabled)
+
+    def set_keyframe_marker_colors(
+        self,
+        marker_color: Optional[QColor],
+        selected_color: Optional[QColor] = None,
+    ):
+        self._marker_color_override = QColor(marker_color) if marker_color else None
+        self._marker_selected_color_override = QColor(selected_color) if selected_color else None
+        for row in self._lane_rows.values():
+            row.bar.set_marker_colors(
+                self._marker_color_override,
+                self._marker_selected_color_override,
+            )
 
     def set_marker_selection(self, markers: List[Tuple[TimelineLaneKey, float]]):
         self._lane_selections = {}

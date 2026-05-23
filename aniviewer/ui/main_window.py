@@ -41,7 +41,7 @@ from PyQt6.QtWidgets import (
     QStackedWidget
 )
 from PyQt6.QtCore import Qt, QSettings, QTimer, QEvent, QProcess, QEventLoop, QThread, QObject, pyqtSignal
-from PyQt6.QtGui import QSurfaceFormat, QColor, QShortcut, QKeySequence, QPixmap, QImage, QIcon, QCursor
+from PyQt6.QtGui import QSurfaceFormat, QColor, QPalette, QShortcut, QKeySequence, QPixmap, QImage, QIcon, QCursor
 from PyQt6.QtWidgets import QGraphicsDropShadowEffect
 from PIL import Image, ImageChops, ImageDraw
 from OpenGL.GL import *
@@ -701,6 +701,7 @@ class MSMAnimationViewer(QMainWindow):
         self._splitter_last_sizes: Optional[List[int]] = None
         self._panel_toggle_guard: bool = False
         self._compact_ui_enabled: bool = False
+        self._simple_mode_enabled: bool = False
         self._focus_restore: Optional[Tuple[bool, bool]] = None
         self._timeline_visible: bool = True
         self._content_splitter_last_sizes: Optional[List[int]] = None
@@ -708,6 +709,7 @@ class MSMAnimationViewer(QMainWindow):
         self._log_splitter_last_sizes: Optional[List[int]] = None
         self.viewport_tool_mode: str = "cursor"
         self.control_panel_host: Optional[QWidget] = None
+        self.viewport_tool_strip_container: Optional[QWidget] = None
         self.right_panel_host: Optional[QWidget] = None
         self.right_panel_stack: Optional[QStackedWidget] = None
         self.monster_migration_panel: Optional[MonsterMigrationPanel] = None
@@ -721,7 +723,10 @@ class MSMAnimationViewer(QMainWindow):
         self._viewport_tool_icon_zoom_selected: Optional[QIcon] = None
         self._viewport_tool_icon_zoom_unselected: Optional[QIcon] = None
         self._viewport_zoom_cursor: Optional[QCursor] = None
+        self._ui_theme_base_palette: Optional[QPalette] = None
+        self._ui_theme_tertiary_color: Optional[QColor] = None
 
+        self._apply_ui_theme_colors()
         self.init_ui()
         self._apply_anchor_logging_preferences()
         self._setup_shortcuts()
@@ -903,7 +908,9 @@ class MSMAnimationViewer(QMainWindow):
         control_panel_host_layout.setSpacing(0)
         control_panel_host_layout.addWidget(self.control_panel, 1)
         control_panel_host_layout.addWidget(self._build_viewport_tool_strip(), 0)
+        self.control_panel_host.setMinimumWidth(200)
         self.main_splitter.addWidget(self.control_panel_host)
+        self._apply_control_panel_width_policy()
         
         # Center - OpenGL viewer
         self.gl_widget = OpenGLAnimationWidget(shader_registry=self.shader_registry)
@@ -1093,9 +1100,107 @@ class MSMAnimationViewer(QMainWindow):
                 return None
         return None
 
+    @staticmethod
+    def _blend_palette_colors(base: QColor, target: QColor, t: float) -> QColor:
+        mix = max(0.0, min(1.0, float(t)))
+        inv = 1.0 - mix
+        return QColor(
+            int(round(base.red() * inv + target.red() * mix)),
+            int(round(base.green() * inv + target.green() * mix)),
+            int(round(base.blue() * inv + target.blue() * mix)),
+            int(round(base.alpha() * inv + target.alpha() * mix)),
+        )
+
+    @staticmethod
+    def _ideal_text_color_for_bg(background: QColor) -> QColor:
+        luminance = (
+            0.2126 * background.redF()
+            + 0.7152 * background.greenF()
+            + 0.0722 * background.blueF()
+        )
+        return QColor("#111111") if luminance > 0.60 else QColor("#F2F2F2")
+
+    def _theme_setting_color(self, key: str) -> Optional[QColor]:
+        raw = self.settings.value(key, "", type=str) or ""
+        color = QColor(str(raw).strip())
+        return color if color.isValid() else None
+
+    def _apply_ui_theme_colors(self) -> None:
+        app = QApplication.instance()
+        if app is None:
+            return
+        if self._ui_theme_base_palette is None:
+            self._ui_theme_base_palette = QPalette(app.palette())
+
+        palette = QPalette(self._ui_theme_base_palette)
+
+        primary_enabled = bool(self.settings.value("ui/theme/primary_enabled", False, type=bool))
+        secondary_enabled = bool(self.settings.value("ui/theme/secondary_enabled", False, type=bool))
+        tertiary_enabled = bool(self.settings.value("ui/theme/tertiary_enabled", False, type=bool))
+        primary_color = self._theme_setting_color("ui/theme/primary_color") if primary_enabled else None
+        secondary_color = self._theme_setting_color("ui/theme/secondary_color") if secondary_enabled else None
+        tertiary_color = self._theme_setting_color("ui/theme/tertiary_color") if tertiary_enabled else None
+        self._ui_theme_tertiary_color = QColor(tertiary_color) if tertiary_color is not None else None
+
+        if primary_color is not None:
+            base_color = palette.color(QPalette.ColorRole.Base)
+            alt_base_color = palette.color(QPalette.ColorRole.AlternateBase)
+            toned_base = self._blend_palette_colors(base_color, primary_color, 0.24)
+            toned_alt_base = self._blend_palette_colors(alt_base_color, primary_color, 0.32)
+            window_text = self._ideal_text_color_for_bg(primary_color)
+            text_color = self._ideal_text_color_for_bg(toned_base)
+            palette.setColor(QPalette.ColorRole.Window, primary_color)
+            palette.setColor(QPalette.ColorRole.Button, primary_color)
+            palette.setColor(
+                QPalette.ColorRole.Light,
+                self._blend_palette_colors(primary_color, QColor("#FFFFFF"), 0.32),
+            )
+            palette.setColor(
+                QPalette.ColorRole.Midlight,
+                self._blend_palette_colors(primary_color, QColor("#FFFFFF"), 0.18),
+            )
+            palette.setColor(
+                QPalette.ColorRole.Mid,
+                self._blend_palette_colors(primary_color, QColor("#000000"), 0.30),
+            )
+            palette.setColor(
+                QPalette.ColorRole.Dark,
+                self._blend_palette_colors(primary_color, QColor("#000000"), 0.55),
+            )
+            palette.setColor(QPalette.ColorRole.WindowText, window_text)
+            palette.setColor(QPalette.ColorRole.ButtonText, window_text)
+            palette.setColor(QPalette.ColorRole.Base, toned_base)
+            palette.setColor(QPalette.ColorRole.AlternateBase, toned_alt_base)
+            palette.setColor(QPalette.ColorRole.ToolTipBase, toned_base)
+            palette.setColor(QPalette.ColorRole.ToolTipText, text_color)
+            palette.setColor(QPalette.ColorRole.Text, text_color)
+            palette.setColor(QPalette.ColorRole.PlaceholderText, text_color)
+
+        if secondary_color is not None:
+            highlighted_text = self._ideal_text_color_for_bg(secondary_color)
+            palette.setColor(QPalette.ColorRole.Highlight, secondary_color)
+            palette.setColor(QPalette.ColorRole.HighlightedText, highlighted_text)
+            palette.setColor(
+                QPalette.ColorRole.Link,
+                self._blend_palette_colors(secondary_color, QColor("#FFFFFF"), 0.12),
+            )
+            palette.setColor(
+                QPalette.ColorRole.LinkVisited,
+                self._blend_palette_colors(secondary_color, QColor("#000000"), 0.18),
+            )
+
+        app.setPalette(palette)
+        if hasattr(self, "viewport_tool_buttons") and self.viewport_tool_buttons:
+            self._apply_viewport_tool_button_styles()
+        if hasattr(self, "timeline") and self.timeline is not None:
+            self.timeline.set_keyframe_marker_colors(self._ui_theme_tertiary_color)
+        self.update()
+
     def _apply_ui_preferences(self):
         compact = bool(self.settings.value("ui/compact_ui", False, type=bool))
         self._set_compact_ui(compact, save=False)
+        simple_mode = bool(self.settings.value("ui/simple_mode", False, type=bool))
+        self._set_simple_mode(simple_mode, save=False)
         sizes = self._load_splitter_sizes("ui/main_splitter_sizes")
         if sizes and len(sizes) == 3:
             self._splitter_last_sizes = sizes
@@ -1467,31 +1572,13 @@ class MSMAnimationViewer(QMainWindow):
 
     def _build_viewport_tool_strip(self) -> QWidget:
         container = QWidget()
+        container.setObjectName("viewportToolStrip")
+        container.setAutoFillBackground(True)
+        container.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.viewport_tool_strip_container = container
         layout = QHBoxLayout(container)
         layout.setContentsMargins(8, 6, 8, 8)
         layout.setSpacing(6)
-        highlight = self.palette().color(self.palette().ColorRole.Highlight)
-        checked_bg = f"rgba({highlight.red()}, {highlight.green()}, {highlight.blue()}, 70)"
-        checked_border = highlight.lighter(120).name()
-
-        base_style = (
-            "QToolButton {"
-            " background-color: #2a2a2a;"
-            " border: 1px solid #4a4a4a;"
-            " border-radius: 4px;"
-            " padding: 2px;"
-            "}"
-            "QToolButton:hover {"
-            " background-color: #353535;"
-            "}"
-            "QToolButton:pressed {"
-            " background-color: #3b3b3b;"
-            "}"
-            "QToolButton:checked {"
-            f" background-color: {checked_bg};"
-            f" border: 1px solid {checked_border};"
-            "}"
-        )
 
         def _make_button() -> QToolButton:
             btn = QToolButton()
@@ -1499,7 +1586,6 @@ class MSMAnimationViewer(QMainWindow):
             btn.setAutoRaise(False)
             btn.setFixedSize(38, 38)
             btn.setIconSize(QPixmap(25, 25).size())
-            btn.setStyleSheet(base_style)
             return btn
 
         self._viewport_tool_icon_cursor_selected = self._load_viewport_tool_icon("Cursor Icon Selected.png")
@@ -1529,8 +1615,57 @@ class MSMAnimationViewer(QMainWindow):
             layout.addWidget(placeholder_btn)
 
         layout.addStretch(1)
+        self._apply_viewport_tool_button_styles()
         self._refresh_viewport_tool_buttons()
         return container
+
+    def _apply_viewport_tool_button_styles(self) -> None:
+        app = QApplication.instance()
+        palette_source = app.palette() if app is not None else self.palette()
+        button_bg = palette_source.color(QPalette.ColorRole.Button)
+        strip_bg = self._blend_palette_colors(
+            palette_source.color(QPalette.ColorRole.Window),
+            button_bg,
+            0.55,
+        )
+        strip_border = self._blend_palette_colors(strip_bg, QColor("#000000"), 0.38)
+        if self.viewport_tool_strip_container is not None:
+            self.viewport_tool_strip_container.setStyleSheet(
+                "QWidget#viewportToolStrip {"
+                f" background-color: {strip_bg.name()};"
+                f" border-top: 1px solid {strip_border.name()};"
+                "}"
+            )
+        if not self.viewport_tool_buttons:
+            return
+        button_border = self._blend_palette_colors(button_bg, QColor("#000000"), 0.45)
+        hover_bg = self._blend_palette_colors(button_bg, QColor("#FFFFFF"), 0.12)
+        pressed_bg = self._blend_palette_colors(button_bg, QColor("#FFFFFF"), 0.18)
+        checked_color = self._ui_theme_tertiary_color or palette_source.color(QPalette.ColorRole.Highlight)
+        checked_bg = f"rgba({checked_color.red()}, {checked_color.green()}, {checked_color.blue()}, 70)"
+        checked_border = checked_color.lighter(120).name()
+
+        style = (
+            "QToolButton {"
+            f" background-color: {button_bg.name()};"
+            f" border: 1px solid {button_border.name()};"
+            " border-radius: 4px;"
+            " padding: 2px;"
+            "}"
+            "QToolButton:hover {"
+            f" background-color: {hover_bg.name()};"
+            "}"
+            "QToolButton:pressed {"
+            f" background-color: {pressed_bg.name()};"
+            "}"
+            "QToolButton:checked {"
+            f" background-color: {checked_bg};"
+            f" border: 1px solid {checked_border};"
+            "}"
+        )
+        for btn in self.viewport_tool_buttons:
+            if btn is not None:
+                btn.setStyleSheet(style)
 
     def _refresh_viewport_tool_buttons(self) -> None:
         if self.viewport_tool_cursor_btn is not None:
@@ -1617,8 +1752,38 @@ class MSMAnimationViewer(QMainWindow):
         if save:
             self.settings.setValue("ui/compact_ui", self._compact_ui_enabled)
 
+    def _apply_control_panel_width_policy(self) -> None:
+        if not hasattr(self, "control_panel_host") or self.control_panel_host is None:
+            return
+        panel_max = int(getattr(self.control_panel, "_max_width", self.control_panel.maximumWidth()))
+        if panel_max <= 0:
+            panel_max = 600
+        if self._simple_mode_enabled:
+            self.control_panel_host.setMaximumWidth(panel_max)
+            if hasattr(self, "main_splitter"):
+                sizes = self.main_splitter.sizes()
+                if len(sizes) == 3 and sizes[0] > panel_max:
+                    overshoot = sizes[0] - panel_max
+                    sizes[0] = panel_max
+                    sizes[1] = max(1, sizes[1] + overshoot)
+                    self.main_splitter.setSizes(sizes)
+        else:
+            self.control_panel_host.setMaximumWidth(16777215)
+
+    def _set_simple_mode(self, enabled: bool, *, save: bool = True):
+        self._simple_mode_enabled = bool(enabled)
+        if hasattr(self, "control_panel"):
+            self.control_panel.set_simple_mode(self._simple_mode_enabled)
+            self._apply_control_panel_width_policy()
+            self._update_right_panel_mode(force_refresh=True)
+        if save:
+            self.settings.setValue("ui/simple_mode", self._simple_mode_enabled)
+
     def on_compact_ui_toggled(self, enabled: bool):
         self._set_compact_ui(enabled, save=True)
+
+    def on_simple_mode_toggled(self, enabled: bool):
+        self._set_simple_mode(enabled, save=True)
 
     def _setup_shortcuts(self):
         """Configure application-wide shortcuts."""
@@ -2080,6 +2245,7 @@ class MSMAnimationViewer(QMainWindow):
         self.control_panel.set_barebones_file_mode(self.export_settings.use_barebones_file_browser)
         self._update_keyframe_history_controls()
         self.control_panel.compact_ui_toggled.connect(self.on_compact_ui_toggled)
+        self.control_panel.simple_mode_toggled.connect(self.on_simple_mode_toggled)
         if hasattr(self.control_panel, "dof_include_mesh_xml_checkbox"):
             self.control_panel.dof_include_mesh_xml_checkbox.toggled.connect(
                 self._on_control_panel_dof_include_mesh_xml_toggled
@@ -23040,6 +23206,7 @@ class MSMAnimationViewer(QMainWindow):
         )
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.log_widget.log("Settings saved", "SUCCESS")
+            self._apply_ui_theme_colors()
             paths_changed = self._reload_primary_paths_from_settings(refresh=True)
             if paths_changed:
                 self.log_widget.log("Applied active path profile from Settings.", "INFO")
@@ -23660,6 +23827,7 @@ All game assets and content are owned by Big Blue Bubble Inc.
     
     def load_settings(self):
         """Load saved settings"""
+        self._apply_ui_theme_colors()
         self.control_panel.set_dof_search_mode(self.dof_search_enabled)
         sprite_filter = self.settings.value("viewport/sprite_filter", "bilinear", type=str)
         if hasattr(self, "gl_widget"):
