@@ -661,7 +661,7 @@ class MSMAnimationViewer(QMainWindow):
         )
         self._layer_thumbnail_cache: Dict[object, Optional[QPixmap]] = {}
         self._atlas_image_cache: Dict[str, Optional[Image.Image]] = {}
-        self._layer_sprite_preview_state: Dict[int, Tuple[str, int, int, int, int]] = {}
+        self._layer_sprite_preview_state: Dict[int, Tuple[Any, ...]] = {}
         self._selected_marker_refs: Set[Tuple["TimelineLaneKey", float]] = set()
         self._atlas_original_image_cache: Dict[str, Optional[Image.Image]] = {}
         self._atlas_modified_images: Dict[str, Image.Image] = {}
@@ -4868,7 +4868,10 @@ class MSMAnimationViewer(QMainWindow):
             if need_context:
                 self.gl_widget.doneCurrent()
         self.base_texture_atlases = list(atlases)
-        self.gl_widget.set_layer_atlas_overrides({})
+        animation = getattr(self.gl_widget.player, "animation", None)
+        base_layers = list(getattr(animation, "layers", []) or [])
+        base_overrides = self._build_base_source_layer_atlas_overrides(base_layers)
+        self.gl_widget.set_layer_atlas_overrides(base_overrides)
         self.gl_widget.update()
 
     def _refresh_costume_list(self):
@@ -5699,7 +5702,8 @@ class MSMAnimationViewer(QMainWindow):
         if entry is None:
             animation.layers = self._clone_layers(self.base_layer_cache)
             self.gl_widget.texture_atlases = list(self.base_texture_atlases)
-            self.gl_widget.set_layer_atlas_overrides({})
+            base_overrides = self._build_base_source_layer_atlas_overrides(animation.layers)
+            self.gl_widget.set_layer_atlas_overrides(base_overrides)
             self.gl_widget.set_layer_pivot_context({})
             self._reset_costume_runtime_state(animation.layers)
             self._configure_costume_shaders(None, None)
@@ -5782,7 +5786,9 @@ class MSMAnimationViewer(QMainWindow):
             costume_atlases,
             sheet_alias,
         )
-        self.gl_widget.set_layer_atlas_overrides(overrides)
+        base_overrides = self._build_base_source_layer_atlas_overrides(layers)
+        merged_overrides = self._merge_layer_atlas_overrides(overrides, base_overrides)
+        self.gl_widget.set_layer_atlas_overrides(merged_overrides)
         self.gl_widget.set_layer_pivot_context(pivot_context)
         self._configure_costume_shaders(entry, costume_data)
         self.gl_widget.set_costume_attachments(attachment_payloads, layers)
@@ -5884,6 +5890,82 @@ class MSMAnimationViewer(QMainWindow):
             if matched:
                 overrides[layer.layer_id] = matched
         return overrides, pivot_context
+
+    def _resolve_source_entry_atlas(
+        self,
+        source_entry: Optional[Dict[str, Any]],
+    ) -> Optional[TextureAtlas]:
+        """Resolve a layer source entry to its preferred texture atlas."""
+        if not isinstance(source_entry, dict) or not self.source_atlas_lookup:
+            return None
+
+        src_value = source_entry.get("src")
+        candidate_keys: List[Any] = []
+
+        def _append_candidate(value: Any) -> None:
+            if value is None:
+                return
+            candidate_keys.append(value)
+
+        if isinstance(src_value, str):
+            src_str = src_value.strip()
+            if src_str:
+                _append_candidate(src_str)
+                _append_candidate(src_str.lower())
+                for key in self._canonical_sheet_keys(src_str):
+                    _append_candidate(key)
+                try:
+                    _append_candidate(int(src_str))
+                except (TypeError, ValueError):
+                    pass
+        elif isinstance(src_value, (int, float)) and not isinstance(src_value, bool):
+            src_int = int(src_value)
+            if src_int >= 0:
+                _append_candidate(src_int)
+                _append_candidate(str(src_int))
+
+        for key in candidate_keys:
+            atlas = self.source_atlas_lookup.get(key)
+            if atlas:
+                return atlas
+        return None
+
+    def _build_base_source_layer_atlas_overrides(
+        self,
+        layers: List[LayerData],
+    ) -> Dict[int, List[TextureAtlas]]:
+        """Build per-layer atlas overrides from base animation source mappings."""
+        overrides: Dict[int, List[TextureAtlas]] = {}
+        for layer in layers or []:
+            layer_id = getattr(layer, "layer_id", None)
+            if layer_id is None:
+                continue
+            source_entry = self.layer_source_lookup.get(layer_id)
+            atlas = self._resolve_source_entry_atlas(source_entry)
+            if atlas:
+                overrides[layer_id] = [atlas]
+        return overrides
+
+    def _merge_layer_atlas_overrides(
+        self,
+        primary: Dict[int, List[TextureAtlas]],
+        fallback: Dict[int, List[TextureAtlas]],
+    ) -> Dict[int, List[TextureAtlas]]:
+        """Merge override chains while preserving ordering and removing duplicates."""
+        merged: Dict[int, List[TextureAtlas]] = {}
+        for layer_id in set(primary.keys()) | set(fallback.keys()):
+            chain: List[TextureAtlas] = []
+            seen: Set[int] = set()
+            for bucket in (primary.get(layer_id) or [], fallback.get(layer_id) or []):
+                for atlas in bucket:
+                    atlas_id = id(atlas)
+                    if atlas_id in seen:
+                        continue
+                    seen.add(atlas_id)
+                    chain.append(atlas)
+            if chain:
+                merged[layer_id] = chain
+        return merged
 
     def _resolve_atlases_for_keys(
         self,
@@ -10210,11 +10292,17 @@ class MSMAnimationViewer(QMainWindow):
             self._dump_mask_debug_layer_layout(animation)
             self.gl_widget.invalidate_animation_cache()
             self._record_layer_defaults(animation.layers)
-            self.gl_widget.set_layer_atlas_overrides({})
+            base_overrides = self._build_base_source_layer_atlas_overrides(animation.layers)
+            self.gl_widget.set_layer_atlas_overrides(base_overrides)
             self.gl_widget.set_layer_pivot_context({})
             self._reset_costume_runtime_state(animation.layers)
             self.base_texture_atlases = list(self.gl_widget.texture_atlases)
             self.costume_atlas_cache.clear()
+            if len(sources) > 1:
+                self.log_widget.log(
+                    f"Source-bound atlas overrides active for {len(base_overrides)}/{len(animation.layers)} layers",
+                    "INFO",
+                )
             self.update_layer_panel()
             self.selected_layer_ids.clear()
             self.primary_selected_layer_id = None
@@ -13161,12 +13249,89 @@ class MSMAnimationViewer(QMainWindow):
         if len(lowered) == 1:
             return 0.35
         return 1.0
+
+    @staticmethod
+    def _layer_panel_source_filter_key(value: Any) -> str:
+        """Normalize a source identifier into a stable filter key."""
+        if value is None:
+            return "__unassigned__"
+        if isinstance(value, bool):
+            return "__unassigned__"
+        if isinstance(value, (int, float)):
+            ivalue = int(value)
+            if ivalue < 0:
+                return "__unassigned__"
+            return f"id:{ivalue}"
+        text = str(value).strip()
+        if not text:
+            return "__unassigned__"
+        try:
+            ivalue = int(text)
+            if ivalue < 0:
+                return "__unassigned__"
+            return f"id:{ivalue}"
+        except (TypeError, ValueError):
+            pass
+        return f"name:{text.lower()}"
+
+    def _build_layer_panel_source_filter_config(
+        self,
+        layers: List[LayerData],
+    ) -> Tuple[List[Tuple[str, str]], Dict[int, str]]:
+        """Build source filter options + per-layer source keys for the layer panel."""
+        options: List[Tuple[str, str]] = [("__all__", "All Sources")]
+        layer_source_keys: Dict[int, str] = {}
+        sources = list((self.current_json_data or {}).get("sources") or [])
+        source_path_lookup: Dict[str, str] = {}
+        seen_option_keys: Set[str] = set()
+
+        for index, source in enumerate(sources):
+            source_id = source.get("id", index)
+            key = self._layer_panel_source_filter_key(source_id)
+            if key in seen_option_keys:
+                continue
+            seen_option_keys.add(key)
+            source_name = str(source.get("src") or f"source_{index}").strip()
+            source_base = os.path.basename(source_name) or source_name
+            if source.get("id", index) == index:
+                label = f"{index}: {source_base}"
+            else:
+                label = f"{index} (id {source_id}): {source_base}"
+            options.append((key, label))
+            for canonical in self._canonical_sheet_keys(source_name):
+                source_path_lookup[canonical] = key
+
+        has_unassigned = False
+        for layer in layers:
+            layer_id = getattr(layer, "layer_id", None)
+            if layer_id is None:
+                continue
+            source_entry = self.layer_source_lookup.get(layer_id) or {}
+            src_value = source_entry.get("src")
+            key = self._layer_panel_source_filter_key(src_value)
+            if key.startswith("name:"):
+                raw_name = str(src_value).strip()
+                for canonical in self._canonical_sheet_keys(raw_name):
+                    mapped = source_path_lookup.get(canonical)
+                    if mapped:
+                        key = mapped
+                        break
+            if key == "__unassigned__":
+                has_unassigned = True
+            layer_source_keys[int(layer_id)] = key
+
+        if has_unassigned:
+            options.append(("__unassigned__", "Unassigned / Shared"))
+
+        return options, layer_source_keys
     
     def update_layer_panel(self):
         """Update the layer visibility panel"""
         animation = self.gl_widget.player.animation
         self._reset_layer_thumbnail_cache()
         if animation:
+            source_options, source_keys = self._build_layer_panel_source_filter_config(animation.layers)
+            self.layer_panel.configure_source_filter(source_options, source_keys)
             self.layer_panel.set_default_hidden_layers(self._default_hidden_layer_ids)
             self.layer_panel.update_layers(animation.layers)
             variant_layers = self._detect_layers_with_sprite_variants(animation.layers)
@@ -13188,6 +13353,7 @@ class MSMAnimationViewer(QMainWindow):
                 self.gl_widget.capture_joint_rest_lengths()
             self._refresh_layer_thumbnails()
         else:
+            self.layer_panel.configure_source_filter([("__all__", "All Sources")], {})
             self.layer_panel.set_default_hidden_layers(set())
             self.layer_panel.update_layers([])
             self.layer_panel.set_layers_with_sprite_variants(set())
@@ -15016,11 +15182,16 @@ class MSMAnimationViewer(QMainWindow):
                 )
             except Exception:
                 sprite_name = ""
-            preview_key = (sprite_name, *tint)
+            source_signature = self._layer_thumbnail_source_signature(layer.layer_id)
+            preview_key = (sprite_name, *tint, source_signature)
             previous = self._layer_sprite_preview_state.get(layer.layer_id)
             if previous == preview_key:
                 continue
-            pixmap = self._get_layer_thumbnail_pixmap(sprite_name, tint=tint)
+            pixmap = self._get_layer_thumbnail_pixmap(
+                sprite_name,
+                tint=tint,
+                layer_id=layer.layer_id,
+            )
             self.layer_panel.set_layer_thumbnail(layer.layer_id, pixmap)
             if hasattr(self, "control_panel") and self.control_panel:
                 self.control_panel.set_export_layer_thumbnail(layer.layer_id, pixmap)
@@ -15050,7 +15221,11 @@ class MSMAnimationViewer(QMainWindow):
                 )
             except Exception:
                 sprite_name = ""
-            pixmap = self._get_layer_thumbnail_pixmap(sprite_name, tint=tint)
+            pixmap = self._get_layer_thumbnail_pixmap(
+                sprite_name,
+                tint=tint,
+                layer_id=layer.layer_id,
+            )
             self.timeline.set_group_thumbnail(("layer", layer.layer_id), pixmap)
         global_lanes = getattr(animation, "global_keyframe_lanes", []) or []
         if global_lanes:
@@ -15061,6 +15236,7 @@ class MSMAnimationViewer(QMainWindow):
         sprite_name: Optional[str],
         *,
         tint: Optional[Tuple[int, int, int, int]] = None,
+        layer_id: Optional[int] = None,
     ) -> Optional[QPixmap]:
         """Return a cached pixmap for a sprite, loading it if necessary."""
         if not sprite_name:
@@ -15070,14 +15246,23 @@ class MSMAnimationViewer(QMainWindow):
             r, g, b, a = (max(0, min(255, int(val))) for val in tint)
             if (r, g, b, a) != (255, 255, 255, 255):
                 tint_key = (r, g, b, a)
-        cache_key = sprite_name if tint_key is None else (sprite_name, tint_key)
-        if cache_key in self._layer_thumbnail_cache:
-            return self._layer_thumbnail_cache[cache_key]
-        resolved = self._resolve_sprite_asset(sprite_name)
+        resolved = self._resolve_sprite_asset(sprite_name, layer_id=layer_id)
         if not resolved:
+            cache_key = ("missing", layer_id, sprite_name, tint_key)
             self._layer_thumbnail_cache[cache_key] = None
             return None
         sprite, atlas = resolved
+        atlas_cache_key = self._atlas_cache_key(atlas) or f"atlas:{id(atlas)}"
+        cache_key = (
+            sprite_name,
+            atlas_cache_key,
+        ) if tint_key is None else (
+            sprite_name,
+            atlas_cache_key,
+            tint_key,
+        )
+        if cache_key in self._layer_thumbnail_cache:
+            return self._layer_thumbnail_cache[cache_key]
         atlas_image = self._load_atlas_image(atlas)
         if atlas_image is None:
             self._layer_thumbnail_cache[cache_key] = None
@@ -15095,6 +15280,52 @@ class MSMAnimationViewer(QMainWindow):
         pixmap = self._pil_image_to_qpixmap(sprite_image)
         self._layer_thumbnail_cache[cache_key] = pixmap
         return pixmap
+
+    def _layer_thumbnail_atlas_chain(self, layer_id: Optional[int]) -> List[TextureAtlas]:
+        """Return atlas search order for a specific layer thumbnail lookup."""
+        chain: List[TextureAtlas] = []
+        seen: Set[int] = set()
+        if layer_id is not None:
+            overrides = getattr(self.gl_widget, "layer_atlas_overrides", {}) or {}
+            for atlas in overrides.get(layer_id) or []:
+                if not atlas:
+                    continue
+                atlas_id = id(atlas)
+                if atlas_id in seen:
+                    continue
+                seen.add(atlas_id)
+                chain.append(atlas)
+            if not chain:
+                source_entry = self.layer_source_lookup.get(layer_id)
+                source_atlas = self._resolve_source_entry_atlas(source_entry)
+                if source_atlas:
+                    atlas_id = id(source_atlas)
+                    if atlas_id not in seen:
+                        seen.add(atlas_id)
+                        chain.append(source_atlas)
+        for atlas in getattr(self.gl_widget, "texture_atlases", []) or []:
+            if not atlas:
+                continue
+            atlas_id = id(atlas)
+            if atlas_id in seen:
+                continue
+            seen.add(atlas_id)
+            chain.append(atlas)
+        return chain
+
+    def _layer_thumbnail_source_signature(self, layer_id: Optional[int]) -> Tuple[str, ...]:
+        """Build a stable signature that changes when layer atlas priority changes."""
+        chain = self._layer_thumbnail_atlas_chain(layer_id)
+        if not chain:
+            return ("<none>",)
+        labels: List[str] = []
+        for atlas in chain:
+            key = self._atlas_cache_key(atlas)
+            if key:
+                labels.append(key)
+            else:
+                labels.append(f"id:{id(atlas)}")
+        return tuple(labels)
 
     def _apply_sprite_tint(
         self,
@@ -15166,10 +15397,18 @@ class MSMAnimationViewer(QMainWindow):
         return atlas_image
 
     def _resolve_sprite_asset(
-        self, sprite_name: str
+        self,
+        sprite_name: str,
+        *,
+        layer_id: Optional[int] = None,
     ) -> Optional[Tuple[Any, TextureAtlas]]:
         """Locate the sprite/atlas pair for a given sprite name."""
-        for atlas in self._iter_active_atlases():
+        search_chain = (
+            self._layer_thumbnail_atlas_chain(layer_id)
+            if layer_id is not None
+            else list(self._iter_active_atlases())
+        )
+        for atlas in search_chain:
             sprite = atlas.get_sprite(sprite_name)
             if sprite:
                 return sprite, atlas

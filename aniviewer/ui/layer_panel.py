@@ -5,12 +5,13 @@ Displays layer visibility controls and multi-selection management
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
     QScrollArea, QCheckBox, QPushButton, QFrame, QGroupBox,
     QToolButton, QSizePolicy, QLineEdit, QMenu, QPlainTextEdit,
+    QComboBox,
     QColorDialog, QSpinBox, QApplication, QButtonGroup
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QSize, QPoint, QMimeData
@@ -73,6 +74,8 @@ class LayerPanel(QWidget):
         self._selection_anchor_id: Optional[int] = None
         self._all_layers: List[LayerData] = []
         self._filter_text: str = ""
+        self._active_source_filter_key: str = "__all__"
+        self._layer_source_keys: Dict[int, str] = {}
         self._updating_color_controls: bool = False
         self._default_hidden_layers: Set[int] = set()
         self._show_placeholder_layers: bool = True
@@ -108,6 +111,18 @@ class LayerPanel(QWidget):
         self.filter_input.textChanged.connect(self._on_filter_changed)
         filter_row.addWidget(self.filter_input, 1)
         header_layout.addLayout(filter_row)
+
+        source_row = QHBoxLayout()
+        source_row.setSpacing(6)
+        self.source_filter_label = QLabel("Source:")
+        source_row.addWidget(self.source_filter_label)
+        self.source_filter_combo = QComboBox()
+        self.source_filter_combo.currentIndexChanged.connect(self._on_source_filter_changed)
+        source_row.addWidget(self.source_filter_combo, 1)
+        self.source_filter_container = QWidget()
+        self.source_filter_container.setLayout(source_row)
+        self.source_filter_container.setVisible(False)
+        header_layout.addWidget(self.source_filter_container)
 
         self.count_label = QLabel("No layers")
         self.count_label.setStyleSheet("color: gray; font-size: 8pt;")
@@ -433,6 +448,44 @@ class LayerPanel(QWidget):
         self._filter_text = text.lower().strip()
         self._apply_filter()
 
+    def _on_source_filter_changed(self, index: int):
+        """Filter layers by selected source entry."""
+        key = self.source_filter_combo.itemData(index)
+        self._active_source_filter_key = key if isinstance(key, str) and key else "__all__"
+        self._apply_filter()
+
+    def configure_source_filter(
+        self,
+        options: Optional[List[Tuple[str, str]]],
+        layer_source_keys: Optional[Dict[int, str]],
+    ) -> None:
+        """Configure source filter options and per-layer source mapping."""
+        self._layer_source_keys = dict(layer_source_keys or {})
+        normalized: List[Tuple[str, str]] = []
+        seen: Set[str] = set()
+        for key, label in options or []:
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            normalized.append((key, label))
+        if "__all__" not in seen:
+            normalized.insert(0, ("__all__", "All Sources"))
+        self.source_filter_combo.blockSignals(True)
+        self.source_filter_combo.clear()
+        for key, label in normalized:
+            self.source_filter_combo.addItem(label, key)
+        current_key = self._active_source_filter_key if self._active_source_filter_key in {k for k, _ in normalized} else "__all__"
+        index = self.source_filter_combo.findData(current_key)
+        if index < 0:
+            index = 0
+            current_key = "__all__"
+        self.source_filter_combo.setCurrentIndex(index)
+        self.source_filter_combo.blockSignals(False)
+        self._active_source_filter_key = current_key
+        non_all_count = sum(1 for key, _ in normalized if key != "__all__")
+        self.source_filter_container.setVisible(non_all_count > 1)
+        self._apply_filter()
+
     def _apply_filter(self):
         """Show/hide layer rows based on filter text."""
         effective_rows: List[LayerRow] = []
@@ -444,19 +497,25 @@ class LayerPanel(QWidget):
 
         visible_count = 0
         for row in effective_rows:
-            if not self._filter_text:
-                row.setVisible(True)
+            source_key = self._layer_source_keys.get(row.layer.layer_id, "__unassigned__")
+            source_matches = (
+                self._active_source_filter_key == "__all__"
+                or source_key == self._active_source_filter_key
+            )
+            name_matches = (
+                not self._filter_text
+                or self._filter_text in row.layer.name.lower()
+            )
+            matches = source_matches and name_matches
+            row.setVisible(matches)
+            if matches:
                 visible_count += 1
-            else:
-                matches = self._filter_text in row.layer.name.lower()
-                row.setVisible(matches)
-                if matches:
-                    visible_count += 1
 
         total = len(effective_rows)
+        source_filtered = self._active_source_filter_key != "__all__"
         if total == 0:
             self.count_label.setText("No layers")
-        elif self._filter_text and visible_count != total:
+        elif (self._filter_text or source_filtered) and visible_count != total:
             self.count_label.setText(f"Showing {visible_count} of {total} layers")
         else:
             self.count_label.setText(f"Showing {total} layers")

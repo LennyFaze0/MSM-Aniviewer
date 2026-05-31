@@ -11,8 +11,8 @@ from PyQt6.QtWidgets import (
     QStackedWidget,
     QFileDialog
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QSize, QTimer
-from PyQt6.QtGui import QPixmap
+from PyQt6.QtCore import Qt, pyqtSignal, QSize, QTimer, QPropertyAnimation, QEasingCurve, pyqtProperty, QRectF
+from PyQt6.QtGui import QPixmap, QColor, QPainter
 from typing import Any, Dict, List, Tuple, Optional
 
 
@@ -36,6 +36,57 @@ class FullscreenSafeComboBox(QComboBox):
         popup.raise_()
         popup.activateWindow()
         view.setFocus(Qt.FocusReason.PopupFocusReason)
+
+
+class MetronomeBeatIndicator(QWidget):
+    """Small circular metronome indicator with pulse animation."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._base_diameter = 12.0
+        self._pulse_scale = 1.0
+        self._color = QColor(255, 255, 255, 64)
+        self._pulse_anim = QPropertyAnimation(self, b"pulseScale", self)
+        self._pulse_anim.setDuration(280)
+        self._pulse_anim.setKeyValueAt(0.0, 1.0)
+        self._pulse_anim.setKeyValueAt(0.15, 1.55)
+        self._pulse_anim.setKeyValueAt(1.0, 1.0)
+        self._pulse_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self.setFixedSize(24, 24)
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+
+    def getPulseScale(self) -> float:
+        return float(self._pulse_scale)
+
+    def setPulseScale(self, value: float) -> None:
+        clamped = max(0.5, min(2.0, float(value)))
+        if abs(clamped - self._pulse_scale) < 1e-4:
+            return
+        self._pulse_scale = clamped
+        self.update()
+
+    pulseScale = pyqtProperty(float, fget=getPulseScale, fset=setPulseScale)
+
+    def set_indicator_color(self, color: QColor) -> None:
+        self._color = QColor(color)
+        self.update()
+
+    def pulse(self) -> None:
+        self._pulse_anim.stop()
+        self.setPulseScale(1.0)
+        self._pulse_anim.start()
+
+    def paintEvent(self, event) -> None:
+        _ = event
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        diameter = self._base_diameter * self._pulse_scale
+        radius = max(2.0, diameter * 0.5)
+        cx = self.width() * 0.5
+        cy = self.height() * 0.5
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(self._color)
+        painter.drawEllipse(QRectF(cx - radius, cy - radius, radius * 2.0, radius * 2.0))
 
 
 class ControlPanel(QWidget):
@@ -749,10 +800,8 @@ class ControlPanel(QWidget):
         metronome_layout.addWidget(self.metronome_checkbox)
         metronome_layout.addStretch(1)
         metronome_layout.addWidget(QLabel("Beat:"))
-        self.metronome_indicator = QLabel("●")
-        self.metronome_indicator.setStyleSheet(
-            "color: rgba(255, 255, 255, 0.25); font: bold 16pt;"
-        )
+        self.metronome_indicator = MetronomeBeatIndicator()
+        self.metronome_indicator.set_indicator_color(QColor(255, 255, 255, 64))
         metronome_layout.addWidget(self.metronome_indicator)
         render_layout.addLayout(metronome_layout)
         self._metronome_flash_timer: QTimer | None = None
@@ -2559,18 +2608,17 @@ class ControlPanel(QWidget):
 
     def pulse_metronome_indicator(self, downbeat: bool = False):
         """Briefly flash the metronome indicator to show a beat."""
-        color = "#00f5a0" if downbeat else "#36c1ff"
-        self.metronome_indicator.setStyleSheet(f"color: {color}; font: bold 16pt;")
+        color = QColor("#00f5a0") if downbeat else QColor("#36c1ff")
+        self.metronome_indicator.set_indicator_color(color)
+        self.metronome_indicator.pulse()
         if self._metronome_flash_timer is None:
             self._metronome_flash_timer = QTimer(self)
             self._metronome_flash_timer.setSingleShot(True)
             self._metronome_flash_timer.timeout.connect(self._reset_metronome_indicator)
-        self._metronome_flash_timer.start(120)
+        self._metronome_flash_timer.start(240)
 
     def _reset_metronome_indicator(self):
-        self.metronome_indicator.setStyleSheet(
-            "color: rgba(255, 255, 255, 0.25); font: bold 16pt;"
-        )
+        self.metronome_indicator.set_indicator_color(QColor(255, 255, 255, 64))
 
     def _emit_time_signature_change(self):
         denom = self.metronome_time_sig_denom.currentData(Qt.ItemDataRole.UserRole)
