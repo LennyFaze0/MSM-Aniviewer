@@ -2,6 +2,16 @@
 
 A comprehensive animation viewer for My Singing Monsters with OpenGL rendering, timeline scrubbing, and export features.
 
+Note: This project was spearheaded with the intention to innovate,
+and stay as a one man project, that being me. However, I have to bring attention to
+the method I use to develop for the aniviewer.
+
+This project was developed in collaboration with an AI agent in VSCODE,
+but hosted locally via unsloth to prevent AI companies from misusing their resources from my hands.
+
+All graphics, UI elements, and reverse engineering efforts pertaining to the Aniviewer 
+are done by me, and will always be done by me. (Aside from collaboration with other reverse engineers or artists)
+
 ## Features
 
 - **OpenGL Rendering**: Accurate animation rendering using raw OpenGL, similar to the actual game
