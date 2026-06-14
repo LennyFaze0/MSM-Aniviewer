@@ -210,6 +210,7 @@ class ControlPanel(QWidget):
     joint_solver_parented_changed = pyqtSignal(bool)
     propagate_user_transforms_changed = pyqtSignal(bool)
     preserve_children_on_record_changed = pyqtSignal(bool)
+    simple_keyframe_mode_changed = pyqtSignal(bool)
     joint_solver_capture_requested = pyqtSignal()
     joint_solver_bake_current_requested = pyqtSignal()
     joint_solver_bake_range_requested = pyqtSignal()
@@ -586,6 +587,15 @@ class ControlPanel(QWidget):
             self.preserve_children_on_record_changed.emit
         )
         anim_layout.addWidget(self.preserve_children_on_record_checkbox)
+
+        self.simple_keyframe_mode_checkbox = QCheckBox("Simple Keyframe Mode")
+        self.simple_keyframe_mode_checkbox.setToolTip(
+            "Record selected layers directly into base keyframes using the b0.6-style keyframe behavior."
+        )
+        self.simple_keyframe_mode_checkbox.toggled.connect(
+            self.simple_keyframe_mode_changed.emit
+        )
+        anim_layout.addWidget(self.simple_keyframe_mode_checkbox)
 
         pose_actions = QGridLayout()
         pose_actions.setHorizontalSpacing(6)
@@ -3081,6 +3091,13 @@ class ControlPanel(QWidget):
         self.preserve_children_on_record_checkbox.setChecked(bool(enabled))
         self.preserve_children_on_record_checkbox.blockSignals(False)
 
+    def set_simple_keyframe_mode(self, enabled: bool):
+        if not hasattr(self, "simple_keyframe_mode_checkbox"):
+            return
+        self.simple_keyframe_mode_checkbox.blockSignals(True)
+        self.simple_keyframe_mode_checkbox.setChecked(bool(enabled))
+        self.simple_keyframe_mode_checkbox.blockSignals(False)
+
     def update_constraints_list(self, entries: List[Tuple[str, bool, str]]):
         """Populate the constraints list (cid, enabled, label)."""
         if not hasattr(self, "constraints_list"):
@@ -3155,6 +3172,8 @@ class ControlPanel(QWidget):
             self.pose_mode_combo.setEnabled(enabled)
         if hasattr(self, "preserve_children_on_record_checkbox"):
             self.preserve_children_on_record_checkbox.setEnabled(enabled)
+        if hasattr(self, "simple_keyframe_mode_checkbox"):
+            self.simple_keyframe_mode_checkbox.setEnabled(enabled)
         if hasattr(self, "reset_pose_btn"):
             self.reset_pose_btn.setEnabled(enabled)
         if hasattr(self, "undo_keyframe_btn"):

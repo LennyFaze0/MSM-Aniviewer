@@ -7,6 +7,7 @@ Separated from widget logic for clarity and testability
 import math
 import os
 import re
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple, Any
 from OpenGL.GL import *
@@ -1276,6 +1277,8 @@ class SpriteRenderer:
         self.shader_registry: Optional[ShaderRegistry] = None
         self._missing_shader_warnings: Set[str] = set()
         self._sprite_alias_cache: Dict[Tuple[str, str], str] = {}
+        self._sprite_atlas_sequence_cache: "OrderedDict[Tuple[Any, ...], Tuple[int, str]]" = OrderedDict()
+        self._sprite_atlas_sequence_cache_limit: int = 8192
         self._sprite_alias_warnings: Set[Tuple[str, str]] = set()
         self.shader_texture_cache: Dict[str, ShaderOverlayTexture] = {}
         self.current_time: float = 0.0
@@ -2090,11 +2093,45 @@ class SpriteRenderer:
         """Search all atlases in order, returning the first match (with alias support)."""
         if not sprite_name or not atlases:
             return None, None, sprite_name
-        for atlas in atlases:
+        atlas_sequence_key = tuple(
+            (
+                id(atlas),
+                self._atlas_cache_key(atlas),
+                len(getattr(atlas, "sprites", {}) or {}),
+            )
+            for atlas in atlases
+        )
+        cache_key = (sprite_name, bool(allow_alias), atlas_sequence_key)
+        cached = self._sprite_atlas_sequence_cache.get(cache_key)
+        if cached is not None:
+            atlas_index, resolved_name = cached
+            self._sprite_atlas_sequence_cache.move_to_end(cache_key)
+            if 0 <= atlas_index < len(atlases) and resolved_name:
+                atlas = atlases[atlas_index]
+                sprite = atlas.get_sprite(resolved_name)
+                if sprite:
+                    return sprite, atlas, resolved_name
+            elif atlas_index < 0:
+                return None, None, sprite_name
+
+        for atlas_index, atlas in enumerate(atlases):
             sprite, resolved_name = self._get_sprite_from_atlas(sprite_name, atlas, allow_alias)
             if sprite:
+                self._remember_sprite_atlas_sequence(cache_key, (atlas_index, resolved_name))
                 return sprite, atlas, resolved_name
+        self._remember_sprite_atlas_sequence(cache_key, (-1, ""))
         return None, None, sprite_name
+
+    def _remember_sprite_atlas_sequence(
+        self,
+        cache_key: Tuple[Any, ...],
+        value: Tuple[int, str],
+    ) -> None:
+        """Store bounded sprite lookup results for an ordered atlas list."""
+        self._sprite_atlas_sequence_cache[cache_key] = value
+        self._sprite_atlas_sequence_cache.move_to_end(cache_key)
+        while len(self._sprite_atlas_sequence_cache) > self._sprite_atlas_sequence_cache_limit:
+            self._sprite_atlas_sequence_cache.popitem(last=False)
 
     def _get_hires_scale(self, atlas: TextureAtlas) -> float:
         """Return the scale applied to hi-res atlases."""
@@ -2305,6 +2342,12 @@ class SpriteRenderer:
             has_costume_pivot_context = bool(
                 pivot_remap_context and pivot_remap_context.get(layer.layer_id)
             )
+            render_tags = getattr(layer, "render_tags", set()) or set()
+            suppress_mixed_costume_pivot_fallback = (
+                has_costume_pivot_context
+                and isinstance(render_tags, set)
+                and "costume_mixed_pivot_sequence" in render_tags
+            )
             anchor_map = getattr(layer, "sprite_anchor_map", None)
             use_anchor_map = False
             anchor_map_missing = False
@@ -2395,6 +2438,10 @@ class SpriteRenderer:
                         if abs(sprite.pivot_x - 0.5) > 0.001 or abs(sprite.pivot_y - 0.5) > 0.001:
                             # DOF sprites already encode pivot-local geometry; do not apply costume pivot adjustment.
                             if getattr(search_atlas, "pivot_mode", None) == "dof":
+                                pass
+                            elif suppress_mixed_costume_pivot_fallback:
+                                # Mixed-pivot costume frame swaps need one
+                                # consistent anchor model across all frames.
                                 pass
                             elif self.costume_pivot_adjustment_enabled and not has_costume_pivot_context:
                                 # Costume logic only runs when both sheet + sprite remaps were supplied.

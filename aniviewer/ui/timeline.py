@@ -528,6 +528,8 @@ class TimelineLaneSpec:
     label: str
     markers: List[float]
     deletable: bool = True
+    targetable: bool = True
+    show_header: bool = True
 
 
 @dataclass
@@ -536,6 +538,7 @@ class TimelineGroupSpec:
     label: str
     lanes: List[TimelineLaneSpec]
     addable: bool = True
+    show_header: bool = True
 
 
 class KeyframeLaneBar(KeyframeMarkerBar):
@@ -590,6 +593,7 @@ class TimelineLaneRow(QWidget):
         layout.setContentsMargins(6, 0, 6, 0)
         layout.setSpacing(2)
 
+        self.header_widget = QWidget()
         header = QHBoxLayout()
         header.setContentsMargins(0, 0, 0, 0)
         header.setSpacing(6)
@@ -607,6 +611,8 @@ class TimelineLaneRow(QWidget):
         self.activate_btn.setToolTip("Set this lane as the target for new keyframes")
         self.activate_btn.setCheckable(True)
         self.activate_btn.setAutoRaise(True)
+        self.activate_btn.setVisible(lane_spec.targetable)
+        self.activate_btn.setEnabled(lane_spec.targetable)
         header.addWidget(self.activate_btn)
 
         self.delete_btn = QToolButton()
@@ -617,7 +623,9 @@ class TimelineLaneRow(QWidget):
         self.delete_btn.setEnabled(lane_spec.deletable)
         header.addWidget(self.delete_btn)
 
-        layout.addLayout(header)
+        self.header_widget.setLayout(header)
+        self.header_widget.setVisible(lane_spec.show_header)
+        layout.addWidget(self.header_widget)
 
         self.bar = KeyframeLaneBar(lane_spec.key)
         self.bar.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
@@ -660,6 +668,7 @@ class TimelineGroupWidget(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
 
+        self.header_widget = QWidget()
         header = QHBoxLayout()
         header.setContentsMargins(6, 0, 6, 0)
         header.setSpacing(6)
@@ -687,10 +696,13 @@ class TimelineGroupWidget(QWidget):
         self.add_btn.setText("+")
         self.add_btn.setToolTip("Add keyframe lane")
         self.add_btn.setEnabled(group_spec.addable)
+        self.add_btn.setVisible(group_spec.addable)
         self.add_btn.clicked.connect(lambda: self.addRequested.emit(group_spec.key))
         header.addWidget(self.add_btn)
 
-        layout.addLayout(header)
+        self.header_widget.setLayout(header)
+        self.header_widget.setVisible(group_spec.show_header)
+        layout.addWidget(self.header_widget)
 
         self.lanes_container = QWidget()
         self.lanes_layout = QVBoxLayout(self.lanes_container)
@@ -764,40 +776,43 @@ class TimelineWidget(QWidget):
         self._compact_ui: bool = False
         self._marker_color_override: Optional[QColor] = None
         self._marker_selected_color_override: Optional[QColor] = None
+        self._simple_marker_mode: bool = False
         self.init_ui()
 
     def init_ui(self):
-        layout = QVBoxLayout(self)
+        self.main_layout = QVBoxLayout(self)
+        self.main_layout.setContentsMargins(0, 0, 0, 0)
 
-        controls = QHBoxLayout()
+        self.controls_layout = QHBoxLayout()
+        self.controls_layout.setContentsMargins(0, 0, 0, 0)
         self.play_btn = QPushButton("Play")
         self.play_btn.clicked.connect(self.play_toggled.emit)
-        controls.addWidget(self.play_btn)
+        self.controls_layout.addWidget(self.play_btn)
 
         self.loop_checkbox = QCheckBox("Loop")
         self.loop_checkbox.setChecked(True)
         self.loop_checkbox.stateChanged.connect(self.loop_toggled.emit)
-        controls.addWidget(self.loop_checkbox)
+        self.controls_layout.addWidget(self.loop_checkbox)
 
         self.time_label = QLabel("0.00 / 0.00s")
-        controls.addWidget(self.time_label)
+        self.controls_layout.addWidget(self.time_label)
         self.beat_info_label = QLabel("")
         self.beat_info_label.setStyleSheet("color: #00f5a0; font-weight: bold;")
         self.beat_info_label.setVisible(False)
-        controls.addWidget(self.beat_info_label)
+        self.controls_layout.addWidget(self.beat_info_label)
         self.lane_target_label = QLabel("Target Lane")
-        controls.addWidget(self.lane_target_label)
+        self.controls_layout.addWidget(self.lane_target_label)
         self.lane_target_combo = QComboBox()
         self.lane_target_combo.setMinimumWidth(220)
         self.lane_target_combo.currentIndexChanged.connect(self._on_lane_combo_changed)
-        controls.addWidget(self.lane_target_combo)
+        self.controls_layout.addWidget(self.lane_target_combo)
         self.collapse_btn = QToolButton()
         self.collapse_btn.setText("Collapse")
         self.collapse_btn.clicked.connect(self._toggle_tracks_collapsed)
-        controls.addWidget(self.collapse_btn)
-        controls.addStretch()
+        self.controls_layout.addWidget(self.collapse_btn)
+        self.controls_layout.addStretch()
 
-        layout.addLayout(controls)
+        self.main_layout.addLayout(self.controls_layout)
 
         self.tracks_scroll = QScrollArea()
         self.tracks_scroll.setWidgetResizable(True)
@@ -808,18 +823,18 @@ class TimelineWidget(QWidget):
         self.tracks_layout.setContentsMargins(0, 0, 0, 0)
         self.tracks_layout.setSpacing(6)
         self.tracks_scroll.setWidget(self.tracks_container)
-        layout.addWidget(self.tracks_scroll)
+        self.main_layout.addWidget(self.tracks_scroll)
 
         self.timeline_slider = QSlider(Qt.Orientation.Horizontal)
         self.timeline_slider.setMinimum(0)
         self.timeline_slider.setMaximum(1)
         self.timeline_slider.valueChanged.connect(self._on_slider_value_changed)
-        layout.addWidget(self.timeline_slider)
+        self.main_layout.addWidget(self.timeline_slider)
 
         self.timeline_scrollbar = QScrollBar(Qt.Orientation.Horizontal)
         self.timeline_scrollbar.setVisible(False)
         self.timeline_scrollbar.valueChanged.connect(self._on_scrollbar_value_changed)
-        layout.addWidget(self.timeline_scrollbar)
+        self.main_layout.addWidget(self.timeline_scrollbar)
 
     def set_compact_ui(self, enabled: bool):
         self._compact_ui = bool(enabled)
@@ -882,6 +897,12 @@ class TimelineWidget(QWidget):
         self._update_lane_view_window()
 
     def set_lane_groups(self, groups: List[TimelineGroupSpec]):
+        self._simple_marker_mode = (
+            len(groups or []) == 1
+            and bool(groups[0].lanes)
+            and not groups[0].show_header
+            and all(not lane.show_header for lane in groups[0].lanes)
+        )
         for idx in reversed(range(self.tracks_layout.count())):
             item = self.tracks_layout.takeAt(idx)
             widget = item.widget()
@@ -931,6 +952,9 @@ class TimelineWidget(QWidget):
                     self._marker_color_override,
                     self._marker_selected_color_override,
                 )
+                if self._simple_marker_mode:
+                    row.layout().setContentsMargins(0, 0, 0, 0)
+                    row.layout().setSpacing(0)
                 selection = self._lane_selections.get(lane_spec.key, [])
                 if selection:
                     row.bar.set_selected_markers(selection)
@@ -940,7 +964,29 @@ class TimelineWidget(QWidget):
                 group_widget.lanes_layout.addWidget(row)
 
         self.tracks_layout.addStretch()
+        self._apply_simple_marker_mode_layout()
         self._refresh_lane_target_combo(groups)
+
+    def _apply_simple_marker_mode_layout(self):
+        if self._simple_marker_mode:
+            self.main_layout.setSpacing(1)
+            self.controls_layout.setSpacing(4)
+            self.tracks_layout.setSpacing(0)
+            self.tracks_layout.setContentsMargins(0, 0, 0, 0)
+            self.tracks_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            self.tracks_scroll.setMinimumHeight(24)
+            self.tracks_scroll.setMaximumHeight(32)
+            self.collapse_btn.setVisible(False)
+        else:
+            self.main_layout.setSpacing(6)
+            self.controls_layout.setSpacing(6)
+            spacing = 4 if self._compact_ui else 6
+            self.tracks_layout.setSpacing(spacing)
+            self.tracks_layout.setContentsMargins(0, 0, 0, 0)
+            self.tracks_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+            self.tracks_scroll.setMinimumHeight(0)
+            self.tracks_scroll.setMaximumHeight(16777215)
+            self.collapse_btn.setVisible(True)
 
     def set_lane_thumbnail(self, lane_key: TimelineLaneKey, pixmap: Optional[QPixmap]):
         row = self._lane_rows.get(lane_key)
@@ -1119,11 +1165,15 @@ class TimelineWidget(QWidget):
         labels: List[str] = []
         for group in groups:
             for lane in group.lanes:
+                if not lane.targetable:
+                    continue
                 self._lane_combo_keys.append(lane.key)
                 labels.append(f"{group.label} - {lane.label}")
         self.lane_target_combo.blockSignals(True)
         self.lane_target_combo.clear()
         if labels:
+            self.lane_target_label.setVisible(True)
+            self.lane_target_combo.setVisible(True)
             self.lane_target_combo.addItems(labels)
             if self._active_lane in self._lane_combo_keys:
                 idx = self._lane_combo_keys.index(self._active_lane)
@@ -1132,6 +1182,8 @@ class TimelineWidget(QWidget):
             self.lane_target_combo.setCurrentIndex(idx)
             self.lane_target_combo.setEnabled(True)
         else:
+            self.lane_target_label.setVisible(False)
+            self.lane_target_combo.setVisible(False)
             self.lane_target_combo.setEnabled(False)
         self.lane_target_combo.blockSignals(False)
 

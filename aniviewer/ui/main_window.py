@@ -510,6 +510,9 @@ class MSMAnimationViewer(QMainWindow):
         self.preserve_children_on_record: bool = bool(
             self.settings.value('pose/preserve_children_on_record', True, type=bool)
         )
+        self.simple_keyframe_mode: bool = bool(
+            self.settings.value('pose/simple_keyframe_mode', False, type=bool)
+        )
         self._dof_anchor_override_active: bool = False
         self._last_non_dof_anchor_flips: Tuple[bool, bool] = (False, False)
         self.audio_library: Dict[str, List[str]] = {}
@@ -662,6 +665,7 @@ class MSMAnimationViewer(QMainWindow):
         self._layer_thumbnail_cache: Dict[object, Optional[QPixmap]] = {}
         self._atlas_image_cache: Dict[str, Optional[Image.Image]] = {}
         self._layer_sprite_preview_state: Dict[int, Tuple[Any, ...]] = {}
+        self._timeline_lane_preview_state: Dict[int, Tuple[Any, ...]] = {}
         self._selected_marker_refs: Set[Tuple["TimelineLaneKey", float]] = set()
         self._atlas_original_image_cache: Dict[str, Optional[Image.Image]] = {}
         self._atlas_modified_images: Dict[str, Image.Image] = {}
@@ -902,6 +906,7 @@ class MSMAnimationViewer(QMainWindow):
         self.control_panel.set_joint_solver_parented(self.joint_solver_parented)
         self.control_panel.set_propagate_user_transforms(self.propagate_user_transforms)
         self.control_panel.set_preserve_children_on_record(self.preserve_children_on_record)
+        self.control_panel.set_simple_keyframe_mode(self.simple_keyframe_mode)
         self.control_panel_host = QWidget()
         control_panel_host_layout = QVBoxLayout(self.control_panel_host)
         control_panel_host_layout.setContentsMargins(0, 0, 0, 0)
@@ -2239,6 +2244,9 @@ class MSMAnimationViewer(QMainWindow):
         self.control_panel.preserve_children_on_record_changed.connect(
             self.on_preserve_children_on_record_changed
         )
+        self.control_panel.simple_keyframe_mode_changed.connect(
+            self.on_simple_keyframe_mode_changed
+        )
         self.control_panel.joint_solver_capture_requested.connect(self.on_joint_solver_capture_requested)
         self.control_panel.joint_solver_bake_current_requested.connect(self.on_joint_solver_bake_current_requested)
         self.control_panel.joint_solver_bake_range_requested.connect(self.on_joint_solver_bake_range_requested)
@@ -2813,12 +2821,16 @@ class MSMAnimationViewer(QMainWindow):
             return False
 
         old_dof_path = self.dof_path
+        costume_asset_paths_changed = new_game_path != self.game_path or downloads_path_changed
         self.game_path = new_game_path
         self.downloads_path = new_downloads_path
         self.dof_path = new_dof_path
         self.shader_registry.set_game_path(self.game_path or None)
         if downloads_path_changed:
             self._invalidate_monster_name_rosetta_cache()
+        if costume_asset_paths_changed:
+            self.costume_cache.clear()
+            self.costume_atlas_cache.clear()
         self._downloads_xml_bin_roots = self._find_downloads_xml_bin_roots()
 
         if self.dof_path != old_dof_path:
@@ -2829,6 +2841,8 @@ class MSMAnimationViewer(QMainWindow):
         if refresh:
             self.build_audio_library()
             self.refresh_file_list()
+            if costume_asset_paths_changed:
+                self._refresh_costume_list_preserving_selection()
             if self.dof_path:
                 self.build_dof_audio_library()
             if self.dof_search_enabled and self.dof_path:
@@ -2910,6 +2924,8 @@ class MSMAnimationViewer(QMainWindow):
         self.settings.setValue('downloads_path', folder)
         self._update_active_path_profile(downloads_path=folder)
         self._invalidate_monster_name_rosetta_cache()
+        self.costume_cache.clear()
+        self.costume_atlas_cache.clear()
         self._downloads_xml_bin_roots = self._find_downloads_xml_bin_roots()
         self._update_path_label()
         self.log_widget.log(f"Downloads path set to: {folder}", "SUCCESS")
@@ -2917,6 +2933,7 @@ class MSMAnimationViewer(QMainWindow):
             self.log_widget.log("No xml_bin folders found under downloads path.", "WARNING")
         self.build_audio_library()
         self.refresh_file_list()
+        self._refresh_costume_list_preserving_selection()
 
     def _get_downloads_xml_bin_roots(self) -> List[str]:
         """Return cached downloads xml_bin roots, refreshing if needed."""
@@ -3184,8 +3201,7 @@ class MSMAnimationViewer(QMainWindow):
             return False
         return magic.startswith(b"UnityFS") or magic.startswith(b"UnityRaw") or magic.startswith(b"UnityWeb")
 
-    def _find_unity_bundle_data_files(self, root: str) -> List[str]:
-        data_files: List[str] = []
+    def _iter_unity_bundle_candidates(self, root: str):
         for dirpath, _, filenames in os.walk(root):
             candidates: List[str] = []
             if "__data" in filenames:
@@ -3195,8 +3211,19 @@ class MSMAnimationViewer(QMainWindow):
                     continue
                 candidates.append(os.path.join(dirpath, filename))
             for candidate in candidates:
-                if self._looks_like_unity_bundle(candidate):
-                    data_files.append(candidate)
+                yield candidate
+
+    def _find_first_unity_bundle_data_file(self, root: str) -> Optional[str]:
+        for candidate in self._iter_unity_bundle_candidates(root):
+            if self._looks_like_unity_bundle(candidate):
+                return candidate
+        return None
+
+    def _find_unity_bundle_data_files(self, root: str) -> List[str]:
+        data_files: List[str] = []
+        for candidate in self._iter_unity_bundle_candidates(root):
+            if self._looks_like_unity_bundle(candidate):
+                data_files.append(candidate)
         return data_files
 
     def _is_dof_bundle_root(self, root: str) -> bool:
@@ -3205,7 +3232,7 @@ class MSMAnimationViewer(QMainWindow):
         msmdata_dir = os.path.join(root, "msmdata")
         if os.path.isdir(msmdata_dir):
             return False
-        return bool(self._find_unity_bundle_data_files(root))
+        return self._find_first_unity_bundle_data_file(root) is not None
 
     def _get_dof_bundle_anim_names(self, root: str) -> List[str]:
         if self._dof_bundle_cache_path == root and self._dof_bundle_anim_cache:
@@ -3291,7 +3318,10 @@ class MSMAnimationViewer(QMainWindow):
             payload = json.loads(Path(cache_path).read_text(encoding="utf-8"))
         except Exception:
             return []
-        if payload.get("root") != root:
+        cached_root = payload.get("root")
+        if not cached_root:
+            return []
+        if os.path.normcase(os.path.normpath(str(cached_root))) != os.path.normcase(os.path.normpath(root)):
             return []
         names = payload.get("anim_names", [])
         if not isinstance(names, list):
@@ -4655,18 +4685,29 @@ class MSMAnimationViewer(QMainWindow):
         if self.legacy_animation_active:
             return []
         token = self._current_monster_token()
-        if not token or not self.game_path:
+        if not token:
             return []
 
         prefix_lower = f"costume_{token.lower()}_"
         entries: Dict[str, CostumeEntry] = {}
 
-        xml_bin_dir = os.path.join(self.game_path, "data", "xml_bin")
-        self._collect_costumes_in_dir(
-            xml_bin_dir, prefix_lower, entries,
-            priority=0,
-            allow_bins=True, allow_json=True
-        )
+        costume_roots: List[str] = []
+        seen_roots: Set[str] = set()
+        for root in self._all_xml_bin_roots():
+            if not root:
+                continue
+            norm = os.path.normcase(os.path.normpath(root))
+            if norm in seen_roots:
+                continue
+            seen_roots.add(norm)
+            costume_roots.append(root)
+
+        for priority, xml_bin_dir in enumerate(costume_roots):
+            self._collect_costumes_in_dir(
+                xml_bin_dir, prefix_lower, entries,
+                priority=priority,
+                allow_bins=True, allow_json=True
+            )
 
         extra_dirs: List[str] = []
         if self.current_json_path:
@@ -4675,11 +4716,12 @@ class MSMAnimationViewer(QMainWindow):
         if project_dir:
             extra_dirs.append(project_dir)
 
-        priority_counter = 1
+        priority_counter = len(costume_roots)
         for directory in extra_dirs:
             if not directory:
                 continue
-            if os.path.normcase(directory) == os.path.normcase(xml_bin_dir):
+            directory_norm = os.path.normcase(os.path.normpath(directory))
+            if directory_norm in seen_roots:
                 continue
             self._collect_costumes_in_dir(
                 directory, prefix_lower, entries,
@@ -4900,6 +4942,20 @@ class MSMAnimationViewer(QMainWindow):
                 force_reload = not bool(self.legacy_sheet_overrides)
                 self._apply_legacy_sheet_variant(preserved_entry, force_reload=force_reload)
 
+    def _refresh_costume_list_preserving_selection(self) -> None:
+        """Refresh costume choices after path changes without losing a valid selection."""
+        if not getattr(getattr(self, "gl_widget", None), "player", None):
+            return
+        animation = getattr(self.gl_widget.player, "animation", None)
+        if not animation or not self.current_json_path:
+            return
+        previous_key = self.active_costume_key
+        if not previous_key and hasattr(self, "control_panel"):
+            previous_key = self.control_panel.costume_combo.currentData()
+        self._refresh_costume_list()
+        if previous_key and previous_key in self.costume_entry_map:
+            self._restore_costume_selection(previous_key)
+
     def _get_current_costume_entry(self) -> Optional[CostumeEntry]:
         """Return the CostumeEntry for the currently selected dropdown item."""
         key = self.control_panel.costume_combo.currentData()
@@ -4989,6 +5045,9 @@ class MSMAnimationViewer(QMainWindow):
                     continue
                 if ext_lower not in ('.json', '.bin'):
                     continue
+                full_path = os.path.join(directory, name)
+                if self._is_costume_attachment_animation_resource(full_path):
+                    continue
                 key = lower_stem
                 entry = entries.get(key)
                 if not entry:
@@ -4997,7 +5056,6 @@ class MSMAnimationViewer(QMainWindow):
                         display_name=self._format_costume_display_name(stem)
                     )
                     entries[key] = entry
-                full_path = os.path.join(directory, name)
                 if ext_lower == '.bin':
                     if entry.bin_path is None or priority < entry.bin_priority:
                         entry.bin_path = full_path
@@ -5010,6 +5068,58 @@ class MSMAnimationViewer(QMainWindow):
             return
         except OSError as exc:
             self.log_widget.log(f"Failed to scan '{directory}' for costumes: {exc}", "WARNING")
+
+    def _is_costume_attachment_animation_resource(self, path: str) -> bool:
+        """
+        Return True for costume-prefixed files that are attachment animations.
+
+        Some downloadable costumes include small Rev6 animation BINs next to the
+        actual costume definition. Those files intentionally start with
+        ``costume_`` because the costume definition references them as AE-style
+        attachments, but they must not be exposed as selectable costume entries.
+        """
+        path_obj = Path(path)
+        suffix = path_obj.suffix.lower()
+        if suffix == ".json":
+            try:
+                with open(path_obj, "r", encoding="utf-8") as handle:
+                    data = json.load(handle)
+            except Exception:
+                return False
+            if not isinstance(data, dict):
+                return False
+            costume_keys = {
+                "apply_shader",
+                "remaps",
+                "clone_layers",
+                "set_blend_layers",
+                "layer_colors",
+                "layer_color_overrides",
+                "ae_anim_layers",
+                "sheet_remaps",
+                "swaps",
+            }
+            return bool(data.get("anims")) and bool(data.get("sources")) and not any(
+                key in data for key in costume_keys
+            )
+        if suffix != ".bin":
+            return False
+        try:
+            with open(path_obj, "rb") as handle:
+                parse_costume_file(handle.read())
+            return False
+        except Exception:
+            pass
+        module = self._load_rev6_animation_module()
+        if not module:
+            return False
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                bin_anim = module.BinAnim.from_file(str(path_obj))
+            data = bin_anim.to_dict()
+        except Exception:
+            return False
+        return bool(data.get("anims")) and bool(data.get("sources"))
 
     def _format_costume_display_name(self, stem: str) -> str:
         """Return a user-friendly label for a costume stem."""
@@ -5038,7 +5148,14 @@ class MSMAnimationViewer(QMainWindow):
             self.costume_cache[cache_key] = data
             return data
         except Exception as exc:
-            self.log_widget.log(f"Failed to load costume '{entry.display_name}': {exc}", "ERROR")
+            if self._is_costume_attachment_animation_resource(source):
+                self.log_widget.log(
+                    f"'{entry.display_name}' is a costume attachment animation, "
+                    "not a costume definition. Select the base costume entry instead.",
+                    "WARNING",
+                )
+            else:
+                self.log_widget.log(f"Failed to load costume '{entry.display_name}': {exc}", "ERROR")
             return None
 
     def _embedded_clone_defs(self) -> Optional[List[Dict[str, Any]]]:
@@ -5257,6 +5374,110 @@ class MSMAnimationViewer(QMainWindow):
             resource = (remap_info.get("resource") or "").strip().lower()
             layer.visible = resource != "empty"
 
+    def _reverse_replacement_clone_visibility(
+        self,
+        layers: List[LayerData],
+        clone_defs: List[Dict[str, Any]],
+        remap_map: Dict[str, Dict[str, Any]],
+        layer_remap_overrides: Dict[int, Dict[str, Any]],
+    ) -> None:
+        """
+        Reverse replacement-clone remaps so base layers remain visible.
+
+        Some costumes remap source layers to ``empty`` and remap the clone (e.g. ``Layer (1)``)
+        to the real costume sprite. For strict "main layer visible, duplicate hidden" behavior,
+        transfer the clone remap to the source layer and force the clone to empty/hidden.
+        """
+        if not layers or not clone_defs:
+            return
+
+        layer_lookup = {
+            (layer.name or "").strip().lower(): layer
+            for layer in layers
+            if layer.name
+        }
+
+        def _layer_remap_info(layer: Optional[LayerData], key_name: str) -> Optional[Dict[str, Any]]:
+            if not layer:
+                return remap_map.get(key_name)
+            return layer_remap_overrides.get(layer.layer_id) or remap_map.get(key_name)
+
+        def _resource_name(info: Optional[Dict[str, Any]]) -> str:
+            if not isinstance(info, dict):
+                return ""
+            return (info.get("resource") or "").strip().lower()
+
+        replacement_clone_counts_by_source: Dict[str, int] = {}
+        for clone in clone_defs:
+            new_name = (clone.get("new_layer") or clone.get("name") or "").strip()
+            source_name = (clone.get("source_layer") or clone.get("resource") or "").strip()
+            if not new_name or not source_name:
+                continue
+            new_key = new_name.lower()
+            source_key = source_name.lower()
+            if new_key == source_key:
+                continue
+            clone_info = _layer_remap_info(layer_lookup.get(new_key), new_key)
+            source_info = _layer_remap_info(layer_lookup.get(source_key), source_key)
+            clone_resource = _resource_name(clone_info)
+            source_resource = _resource_name(source_info)
+            if clone_resource and clone_resource != "empty" and source_resource == "empty":
+                replacement_clone_counts_by_source[source_key] = (
+                    replacement_clone_counts_by_source.get(source_key, 0) + 1
+                )
+
+        for clone in clone_defs:
+            new_name = (clone.get("new_layer") or clone.get("name") or "").strip()
+            source_name = (clone.get("source_layer") or clone.get("resource") or "").strip()
+            if not new_name or not source_name:
+                continue
+            new_key = new_name.lower()
+            source_key = source_name.lower()
+            if new_key == source_key:
+                continue
+
+            clone_layer = layer_lookup.get(new_key)
+            source_layer = layer_lookup.get(source_key)
+            if not clone_layer or not source_layer:
+                continue
+
+            clone_info = _layer_remap_info(clone_layer, new_key)
+            source_info = _layer_remap_info(source_layer, source_key)
+            clone_resource = _resource_name(clone_info)
+            source_resource = _resource_name(source_info)
+
+            if not clone_resource or clone_resource == "empty":
+                continue
+            if source_resource != "empty":
+                continue
+            if replacement_clone_counts_by_source.get(source_key, 0) > 1:
+                # Multiple real clones from one hidden source are deliberate costume
+                # stacks, not duplicate replacement layers to collapse.
+                continue
+
+            # Move the costume sprite assignment back onto the source layer.
+            layer_remap_overrides[source_layer.layer_id] = dict(clone_info)
+            # Suppress the duplicate clone layer.
+            clone_display_name = clone_info.get("display_name") if isinstance(clone_info, dict) else None
+            layer_remap_overrides[clone_layer.layer_id] = {
+                "display_name": clone_display_name or clone_layer.name,
+                "resource": "empty",
+                "frame_exact": {},
+                "frame_lower": {},
+                "sheet": "empty.xml",
+            }
+            clone_layer.visible = False
+            source_layer.visible = True
+            self.diagnostics.log_clone(
+                f"Reversed replacement clone '{new_name}' -> source '{source_name}'",
+                layer_id=clone_layer.layer_id,
+                severity="DEBUG",
+                extra={
+                    "source_layer_id": source_layer.layer_id,
+                    "clone_resource": clone_resource,
+                },
+            )
+
     def _clone_layers(self, layers: List[LayerData]) -> List[LayerData]:
         """Deep-copy layer structures so they can be safely mutated."""
         def _clone_lanes(lanes: List[KeyframeLane]) -> List[KeyframeLane]:
@@ -5375,6 +5596,37 @@ class MSMAnimationViewer(QMainWindow):
         layer_lookup = {layer.name.lower(): layer for layer in layers}
         next_id = max((layer.layer_id for layer in layers), default=-1)
 
+        def _resolve_insert_index(reference_index: int, mode: int) -> int:
+            """Translate clone mode into an insertion index in animation layer order."""
+            if mode > 0:
+                return max(0, reference_index)
+            return min(len(layers), reference_index + 1)
+
+        def _reposition_existing_clone(
+            existing_layer: LayerData,
+            reference_layer: LayerData,
+            mode: int
+        ) -> bool:
+            """Move an existing canonical clone to the requested relative ordering."""
+            order_reference = self._resolve_overlay_reference(reference_layer, layer_lookup)
+            anchor_layer = order_reference or reference_layer
+            try:
+                reference_index = layers.index(anchor_layer)
+                current_index = layers.index(existing_layer)
+            except ValueError:
+                return False
+
+            target_index = _resolve_insert_index(reference_index, mode)
+            if current_index == target_index:
+                return False
+
+            moved_layer = layers.pop(current_index)
+            if current_index < target_index:
+                target_index -= 1
+            target_index = max(0, min(len(layers), target_index))
+            layers.insert(target_index, moved_layer)
+            return True
+
         for entry in clone_defs:
             new_name = entry.get('new_layer') or entry.get('name')
             source_name = entry.get('source_layer') or entry.get('resource')
@@ -5436,10 +5688,28 @@ class MSMAnimationViewer(QMainWindow):
                     entry['resource'] = source_name
 
             if alias_exists and normalized_new in self.canonical_layer_names:
+                existing_clone = layer_lookup.get(normalized_new)
+                moved_existing = False
+                resolved_reference_name: Optional[str] = None
+                if existing_clone:
+                    reference_candidates = self._layer_name_variants(reference_name)
+                    reference_layer = self._find_layer_in_lookup(layer_lookup, reference_candidates)
+                    if reference_layer:
+                        resolved_reference_name = reference_layer.name
+                        moved_existing = _reposition_existing_clone(
+                            existing_clone,
+                            reference_layer,
+                            insert_mode or 1,
+                        )
                 self.diagnostics.log_clone(
-                    f"{label.title()} skipped '{new_name}' because canonical clone already exists",
-                    layer_id=layer_lookup[normalized_new].layer_id if normalized_new in layer_lookup else None,
-                    severity="DEBUG"
+                    f"{label.title()} reused canonical clone '{new_name}'",
+                    layer_id=existing_clone.layer_id if existing_clone else None,
+                    severity="DEBUG",
+                    extra={
+                        "reference": resolved_reference_name or reference_name,
+                        "mode": "above" if (insert_mode and insert_mode > 0) else "below",
+                        "repositioned": moved_existing,
+                    },
                 )
                 # Already seeded from canonical clones.
                 continue
@@ -5744,6 +6014,12 @@ class MSMAnimationViewer(QMainWindow):
             layer_remap_overrides,
             label="clone"
         )
+        self._reverse_replacement_clone_visibility(
+            layers,
+            costume_data.get('clone_layers', []),
+            remap_map,
+            layer_remap_overrides,
+        )
         self._apply_remaps_to_layers(layers, remap_map, layer_remap_overrides)
         self._update_canonical_clone_visibility(layers, remap_map, layer_remap_overrides)
         self._apply_shader_overrides(layers, costume_data.get('apply_shader', []))
@@ -5766,6 +6042,17 @@ class MSMAnimationViewer(QMainWindow):
         self._assign_attachment_targets(attachment_payloads, layers)
 
         costume_atlases = self._load_costume_atlases(sheet_names)
+        self._resolve_attachment_alignment_modes(
+            attachment_payloads,
+            remap_map,
+            costume_atlases,
+        )
+        self._tag_mixed_pivot_costume_frame_sequences(
+            layers,
+            remap_map,
+            layer_remap_overrides,
+            costume_atlases,
+        )
         base_atlases = self._apply_sheet_aliases_to_base_atlases(self.base_texture_atlases, sheet_alias)
         combined_atlases: List[TextureAtlas] = []
         for atlas in costume_atlases:
@@ -5890,6 +6177,105 @@ class MSMAnimationViewer(QMainWindow):
             if matched:
                 overrides[layer.layer_id] = matched
         return overrides, pivot_context
+
+    def _tag_mixed_pivot_costume_frame_sequences(
+        self,
+        layers: List[LayerData],
+        remap_map: Dict[str, Dict[str, Any]],
+        layer_remap_overrides: Dict[int, Dict[str, Any]],
+        costume_atlases: List[TextureAtlas],
+    ) -> None:
+        """
+        Mark and stabilize frame-swapped costume layers where only some target
+        frames have non-centered atlas pivots.
+
+        Those mixed sequences should stay internally consistent. Without this
+        tag, the renderer's generic non-default-pivot fallback applies only to
+        the outlier frames, which creates visible popping during sprite swaps
+        such as Den Rare's eyelid animation. The per-sprite anchor map keeps
+        the sequence on one costume-canvas anchor instead of dropping all offset
+        or applying a different offset per frame. If the remap's primary
+        resource sprite is one of the frame targets, prefer that anchor because
+        the game creates the remapped Gfx from the primary resource before
+        adding frame-index redirects.
+        """
+        if not layers or not costume_atlases:
+            return
+
+        def _lookup_sprite(
+            sprite_name: str,
+            sheet_name: str,
+        ) -> Tuple[Optional[SpriteInfo], Optional[TextureAtlas]]:
+            if not sprite_name:
+                return None, None
+            sheet_keys = set(self._canonical_sheet_keys(sheet_name))
+            for atlas in costume_atlases:
+                if sheet_keys:
+                    atlas_keys = set(
+                        self._canonical_sheet_keys(
+                            getattr(atlas, "source_name", None) or atlas.image_path
+                        )
+                    )
+                    if not sheet_keys.intersection(atlas_keys):
+                        continue
+                sprite = atlas.get_sprite(sprite_name)
+                if sprite:
+                    return sprite, atlas
+            return None, None
+
+        for layer in layers:
+            remap_info = layer_remap_overrides.get(layer.layer_id) or remap_map.get(layer.name.lower())
+            if not remap_info:
+                continue
+            frame_targets = [
+                target
+                for target in (remap_info.get("frame_exact") or {}).values()
+                if isinstance(target, str) and target
+            ]
+            if len(set(frame_targets)) < 2:
+                continue
+            sheet_name = remap_info.get("sheet") or ""
+            pivot_kinds: Set[bool] = set()
+            anchor_counts: Dict[Tuple[float, float], int] = {}
+            sprite_anchors: Dict[str, Tuple[float, float]] = {}
+            sprite_pivot_kinds: Dict[str, bool] = {}
+            for sprite_name in dict.fromkeys(frame_targets):
+                sprite, atlas = _lookup_sprite(sprite_name, sheet_name)
+                if not sprite:
+                    continue
+                non_default = (
+                    abs(float(sprite.pivot_x) - 0.5) > 0.001
+                    or abs(float(sprite.pivot_y) - 0.5) > 0.001
+                )
+                pivot_kinds.add(non_default)
+                sprite_pivot_kinds[sprite_name] = non_default
+                hires_scale = 0.5 if atlas and atlas.is_hires else 1.0
+                sprite_w = sprite.original_w if sprite.original_w > 0 else sprite.w
+                sprite_h = sprite.original_h if sprite.original_h > 0 else sprite.h
+                anchor = (
+                    round(float(sprite_w) * hires_scale * float(sprite.pivot_x), 6),
+                    round(float(sprite_h) * hires_scale * float(sprite.pivot_y), 6),
+                )
+                sprite_anchors[sprite_name] = anchor
+                anchor_counts[anchor] = anchor_counts.get(anchor, 0) + 1
+            if len(pivot_kinds) <= 1 or not anchor_counts:
+                continue
+            dominant_anchor = max(
+                anchor_counts.items(),
+                key=lambda item: (item[1], item[0][0], item[0][1]),
+            )[0]
+            resource_name = (remap_info.get("resource") or "").strip()
+            if (
+                resource_name in sprite_anchors
+                and not sprite_pivot_kinds.get(resource_name, False)
+            ):
+                continue
+            sequence_anchor = sprite_anchors.get(resource_name, dominant_anchor)
+            layer.render_tags.add("costume_mixed_pivot_sequence")
+            if not isinstance(layer.sprite_anchor_map, dict):
+                layer.sprite_anchor_map = {}
+            for sprite_name in sprite_anchors:
+                layer.sprite_anchor_map.setdefault(sprite_name, sequence_anchor)
 
     def _resolve_source_entry_atlas(
         self,
@@ -7997,9 +8383,112 @@ class MSMAnimationViewer(QMainWindow):
                     "tempo_multiplier": tempo_multiplier,
                     "loop": loop_flag,
                     "root_layer": root_layer_name,
+                    "alignment_mode": "rendered_anchor",
                 }
             )
         return payloads
+
+    def _resolve_attachment_alignment_modes(
+        self,
+        payloads: List[Dict[str, Any]],
+        remap_map: Dict[str, Dict[str, Any]],
+        costume_atlases: List[TextureAtlas],
+    ) -> None:
+        """Choose canvas alignment only for same-canvas costume AE overlays."""
+        if not payloads or not remap_map or not costume_atlases:
+            return
+
+        def _lookup_sprite(
+            sprite_name: str,
+            atlases: List[TextureAtlas],
+            sheet_name: str = "",
+        ) -> Tuple[Optional[SpriteInfo], Optional[TextureAtlas]]:
+            if not sprite_name:
+                return None, None
+            sheet_keys = set(self._canonical_sheet_keys(sheet_name))
+            for atlas in atlases or []:
+                if sheet_keys:
+                    atlas_keys = set(
+                        self._canonical_sheet_keys(
+                            getattr(atlas, "source_name", None) or atlas.image_path
+                        )
+                    )
+                    if not sheet_keys.intersection(atlas_keys):
+                        continue
+                sprite = atlas.get_sprite(sprite_name)
+                if sprite:
+                    return sprite, atlas
+            return None, None
+
+        def _first_root_sprite(animation: Optional[AnimationData]) -> str:
+            if not animation or not animation.layers:
+                return ""
+            root_layers = [
+                layer for layer in animation.layers
+                if getattr(layer, "parent_id", -1) < 0
+            ]
+            if not root_layers:
+                root_layers = list(animation.layers)
+            for layer in root_layers:
+                for keyframe in layer.keyframes or []:
+                    sprite_name = (keyframe.sprite_name or "").strip()
+                    if sprite_name:
+                        return sprite_name
+            return ""
+
+        def _same_source_canvas(left: SpriteInfo, right: SpriteInfo) -> bool:
+            left_w = float(left.original_w or left.w or 0.0)
+            left_h = float(left.original_h or left.h or 0.0)
+            right_w = float(right.original_w or right.w or 0.0)
+            right_h = float(right.original_h or right.h or 0.0)
+            return (
+                left_w > 0.0
+                and left_h > 0.0
+                and abs(left_w - right_w) <= 1e-3
+                and abs(left_h - right_h) <= 1e-3
+            )
+
+        for payload in payloads:
+            payload["alignment_mode"] = "rendered_anchor"
+            if payload.get("root_layer"):
+                continue
+            target_name = (payload.get("target_layer") or "").strip().lower()
+            if not target_name:
+                continue
+            remap_info = remap_map.get(target_name)
+            if not remap_info:
+                continue
+            target_resource = (remap_info.get("resource") or "").strip()
+            if not target_resource or target_resource.lower() == "empty":
+                continue
+            target_sprite, target_atlas = _lookup_sprite(
+                target_resource,
+                costume_atlases,
+                remap_info.get("sheet") or "",
+            )
+            if not target_sprite or not target_atlas:
+                continue
+            root_sprite_name = _first_root_sprite(payload.get("animation"))
+            root_sprite, root_atlas = _lookup_sprite(
+                root_sprite_name,
+                list(payload.get("atlases") or []),
+            )
+            if not root_sprite or not root_atlas:
+                continue
+            target_keys = set(
+                self._canonical_sheet_keys(
+                    getattr(target_atlas, "source_name", None) or target_atlas.image_path
+                )
+            )
+            root_keys = set(
+                self._canonical_sheet_keys(
+                    getattr(root_atlas, "source_name", None) or root_atlas.image_path
+                )
+            )
+            if target_keys and root_keys and not target_keys.intersection(root_keys):
+                continue
+            if _same_source_canvas(target_sprite, root_sprite):
+                payload["alignment_mode"] = "costume_canvas"
 
     def _determine_attachment_root(
         self,
@@ -10288,6 +10777,9 @@ class MSMAnimationViewer(QMainWindow):
             self._configure_costume_shaders(None, None)
 
             self.gl_widget.player.load_animation(animation)
+            sync_timer = getattr(self.gl_widget, "sync_playback_timer", None)
+            if callable(sync_timer):
+                sync_timer()
             self._log_renderability_snapshot(animation, stage="pre_gl")
             self._dump_mask_debug_layer_layout(animation)
             self.gl_widget.invalidate_animation_cache()
@@ -13390,6 +13882,7 @@ class MSMAnimationViewer(QMainWindow):
         self._layer_thumbnail_cache.clear()
         self._atlas_image_cache.clear()
         self._layer_sprite_preview_state.clear()
+        self._timeline_lane_preview_state.clear()
         if hasattr(self, "layer_panel") and self.layer_panel:
             self.layer_panel.clear_layer_thumbnails()
         if hasattr(self, "control_panel") and self.control_panel:
@@ -15164,6 +15657,62 @@ class MSMAnimationViewer(QMainWindow):
             if hasattr(self, "control_panel") and self.control_panel:
                 self.control_panel.clear_export_layer_thumbnails()
             self._layer_sprite_preview_state.clear()
+            self._timeline_lane_preview_state.clear()
+            return
+        current_time = self.gl_widget.player.current_time
+        timeline_updates: Dict[int, Tuple[Tuple[Any, ...], Optional[QPixmap]]] = {}
+        for layer in animation.layers:
+            if layer.layer_id is None:
+                continue
+            sprite_name = ""
+            tint = (255, 255, 255, 255)
+            try:
+                state = self.gl_widget.player.get_layer_state(layer, current_time)
+                sprite_name = state.get("sprite_name") or ""
+                tint = (
+                    int(state.get("r", 255)),
+                    int(state.get("g", 255)),
+                    int(state.get("b", 255)),
+                    int(state.get("a", 255)),
+                )
+            except Exception:
+                sprite_name = ""
+            source_signature = self._layer_thumbnail_source_signature(layer.layer_id)
+            preview_key = (sprite_name, *tint, source_signature)
+            previous = self._layer_sprite_preview_state.get(layer.layer_id)
+            timeline_previous = self._timeline_lane_preview_state.get(layer.layer_id)
+            if previous == preview_key and timeline_previous == preview_key:
+                continue
+            pixmap = self._get_layer_thumbnail_pixmap(
+                sprite_name,
+                tint=tint,
+                layer_id=layer.layer_id,
+            )
+            if previous != preview_key:
+                self.layer_panel.set_layer_thumbnail(layer.layer_id, pixmap)
+                if hasattr(self, "control_panel") and self.control_panel:
+                    self.control_panel.set_export_layer_thumbnail(layer.layer_id, pixmap)
+                self._layer_sprite_preview_state[layer.layer_id] = preview_key
+            if timeline_previous != preview_key:
+                timeline_updates[layer.layer_id] = (preview_key, pixmap)
+        self._refresh_timeline_lane_thumbnails(timeline_updates)
+
+    def _refresh_timeline_lane_thumbnails(
+        self,
+        thumbnail_updates: Optional[Dict[int, Tuple[Tuple[Any, ...], Optional[QPixmap]]]] = None,
+    ) -> None:
+        if not hasattr(self, "timeline"):
+            return
+        animation = getattr(self.gl_widget.player, "animation", None)
+        if not animation:
+            return
+        if thumbnail_updates is not None:
+            for layer_id, (preview_key, pixmap) in thumbnail_updates.items():
+                self.timeline.set_group_thumbnail(("layer", layer_id), pixmap)
+                self._timeline_lane_preview_state[layer_id] = preview_key
+            global_lanes = getattr(animation, "global_keyframe_lanes", []) or []
+            if global_lanes:
+                self.timeline.set_group_thumbnail(("global", -1), None)
             return
         current_time = self.gl_widget.player.current_time
         for layer in animation.layers:
@@ -15184,49 +15733,15 @@ class MSMAnimationViewer(QMainWindow):
                 sprite_name = ""
             source_signature = self._layer_thumbnail_source_signature(layer.layer_id)
             preview_key = (sprite_name, *tint, source_signature)
-            previous = self._layer_sprite_preview_state.get(layer.layer_id)
-            if previous == preview_key:
+            if self._timeline_lane_preview_state.get(layer.layer_id) == preview_key:
                 continue
-            pixmap = self._get_layer_thumbnail_pixmap(
-                sprite_name,
-                tint=tint,
-                layer_id=layer.layer_id,
-            )
-            self.layer_panel.set_layer_thumbnail(layer.layer_id, pixmap)
-            if hasattr(self, "control_panel") and self.control_panel:
-                self.control_panel.set_export_layer_thumbnail(layer.layer_id, pixmap)
-            self._layer_sprite_preview_state[layer.layer_id] = preview_key
-        self._refresh_timeline_lane_thumbnails()
-
-    def _refresh_timeline_lane_thumbnails(self) -> None:
-        if not hasattr(self, "timeline"):
-            return
-        animation = getattr(self.gl_widget.player, "animation", None)
-        if not animation:
-            return
-        current_time = self.gl_widget.player.current_time
-        for layer in animation.layers:
-            if layer.layer_id is None:
-                continue
-            sprite_name = ""
-            tint = (255, 255, 255, 255)
-            try:
-                state = self.gl_widget.player.get_layer_state(layer, current_time)
-                sprite_name = state.get("sprite_name") or ""
-                tint = (
-                    int(state.get("r", 255)),
-                    int(state.get("g", 255)),
-                    int(state.get("b", 255)),
-                    int(state.get("a", 255)),
-                )
-            except Exception:
-                sprite_name = ""
             pixmap = self._get_layer_thumbnail_pixmap(
                 sprite_name,
                 tint=tint,
                 layer_id=layer.layer_id,
             )
             self.timeline.set_group_thumbnail(("layer", layer.layer_id), pixmap)
+            self._timeline_lane_preview_state[layer.layer_id] = preview_key
         global_lanes = getattr(animation, "global_keyframe_lanes", []) or []
         if global_lanes:
             self.timeline.set_group_thumbnail(("global", -1), None)
@@ -15595,7 +16110,14 @@ class MSMAnimationViewer(QMainWindow):
             key=lambda item: (item[0].scope, item[0].layer_id, item[0].lane_index, item[1]),
         )
         implicit_time = False
-        if selected_refs:
+        if selected_refs and self.simple_keyframe_mode:
+            target_times = self._simple_marker_times_from_refs(selected_refs)
+            base_matches = self._gather_keyframes_for_times(target_layers, target_times)
+            lane_matches = [
+                (TimelineLaneKey("layer", layer.layer_id, 0), layer, frame)
+                for layer, frame in base_matches
+            ]
+        elif selected_refs:
             lane_matches = self._gather_keyframes_for_marker_refs(selected_refs)
         else:
             implicit_time = True
@@ -15817,6 +16339,9 @@ class MSMAnimationViewer(QMainWindow):
         duration = float(max(0.0, self.gl_widget.player.duration))
         if not math.isfinite(duration):
             duration = 0.0
+        if self.simple_keyframe_mode:
+            self._refresh_simple_timeline_keyframes(animation, duration)
+            return
 
         def _sanitize_marker_time(raw_time: Any) -> Optional[float]:
             try:
@@ -15912,6 +16437,81 @@ class MSMAnimationViewer(QMainWindow):
                 if group.lanes:
                     self.timeline.set_active_lane(group.lanes[0].key)
                     break
+
+    def _simple_timeline_lane_key(self) -> TimelineLaneKey:
+        return TimelineLaneKey("simple", -1, 0)
+
+    def _simple_timeline_target_ids(self, animation: Optional[AnimationData] = None) -> Set[int]:
+        if self.selected_layer_ids:
+            return set(self.selected_layer_ids)
+        if animation is None:
+            animation = getattr(self.gl_widget.player, "animation", None)
+        if not animation:
+            return set()
+        return {
+            layer.layer_id
+            for layer in animation.layers
+            if layer.layer_id is not None
+        }
+
+    def _simple_marker_times_from_refs(
+        self,
+        marker_refs: Optional[List[Tuple[TimelineLaneKey, float]]] = None,
+    ) -> List[float]:
+        refs = marker_refs if marker_refs is not None else list(self._selected_marker_refs)
+        tolerance = self._marker_time_tolerance()
+        times: List[float] = []
+        for _lane_key, raw_time in refs or []:
+            try:
+                value = max(0.0, float(raw_time))
+            except (TypeError, ValueError):
+                continue
+            if any(abs(value - existing) <= tolerance for existing in times):
+                continue
+            times.append(value)
+        times.sort()
+        return times
+
+    def _refresh_simple_timeline_keyframes(self, animation: AnimationData, duration: float) -> None:
+        """Show b0.6-style aggregate base-keyframe markers for selected/all layers."""
+        target_ids = self._simple_timeline_target_ids(animation)
+        markers: Set[float] = set()
+        for layer in animation.layers:
+            if layer.layer_id not in target_ids:
+                continue
+            for keyframe in layer.keyframes or []:
+                try:
+                    value = max(0.0, float(keyframe.time))
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(value):
+                    markers.add(min(value, duration) if duration > 0.0 else value)
+
+        lane_key = self._simple_timeline_lane_key()
+        label = "Selected Keyframes" if self.selected_layer_ids else "All Keyframes"
+        groups = [
+            TimelineGroupSpec(
+                ("simple", -1),
+                "Simple Keyframe Mode",
+                [
+                    TimelineLaneSpec(
+                        lane_key,
+                        label,
+                        sorted(markers),
+                        deletable=False,
+                        targetable=False,
+                        show_header=False,
+                    )
+                ],
+                addable=False,
+                show_header=False,
+            )
+        ]
+        self.timeline.set_timeline_duration(duration)
+        self.timeline.set_lane_groups(groups)
+        self.timeline.set_active_lane(lane_key)
+        available_markers = [(lane_key, time_value) for time_value in sorted(markers)]
+        self._sync_marker_selection(available_markers)
 
     def _normalize_beat_sequence(self, beats: List[float], duration: float) -> List[float]:
         cleaned: List[float] = []
@@ -16136,6 +16736,9 @@ class MSMAnimationViewer(QMainWindow):
         new_state = bool(playing)
         previous = bool(player.playing)
         player.playing = new_state
+        sync_timer = getattr(self.gl_widget, "sync_playback_timer", None)
+        if callable(sync_timer):
+            sync_timer()
         if sync_audio:
             self._sync_audio_playback(new_state)
         if previous != new_state:
@@ -16207,6 +16810,9 @@ class MSMAnimationViewer(QMainWindow):
         animation = self.gl_widget.player.animation
         if not animation:
             return
+        if self.simple_keyframe_mode:
+            self._remove_simple_keyframe_markers(marker_refs)
+            return
         sanitized = sorted(
             {
                 (lane_key, max(0.0, float(time_value)))
@@ -16261,6 +16867,46 @@ class MSMAnimationViewer(QMainWindow):
         else:
             self.log_widget.log("No keyframes found at the selected time to remove.", "INFO")
 
+    def _remove_simple_keyframe_markers(
+        self,
+        marker_refs: List[Tuple[TimelineLaneKey, float]],
+    ) -> None:
+        """Remove base keyframes by aggregate marker time, matching b0.6 timeline behavior."""
+        animation = self.gl_widget.player.animation
+        if not animation:
+            return
+        sanitized = self._simple_marker_times_from_refs(marker_refs)
+        if not sanitized:
+            return
+        target_ids = self._simple_timeline_target_ids(animation)
+        if not target_ids:
+            return
+        self._begin_keyframe_action(sorted(target_ids))
+        removed = 0
+        tolerance = self._marker_time_tolerance()
+        for layer in animation.layers:
+            if layer.layer_id not in target_ids:
+                continue
+            original_count = len(layer.keyframes)
+            kept_frames = [
+                frame for frame in layer.keyframes
+                if all(abs(frame.time - value) > tolerance for value in sanitized)
+            ]
+            if len(kept_frames) != original_count:
+                layer.keyframes = kept_frames
+                removed += original_count - len(kept_frames)
+                self._sync_layer_source_frames(layer)
+        self._finalize_keyframe_action("delete_keyframe")
+        if removed:
+            self.gl_widget.player.calculate_duration()
+            self.update_timeline()
+            self.gl_widget.update()
+            self.log_widget.log(f"Removed {removed} keyframe(s).", "SUCCESS")
+            lane_key = self._simple_timeline_lane_key()
+            self._remove_marker_selection_refs([(lane_key, time_value) for time_value in sanitized])
+        else:
+            self.log_widget.log("No keyframes found at the selected time to remove.", "INFO")
+
     def on_keyframe_marker_dragged(self, marker_refs: List[Tuple[TimelineLaneKey, float]], delta: float):
         """Move selected keyframes to a new timestamp by dragging markers."""
         animation = self.gl_widget.player.animation
@@ -16269,6 +16915,9 @@ class MSMAnimationViewer(QMainWindow):
         if not marker_refs:
             return
         if abs(delta) < 1e-6:
+            return
+        if self.simple_keyframe_mode:
+            self._drag_simple_keyframe_markers(marker_refs, delta)
             return
 
         tolerance = self._marker_time_tolerance()
@@ -16325,6 +16974,58 @@ class MSMAnimationViewer(QMainWindow):
             )
         else:
             self.log_widget.log("No keyframes moved for the selected lanes.", "INFO")
+
+    def _drag_simple_keyframe_markers(
+        self,
+        marker_refs: List[Tuple[TimelineLaneKey, float]],
+        delta: float,
+    ) -> None:
+        """Move base keyframes by aggregate marker time, matching b0.6 timeline behavior."""
+        animation = self.gl_widget.player.animation
+        if not animation:
+            return
+        original_times = self._simple_marker_times_from_refs(marker_refs)
+        if not original_times:
+            return
+        target_ids = self._simple_timeline_target_ids(animation)
+        if not target_ids:
+            return
+        self._begin_keyframe_action(sorted(target_ids))
+        tolerance = self._marker_time_tolerance()
+        duration = max(0.0, self.gl_widget.player.duration)
+        pairs: List[Tuple[float, float]] = []
+        for value in original_times:
+            old_time = max(0.0, float(value))
+            proposed = old_time + float(delta)
+            new_time = min(max(proposed, 0.0), duration)
+            pairs.append((old_time, new_time))
+        moved = 0
+        for layer in animation.layers:
+            if layer.layer_id not in target_ids:
+                continue
+            updated = False
+            for frame in layer.keyframes:
+                for old_time, target_time in pairs:
+                    if abs(frame.time - old_time) <= tolerance:
+                        frame.time = target_time
+                        updated = True
+            if updated:
+                layer.keyframes.sort(key=lambda frame: frame.time)
+                self._sync_layer_source_frames(layer)
+                moved += 1
+        self._finalize_keyframe_action("move_keyframe")
+        if moved:
+            self.gl_widget.player.calculate_duration()
+            self.update_timeline()
+            self.gl_widget.update()
+            lane_key = self._simple_timeline_lane_key()
+            self._replace_marker_selection([(lane_key, new_time) for _old_time, new_time in pairs])
+            self.log_widget.log(
+                f"Moved {len(pairs)} keyframe time(s) by {delta:.3f}s",
+                "SUCCESS",
+            )
+        else:
+            self.log_widget.log("No keyframes moved for the selected layers.", "INFO")
 
     def on_keyframe_selection_changed(self, selected_markers: List[Tuple[TimelineLaneKey, float]]):
         """Store the current marker selection from the timeline widget."""
@@ -16490,6 +17191,9 @@ class MSMAnimationViewer(QMainWindow):
         if not animation:
             self.log_widget.log("Load an animation before copying keyframes.", "WARNING")
             return
+        if self.simple_keyframe_mode:
+            self._copy_simple_selected_keyframes(animation)
+            return
         selected_markers = sorted(
             self._selected_marker_refs,
             key=lambda item: (item[0].scope, item[0].layer_id, item[0].lane_index, item[1]),
@@ -16544,6 +17248,54 @@ class MSMAnimationViewer(QMainWindow):
         }
         self.log_widget.log(
             f"Copied {total_frames} keyframe(s) from {len(clipboard_entries)} lane(s).",
+            "SUCCESS",
+        )
+
+    def _copy_simple_selected_keyframes(self, animation: AnimationData) -> None:
+        """Copy base keyframes by aggregate selected marker time, matching b0.6 behavior."""
+        selected_times = self._simple_marker_times_from_refs()
+        if not selected_times:
+            self.log_widget.log("Select keyframes in the timeline before copying.", "INFO")
+            return
+        tolerance = self._marker_time_tolerance()
+        target_ids = self._simple_timeline_target_ids(animation)
+        if not target_ids:
+            self.log_widget.log("No layers available to copy keyframes from.", "WARNING")
+            return
+        base_time = selected_times[0]
+        clipboard_layers: List[Dict[str, Any]] = []
+        total_frames = 0
+        for layer in animation.layers:
+            if layer.layer_id not in target_ids:
+                continue
+            matches: List[Dict[str, Any]] = []
+            for frame in layer.keyframes:
+                if any(abs(frame.time - marker) <= tolerance for marker in selected_times):
+                    matches.append(
+                        {
+                            "time_offset": float(frame.time - base_time),
+                            "data": replace(frame),
+                        }
+                    )
+            if matches:
+                clipboard_layers.append(
+                    {
+                        "layer_name": layer.name,
+                        "layer_id": layer.layer_id,
+                        "source_key": self._clipboard_layer_source_key(layer.layer_id),
+                        "keyframes": matches,
+                    }
+                )
+                total_frames += len(matches)
+        if not clipboard_layers:
+            self.log_widget.log("No keyframes matched the current selection to copy.", "INFO")
+            return
+        self._keyframe_clipboard = {
+            "layers": clipboard_layers,
+            "copied_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        self.log_widget.log(
+            f"Copied {total_frames} keyframe(s) from {len(clipboard_layers)} layer(s).",
             "SUCCESS",
         )
 
@@ -16708,7 +17460,15 @@ class MSMAnimationViewer(QMainWindow):
         self.gl_widget.update()
         self._refresh_timeline_keyframes()
         if new_marker_refs:
-            self._replace_marker_selection(new_marker_refs)
+            if self.simple_keyframe_mode:
+                lane_key = self._simple_timeline_lane_key()
+                simple_refs = [
+                    (lane_key, time_value)
+                    for time_value in sorted({float(time) for _lane_key, time in new_marker_refs})
+                ]
+                self._replace_marker_selection(simple_refs)
+            else:
+                self._replace_marker_selection(new_marker_refs)
         self.log_widget.log(
             f"Pasted {inserted} keyframe(s) into {len(candidate_layers)} lane group(s).",
             "SUCCESS",
@@ -17144,6 +17904,9 @@ class MSMAnimationViewer(QMainWindow):
         layer_ids = set(self.selected_layer_ids)
         if not layer_ids:
             return
+        if self.simple_keyframe_mode:
+            self._record_simple_pose_clicked(layer_ids)
+            return
         active_lane = self.timeline.get_active_lane() if hasattr(self, "timeline") else None
         use_global_lane = bool(active_lane and active_lane.scope == "global")
         lane_index = active_lane.lane_index if active_lane and active_lane.scope == "layer" else 0
@@ -17236,6 +17999,41 @@ class MSMAnimationViewer(QMainWindow):
         self._finalize_keyframe_action("record_pose")
         self.log_widget.log(
             f"Recorded pose for {applied} layer(s) ({scope}).",
+            "SUCCESS"
+        )
+
+    def _record_simple_pose_clicked(self, layer_ids: Set[int]) -> None:
+        """Record selected layers using the b0.6 direct base-keyframe behavior."""
+        base_states_map, final_states_map = self._gather_pose_state_maps(layer_ids)
+        time_value = round(self.gl_widget.player.current_time, 5)
+        influence = self.pose_influence_mode or "current"
+        applied = 0
+        self._begin_keyframe_action(list(layer_ids))
+        for layer_id in layer_ids:
+            if self._record_simple_pose_for_layer(
+                layer_id,
+                time_value,
+                influence,
+                base_states_map,
+                final_states_map,
+                force=True,
+            ):
+                applied += 1
+
+        if not applied:
+            self.log_widget.log("No gizmo offsets detected; nothing to record.", "INFO")
+            self._finalize_keyframe_action("record_pose")
+            return
+
+        self._clear_user_offsets_for_layers(self.selected_layer_ids)
+        self.update_offset_display()
+        self.gl_widget.player.calculate_duration()
+        self.update_timeline()
+        self.gl_widget.update()
+        scope = "propagated" if influence == "forward" else "local"
+        self._finalize_keyframe_action("record_pose")
+        self.log_widget.log(
+            f"Recorded pose for {applied} layer(s) ({scope}, simple keyframe mode).",
             "SUCCESS"
         )
 
@@ -17548,6 +18346,145 @@ class MSMAnimationViewer(QMainWindow):
 
         if is_base_lane:
             self._sync_layer_source_frames(layer)
+        return True
+
+    def _record_simple_pose_for_layer(
+        self,
+        layer_id: int,
+        time_value: float,
+        influence: str,
+        base_states: Dict[int, Dict[str, Any]],
+        final_states: Dict[int, Dict[str, Any]],
+        tolerance: float = 1e-4,
+        force: bool = False,
+    ) -> bool:
+        """Capture gizmo offsets using the b0.6 direct base-keyframe path."""
+        layer = self.gl_widget.get_layer_by_id(layer_id)
+        if not layer:
+            return False
+        anchor_override = self.gl_widget.layer_anchor_overrides.get(layer_id)
+        anchor_captured = False
+        local_state = self.gl_widget.player.get_layer_state(
+            layer,
+            time_value,
+            include_additive=False,
+            include_global=False,
+        )
+        base_state = base_states.get(layer_id, {})
+        final_state = final_states.get(layer_id, {})
+        if not base_state or not final_state:
+            base_state = {}
+            final_state = {}
+        base_pos_x = float(local_state.get("pos_x", 0.0))
+        base_pos_y = float(local_state.get("pos_y", 0.0))
+        base_rot = float(local_state.get("rotation", 0.0))
+        base_scale_x = float(local_state.get("scale_x", 100.0))
+        base_scale_y = float(local_state.get("scale_y", 100.0))
+
+        offset_x, offset_y = self.gl_widget.layer_offsets.get(layer_id, (0.0, 0.0))
+        rot_offset = self.gl_widget.layer_rotations.get(layer_id, 0.0)
+        scale_offset_x, scale_offset_y = self.gl_widget.layer_scale_offsets.get(layer_id, (1.0, 1.0))
+
+        base_anchor_x = float(base_state.get("anchor_world_x", base_state.get("tx", 0.0)))
+        base_anchor_y = float(base_state.get("anchor_world_y", base_state.get("ty", 0.0)))
+        final_anchor_x = float(final_state.get("anchor_world_x", base_anchor_x))
+        final_anchor_y = float(final_state.get("anchor_world_y", base_anchor_y))
+        world_delta_x = (final_anchor_x - base_anchor_x) + offset_x
+        world_delta_y = (final_anchor_y - base_anchor_y) + offset_y
+        has_translation = abs(world_delta_x) > tolerance or abs(world_delta_y) > tolerance
+        has_rotation = abs(rot_offset) > tolerance
+        has_scale = (
+            abs(scale_offset_x - 1.0) > tolerance
+            or abs(scale_offset_y - 1.0) > tolerance
+        )
+
+        if anchor_override is not None:
+            anchor_captured = self._update_layer_anchor(layer, anchor_override)
+
+        changes_requested = has_translation or has_rotation or has_scale or anchor_captured
+        if not changes_requested and not force:
+            return False
+
+        local_delta_x = 0.0
+        local_delta_y = 0.0
+        if changes_requested:
+            local_delta_x, local_delta_y = self._world_delta_to_local(
+                layer,
+                base_states,
+                world_delta_x,
+                world_delta_y,
+            )
+        target_pos_x = base_pos_x + local_delta_x
+        target_pos_y = base_pos_y + local_delta_y
+        target_rot = base_rot + (rot_offset if has_rotation else 0.0)
+        target_scale_x = base_scale_x * (scale_offset_x if has_scale else 1.0)
+        target_scale_y = base_scale_y * (scale_offset_y if has_scale else 1.0)
+
+        eval_state = self.gl_widget.player.get_layer_state(
+            layer,
+            self.gl_widget.player.current_time,
+            include_additive=False,
+            include_global=False,
+        )
+        keyframe = self._find_keyframe_at_time(layer, time_value)
+        created = False
+        if not keyframe:
+            keyframe = KeyframeData(time=time_value)
+            layer.keyframes.append(keyframe)
+            created = True
+            keyframe.pos_x = base_pos_x
+            keyframe.pos_y = base_pos_y
+            keyframe.scale_x = base_scale_x
+            keyframe.scale_y = base_scale_y
+            keyframe.rotation = base_rot
+            keyframe.opacity = float(eval_state.get("opacity", keyframe.opacity))
+            snapshot_sprite = eval_state.get("sprite_name")
+            if snapshot_sprite:
+                keyframe.sprite_name = snapshot_sprite
+            keyframe.immediate_sprite = -1
+            keyframe.r = int(eval_state.get("r", keyframe.r))
+            keyframe.g = int(eval_state.get("g", keyframe.g))
+            keyframe.b = int(eval_state.get("b", keyframe.b))
+
+        keyframe.time = time_value
+        if has_translation:
+            keyframe.pos_x = target_pos_x
+            keyframe.pos_y = target_pos_y
+            if created:
+                keyframe.immediate_pos = 0
+        if has_rotation:
+            keyframe.rotation = target_rot
+            if created:
+                keyframe.immediate_rotation = 0
+        if has_scale:
+            keyframe.scale_x = target_scale_x
+            keyframe.scale_y = target_scale_y
+            if created:
+                keyframe.immediate_scale = 0
+
+        if created:
+            layer.keyframes.sort(key=lambda frame: frame.time)
+
+        if influence == "forward" and changes_requested:
+            delta_x = local_delta_x if has_translation else 0.0
+            delta_y = local_delta_y if has_translation else 0.0
+            delta_rot = target_rot - base_rot if has_rotation else 0.0
+            factor_x = scale_offset_x if has_scale else 1.0
+            factor_y = scale_offset_y if has_scale else 1.0
+            forward_tol = 1.0 / 600.0
+            for frame in layer.keyframes:
+                if frame.time <= time_value + forward_tol:
+                    continue
+                if has_translation:
+                    frame.pos_x += delta_x
+                    frame.pos_y += delta_y
+                if has_rotation:
+                    frame.rotation += delta_rot
+                if has_scale:
+                    frame.scale_x *= factor_x
+                    frame.scale_y *= factor_y
+
+        self._sync_layer_source_frames(layer)
         return True
 
     def _record_pose_for_global_lane(
@@ -19805,6 +20742,12 @@ class MSMAnimationViewer(QMainWindow):
     def on_preserve_children_on_record_changed(self, enabled: bool) -> None:
         self.preserve_children_on_record = bool(enabled)
         self.settings.setValue('pose/preserve_children_on_record', self.preserve_children_on_record)
+
+    def on_simple_keyframe_mode_changed(self, enabled: bool) -> None:
+        self.simple_keyframe_mode = bool(enabled)
+        self.settings.setValue('pose/simple_keyframe_mode', self.simple_keyframe_mode)
+        self._selected_marker_refs = set()
+        self._refresh_timeline_keyframes()
 
     def on_joint_solver_capture_requested(self) -> None:
         self.gl_widget.capture_joint_rest_lengths()
@@ -25293,15 +26236,32 @@ All game assets and content are owned by Big Blue Bubble Inc.
             collection.append(value)
 
     def _locate_costume_texture(self, base_name: Optional[str]) -> Optional[str]:
-        if not base_name or not self.game_path:
+        if not base_name:
             return None
-        costume_dir = Path(self.game_path) / "data" / "gfx" / "costumes"
-        if not costume_dir.exists():
-            return None
+        costume_dirs: List[Path] = []
+        seen_dirs: Set[str] = set()
+
+        def add_dir(path: Path) -> None:
+            try:
+                norm = os.path.normcase(os.path.normpath(str(path)))
+            except TypeError:
+                return
+            if norm in seen_dirs or not path.is_dir():
+                return
+            seen_dirs.add(norm)
+            costume_dirs.append(path)
+
+        for data_root in self._candidate_data_roots():
+            root = Path(data_root)
+            add_dir(root / "gfx" / "costumes")
+            if root.name.lower() != "data":
+                add_dir(root / "data" / "gfx" / "costumes")
+
         for ext in (".avif", ".png", ".dds", ".jpg", ".jpeg", ".tga", ".bmp"):
-            candidate = costume_dir / f"{base_name}{ext}"
-            if candidate.exists():
-                return str(candidate)
+            for costume_dir in costume_dirs:
+                candidate = costume_dir / f"{base_name}{ext}"
+                if candidate.exists():
+                    return str(candidate)
         return None
 
     def _resolve_shader_texture_path(
@@ -25312,9 +26272,6 @@ All game assets and content are owned by Big Blue Bubble Inc.
         sheet_lookup: Dict[str, List[str]],
         fallback_sheets: List[str],
     ) -> Optional[str]:
-        if not self.game_path:
-            return None
-
         candidates: List[str] = []
         candidates.extend(self._match_sheet_candidates_for_node(node_name, sheet_lookup))
         candidates.extend(fallback_sheets)
@@ -25353,6 +26310,15 @@ All game assets and content are owned by Big Blue Bubble Inc.
         parts = entry_key.split("_")[1:]
         if len(parts) < 2:
             return None
-        index = parts[-1]
-        token = "_".join(parts[:-1]).upper()
+        index_pos: Optional[int] = None
+        for idx in range(len(parts) - 1, 0, -1):
+            if parts[idx].isdigit():
+                index_pos = idx
+                break
+        if index_pos is None:
+            index_pos = len(parts) - 1
+        index = parts[index_pos]
+        token = "_".join(parts[:index_pos]).upper()
+        if not token or not index:
+            return None
         return f"monster_{token}_costume_{index}"

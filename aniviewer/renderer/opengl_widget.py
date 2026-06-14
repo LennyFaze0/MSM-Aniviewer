@@ -363,6 +363,7 @@ class AttachmentInstance:
     loop: bool = True
     root_layer_name: Optional[str] = None
     allow_base_fallback: bool = False
+    alignment_mode: str = "rendered_anchor"
     visible: bool = True
 
 
@@ -793,6 +794,7 @@ class OpenGLAnimationWidget(QOpenGLWidget):
         # Timing
         self.last_update_time: Optional[float] = None
         self._motion_blur_frame_dt: float = 1.0 / 60.0
+        self._animation_timer_interval_ms: int = 16
         
         # Set OpenGL format
         fmt = QSurfaceFormat()
@@ -812,7 +814,7 @@ class OpenGLAnimationWidget(QOpenGLWidget):
         # Timer for animation updates
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.update_animation)
-        self.timer.start(16)  # ~60 FPS
+        self._sync_animation_timer()
         self._svg_background_quality_timer = QTimer(self)
         self._svg_background_quality_timer.setSingleShot(True)
         self._svg_background_quality_timer.setInterval(300)
@@ -826,6 +828,25 @@ class OpenGLAnimationWidget(QOpenGLWidget):
         
         # Enable keyboard focus
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def _sync_animation_timer(self) -> None:
+        """Run the high-frequency timer only while animation playback is active."""
+        should_run = bool(
+            getattr(self.player, "playing", False)
+            and getattr(self.player, "animation", None)
+        )
+        if should_run:
+            if not self.timer.isActive():
+                self.last_update_time = None
+                self.timer.start(self._animation_timer_interval_ms)
+            return
+        if self.timer.isActive():
+            self.timer.stop()
+        self.last_update_time = None
+
+    def sync_playback_timer(self) -> None:
+        """Public hook for callers that mutate AnimationPlayer.playing directly."""
+        self._sync_animation_timer()
     
     @property
     def position_scale(self) -> float:
@@ -5367,6 +5388,41 @@ class OpenGLAnimationWidget(QOpenGLWidget):
                     ay += m10 * dx + m11 * dy
         return (ax, ay)
 
+    def _get_sprite_canvas_origin_from_state(
+        self,
+        state: Dict[str, float],
+    ) -> Tuple[float, float]:
+        """Return the world-space origin of the sprite's untrimmed source canvas."""
+        ax = state.get('tx', 0.0)
+        ay = state.get('ty', 0.0)
+        anchor_offset = state.get('sprite_anchor_offset')
+        if anchor_offset:
+            scale = self.renderer.base_world_scale * self.renderer.position_scale
+            dx = anchor_offset[0] * scale
+            dy = anchor_offset[1] * scale
+            m00 = state.get('m00', 1.0)
+            m01 = state.get('m01', 0.0)
+            m10 = state.get('m10', 0.0)
+            m11 = state.get('m11', 1.0)
+            ax += m00 * dx + m01 * dy
+            ay += m10 * dx + m11 * dy
+        return (ax, ay)
+
+    def _get_attachment_alignment_point(
+        self,
+        state: Dict[str, float],
+        atlases: Optional[List[TextureAtlas]],
+        alignment_mode: str,
+    ) -> Tuple[float, float]:
+        """Return the point used to align an attached animation to its target."""
+        if alignment_mode == "costume_canvas":
+            return self._get_sprite_canvas_origin_from_state(state)
+        return self._get_rendered_anchor_from_state(
+            state,
+            atlases=atlases,
+            include_sprite_offset=True,
+        )
+
     def _get_attachment_root_anchor(
         self,
         instance: AttachmentInstance,
@@ -5556,20 +5612,21 @@ class OpenGLAnimationWidget(QOpenGLWidget):
             override_atlases = self.layer_atlas_overrides.get(instance.target_layer_id)
             if override_atlases:
                 parent_atlases = list(override_atlases) + self.texture_atlases
+        alignment_mode = getattr(instance, "alignment_mode", "rendered_anchor") or "rendered_anchor"
         auto_offset: Optional[Tuple[float, float]] = None
         root_layer_id = root_debug.get("root_layer_id") if isinstance(root_debug, dict) else None
         if root_layer_id is not None:
             root_state = combined_states.get(root_layer_id)
             if root_state:
-                combined_root_anchor = self._get_rendered_anchor_from_state(
+                combined_root_anchor = self._get_attachment_alignment_point(
                     root_state,
-                    atlases=atlas_chain,
-                    include_sprite_offset=True,
+                    atlas_chain,
+                    alignment_mode,
                 )
-                parent_anchor = self._get_rendered_anchor_from_state(
+                parent_anchor = self._get_attachment_alignment_point(
                     parent_state,
-                    atlases=parent_atlases,
-                    include_sprite_offset=True,
+                    parent_atlases,
+                    alignment_mode,
                 )
                 dx = parent_anchor[0] - combined_root_anchor[0]
                 dy = parent_anchor[1] - combined_root_anchor[1]
@@ -5598,6 +5655,7 @@ class OpenGLAnimationWidget(QOpenGLWidget):
             auto_offset,
             atlas_chain=atlas_chain,
             parent_atlases=parent_atlases,
+            alignment_mode=alignment_mode,
         )
         bounds = self._compute_attachment_bounds(animation, combined_states, atlas_chain)
         if bounds:
@@ -5625,6 +5683,7 @@ class OpenGLAnimationWidget(QOpenGLWidget):
         auto_offset: Optional[Tuple[float, float]] = None,
         atlas_chain: Optional[List[TextureAtlas]] = None,
         parent_atlases: Optional[List[TextureAtlas]] = None,
+        alignment_mode: str = "rendered_anchor",
     ) -> None:
         """Capture a detailed debug snapshot for attachment alignment troubleshooting."""
         if not self.attachment_debug_overlay_enabled:
@@ -5694,6 +5753,7 @@ class OpenGLAnimationWidget(QOpenGLWidget):
             "offset": offset,
             "auto_offset": auto_offset,
             "effective_offset": effective_offset,
+            "alignment_mode": alignment_mode,
             "time": float(self.player.current_time),
             "attachment_time": float(instance.player.current_time),
             "duration": float(instance.player.duration or 0.0),
@@ -7313,6 +7373,10 @@ class OpenGLAnimationWidget(QOpenGLWidget):
     
     def update_animation(self):
         """Update animation state with proper delta time"""
+        if not self.player.playing or not self.player.animation:
+            self._sync_animation_timer()
+            return
+
         current_time = time.time()
 
         if self.last_update_time is not None:
@@ -7327,15 +7391,15 @@ class OpenGLAnimationWidget(QOpenGLWidget):
         was_playing = self.player.playing
         previous_time = self.player.current_time
 
-        if self.player.playing:
-            self.player.update(delta_time)
-            if self.player.animation:
-                self.animation_time_changed.emit(self.player.current_time, self.player.duration)
-                if self.player.loop and self.player.current_time + 1e-5 < previous_time:
-                    self.animation_looped.emit()
-            self.update()
+        self.player.update(delta_time)
+        if self.player.animation:
+            self.animation_time_changed.emit(self.player.current_time, self.player.duration)
+            if self.player.loop and self.player.current_time + 1e-5 < previous_time:
+                self.animation_looped.emit()
+        self.update()
 
         if was_playing != self.player.playing:
+            self._sync_animation_timer()
             self.playback_state_changed.emit(self.player.playing)
             if self.player.animation:
                 self.animation_time_changed.emit(self.player.current_time, self.player.duration)
@@ -8622,6 +8686,7 @@ class OpenGLAnimationWidget(QOpenGLWidget):
                     loop=loop_flag,
                     root_layer_name=payload.get("root_layer"),
                     allow_base_fallback=bool(payload.get("allow_base_fallback")),
+                    alignment_mode=payload.get("alignment_mode", "rendered_anchor") or "rendered_anchor",
                     visible=True,
                 )
             )
