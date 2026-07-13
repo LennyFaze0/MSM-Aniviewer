@@ -4,6 +4,8 @@ Provides playback controls and timeline scrubbing with keyframe markers.
 """
 
 import math
+import sys
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 
@@ -14,7 +16,6 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QSlider,
     QLabel,
-    QCheckBox,
     QScrollBar,
     QScrollArea,
     QToolButton,
@@ -22,11 +23,736 @@ from PyQt6.QtWidgets import (
     QApplication,
     QComboBox,
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QPointF, QRectF
-from PyQt6.QtGui import QPainter, QColor, QPen, QPainterPath, QPixmap
+from PyQt6.QtCore import Qt, pyqtSignal, QPoint, QPointF, QRectF, QSize, QMimeData
+from PyQt6.QtGui import QPainter, QColor, QPen, QPainterPath, QPixmap, QImage, QDrag
+
+from utils.ui_scaling import clamp_ui_scale, scale_float, scale_int
 
 _QINT32_MIN = -2147483648
 _QINT32_MAX = 2147483647
+PLAY_BUTTON_DRAG_MIME = "application/x-aniviewer-play-button"
+
+
+class TexturedTimelineSlider(QSlider):
+    """Timeline slider with a textured scrub handle."""
+
+    _ASSET_NAMES = {
+        "default": "Timeline Slider Icon Unselected.png",
+        "selected": "Timeline Slider Icon Selected.png",
+        "left": "Timeline Slider Icon Selected Left.png",
+        "right": "Timeline Slider Icon Selected Right.png",
+    }
+
+    def __init__(self, orientation: Qt.Orientation, parent=None):
+        super().__init__(orientation, parent)
+        self._ui_scale_factor = 1.0
+        self._compact_ui = False
+        self._pressed = False
+        self._drag_direction = 0
+        self._last_drag_x: Optional[float] = None
+        self._tint_color: Optional[QColor] = None
+        self._pixmaps: Dict[str, QPixmap] = {}
+        self._scaled_pixmaps: Dict[Tuple[str, int, int, str], QPixmap] = {}
+        self.setMouseTracking(True)
+        self._load_knob_pixmaps()
+        self._apply_metrics()
+
+    def _asset_roots(self) -> List[Path]:
+        roots: List[Path] = []
+        if getattr(sys, "frozen", False):
+            bundle_root = Path(getattr(sys, "_MEIPASS", Path.cwd()))
+            roots.append(bundle_root / "aniviewer" / "assets")
+            roots.append(bundle_root / "assets")
+        roots.append(Path(__file__).resolve().parent.parent / "assets")
+        roots.append(Path.cwd() / "assets")
+        return roots
+
+    def _load_knob_pixmaps(self) -> None:
+        for state, filename in self._ASSET_NAMES.items():
+            for root in self._asset_roots():
+                candidate = root / filename
+                if candidate.exists():
+                    pixmap = QPixmap(str(candidate))
+                    if not pixmap.isNull():
+                        self._pixmaps[state] = pixmap
+                    break
+
+    def set_ui_scale_factor(self, factor: float) -> None:
+        self._ui_scale_factor = clamp_ui_scale(factor)
+        self._apply_metrics()
+
+    def set_compact_ui(self, enabled: bool) -> None:
+        self._compact_ui = bool(enabled)
+        self._apply_metrics()
+
+    def set_tint_color(self, color: Optional[QColor]) -> None:
+        tint = QColor(color) if color is not None else None
+        if tint is not None and not tint.isValid():
+            tint = None
+        old_name = self._tint_color.name(QColor.NameFormat.HexRgb) if self._tint_color else ""
+        new_name = tint.name(QColor.NameFormat.HexRgb) if tint else ""
+        if old_name == new_name:
+            return
+        self._tint_color = tint
+        self._scaled_pixmaps.clear()
+        self.update()
+
+    def _knob_size(self) -> int:
+        base_size = 38 if self._compact_ui else 48
+        return scale_int(base_size, self._ui_scale_factor, minimum=32)
+
+    def _groove_height(self) -> int:
+        base_height = 5 if self._compact_ui else 7
+        return scale_int(base_height, self._ui_scale_factor, minimum=4)
+
+    def _apply_metrics(self) -> None:
+        size = self._knob_size()
+        self.setMinimumHeight(size + scale_int(6, self._ui_scale_factor, minimum=2))
+        self.setStyleSheet(
+            "QSlider::handle:horizontal {"
+            f"width: {size}px;"
+            f"height: {size}px;"
+            "background: transparent;"
+            "border: 0px;"
+            "}"
+        )
+        self._scaled_pixmaps.clear()
+        self.updateGeometry()
+        self.update()
+
+    def _current_state(self) -> str:
+        if not self._pressed:
+            return "default"
+        if self._drag_direction < 0:
+            return "left"
+        if self._drag_direction > 0:
+            return "right"
+        return "selected"
+
+    def _tint_key(self) -> str:
+        if self._tint_color is None:
+            return ""
+        return self._tint_color.name(QColor.NameFormat.HexRgb).upper()
+
+    @staticmethod
+    def _tint_grayscale_pixmap(pixmap: QPixmap, tint_color: QColor) -> QPixmap:
+        if pixmap.isNull() or not tint_color.isValid():
+            return pixmap
+        image = pixmap.toImage().convertToFormat(QImage.Format.Format_ARGB32)
+        hue = tint_color.hslHue()
+        saturation = tint_color.hslSaturation()
+        if hue < 0:
+            hue = 0
+        if saturation < 0:
+            saturation = 0
+        base_lightness = tint_color.lightnessF()
+        for y in range(image.height()):
+            for x in range(image.width()):
+                source = image.pixelColor(x, y)
+                alpha = source.alpha()
+                if alpha <= 0:
+                    continue
+                luminance = (
+                    0.2126 * source.redF()
+                    + 0.7152 * source.greenF()
+                    + 0.0722 * source.blueF()
+                )
+                if luminance <= 0.5:
+                    lightness = base_lightness * (luminance / 0.5)
+                else:
+                    lightness = base_lightness + (1.0 - base_lightness) * ((luminance - 0.5) / 0.5)
+                lightness_int = int(round(max(0.0, min(1.0, lightness)) * 255.0))
+                image.setPixelColor(
+                    x,
+                    y,
+                    QColor.fromHsl(hue, saturation, lightness_int, alpha),
+                )
+        return QPixmap.fromImage(image)
+
+    def _scaled_pixmap(self, state: str, size: int) -> Optional[QPixmap]:
+        pixmap = self._pixmaps.get(state) or self._pixmaps.get("default")
+        if pixmap is None or pixmap.isNull():
+            return None
+        dpr = max(1.0, float(self.devicePixelRatioF()))
+        physical_size = max(1, int(round(size * dpr)))
+        dpr_key = max(1, int(round(dpr * 100.0)))
+        tint_key = self._tint_key()
+        key = (state, int(size), dpr_key, tint_key)
+        cached = self._scaled_pixmaps.get(key)
+        if cached is not None and not cached.isNull():
+            return cached
+        scaled = pixmap.scaled(
+            QSize(physical_size, physical_size),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        if self._tint_color is not None:
+            scaled = self._tint_grayscale_pixmap(scaled, self._tint_color)
+        scaled.setDevicePixelRatio(dpr)
+        self._scaled_pixmaps[key] = scaled
+        return scaled
+
+    def _handle_rect(self) -> QRectF:
+        return self._handle_rect_for_position(self.sliderPosition())
+
+    def _handle_rect_for_position(self, position: int) -> QRectF:
+        size = self._knob_size()
+        left, right = self._handle_travel_range()
+        value_range = self.maximum() - self.minimum()
+        if value_range <= 0 or right <= left:
+            center_x = float(self.width()) / 2.0
+        else:
+            ratio = (int(position) - self.minimum()) / float(value_range)
+            ratio = min(1.0, max(0.0, ratio))
+            if self.invertedAppearance():
+                ratio = 1.0 - ratio
+            center_x = left + (right - left) * ratio
+        center_y = float(self.height()) / 2.0
+        return QRectF(
+            center_x - size / 2.0,
+            center_y - size / 2.0,
+            float(size),
+            float(size),
+        )
+
+    def _handle_travel_range(self) -> Tuple[float, float]:
+        half_size = self._knob_size() / 2.0
+        width = float(self.width())
+        if width <= half_size * 2.0:
+            center = width / 2.0
+            return (center, center)
+        return (half_size, width - half_size)
+
+    def _set_value_from_x(self, x: float) -> None:
+        left, right = self._handle_travel_range()
+        value_range = self.maximum() - self.minimum()
+        if value_range <= 0 or right <= left:
+            self.setValue(self.minimum())
+            return
+        ratio = (float(x) - left) / (right - left)
+        ratio = min(1.0, max(0.0, ratio))
+        if self.invertedAppearance():
+            ratio = 1.0 - ratio
+        value = int(round(self.minimum() + value_range * ratio))
+        self.setSliderPosition(value)
+        self.setValue(value)
+
+    def paintEvent(self, event):
+        _ = event
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        size = self._knob_size()
+        handle_rect = self._handle_rect()
+        groove_height = self._groove_height()
+        groove_left, groove_right = self._handle_travel_range()
+        if groove_right <= groove_left:
+            groove_left = size / 2.0
+            groove_right = max(groove_left, float(self.width()) - size / 2.0)
+        groove_top = float(self.height()) / 2.0 - groove_height / 2.0
+        groove_rect = QRectF(
+            groove_left,
+            groove_top,
+            max(1.0, groove_right - groove_left),
+            float(groove_height),
+        )
+        palette = self.palette()
+        track_color = palette.color(palette.ColorRole.Mid)
+        border_color = palette.color(palette.ColorRole.Dark)
+        fill_color = palette.color(palette.ColorRole.Highlight)
+
+        painter.setPen(QPen(border_color, 1))
+        painter.setBrush(track_color)
+        painter.drawRect(groove_rect)
+
+        fill_right = min(max(handle_rect.center().x(), groove_rect.left()), groove_rect.right())
+        fill_rect = QRectF(
+            groove_rect.left(),
+            groove_rect.top(),
+            max(0.0, fill_right - groove_rect.left()),
+            groove_rect.height(),
+        )
+        if fill_rect.width() > 0.0:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(fill_color)
+            painter.drawRect(fill_rect)
+
+        pixmap = self._scaled_pixmap(self._current_state(), size)
+        if pixmap is None:
+            return
+        logical_size = pixmap.deviceIndependentSize()
+        width = float(logical_size.width())
+        height = float(logical_size.height())
+        x = float(handle_rect.center().x() - width / 2.0)
+        y = float(handle_rect.center().y() - height / 2.0)
+        painter.drawPixmap(
+            QRectF(x, y, width, height),
+            pixmap,
+            QRectF(pixmap.rect()),
+        )
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._pressed = True
+            self._drag_direction = 0
+            self._last_drag_x = event.position().x()
+            self.setSliderDown(True)
+            self._set_value_from_x(event.position().x())
+            self.update()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._pressed:
+            x = event.position().x()
+            if self._last_drag_x is not None:
+                delta = x - self._last_drag_x
+                threshold = max(0.5, self._ui_scale_factor)
+                if abs(delta) >= threshold:
+                    self._drag_direction = 1 if delta > 0.0 else -1
+            self._last_drag_x = x
+            self._set_value_from_x(x)
+            self.update()
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            if self._pressed:
+                self._set_value_from_x(event.position().x())
+            self.setSliderDown(False)
+            self._pressed = False
+            self._drag_direction = 0
+            self._last_drag_x = None
+            self.update()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def leaveEvent(self, event):
+        if not self._pressed:
+            self._drag_direction = 0
+            self.update()
+        super().leaveEvent(event)
+
+
+class TexturedPlaybackButton(QPushButton):
+    """Playback button that uses authored play/pause textures."""
+
+    _ASSET_NAMES = {
+        "play": "Play Icon.png",
+        "pause": "Pause Icon.png",
+    }
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._ui_scale_factor = 1.0
+        self._compact_ui = False
+        self._playing = False
+        self._drag_start_pos: Optional[QPoint] = None
+        self._drag_active = False
+        self._pixmaps: Dict[str, QPixmap] = {}
+        self._scaled_pixmaps: Dict[Tuple[str, int, int], QPixmap] = {}
+        self._load_pixmaps()
+        self.setText("")
+        self.setToolTip("Play")
+        self.setAccessibleName("Play")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._apply_metrics()
+
+    def _asset_roots(self) -> List[Path]:
+        roots: List[Path] = []
+        if getattr(sys, "frozen", False):
+            bundle_root = Path(getattr(sys, "_MEIPASS", Path.cwd()))
+            roots.append(bundle_root / "aniviewer" / "assets")
+            roots.append(bundle_root / "assets")
+        roots.append(Path(__file__).resolve().parent.parent / "assets")
+        roots.append(Path.cwd() / "assets")
+        return roots
+
+    def _load_pixmaps(self) -> None:
+        for state, filename in self._ASSET_NAMES.items():
+            for root in self._asset_roots():
+                candidate = root / filename
+                if candidate.exists():
+                    pixmap = QPixmap(str(candidate))
+                    if not pixmap.isNull():
+                        self._pixmaps[state] = pixmap
+                    break
+
+    def set_ui_scale_factor(self, factor: float) -> None:
+        self._ui_scale_factor = clamp_ui_scale(factor)
+        self._apply_metrics()
+
+    def set_compact_ui(self, enabled: bool) -> None:
+        self._compact_ui = bool(enabled)
+        self._apply_metrics()
+
+    def set_playing(self, playing: bool) -> None:
+        self._playing = bool(playing)
+        label = "Pause" if self._playing else "Play"
+        self.setToolTip(label)
+        self.setAccessibleName(label)
+        self.update()
+
+    def _button_size(self) -> int:
+        base_size = 32 if self._compact_ui else 38
+        return scale_int(base_size, self._ui_scale_factor, minimum=26)
+
+    def _apply_metrics(self) -> None:
+        size = self._button_size()
+        self.setFixedSize(size, size)
+        self.setStyleSheet("QPushButton { border: 0px; background: transparent; padding: 0px; }")
+        self._scaled_pixmaps.clear()
+        self.updateGeometry()
+        self.update()
+
+    def _current_state(self) -> str:
+        return "pause" if self._playing else "play"
+
+    def _scaled_pixmap(self, state: str, size: int) -> Optional[QPixmap]:
+        pixmap = self._pixmaps.get(state)
+        if pixmap is None or pixmap.isNull():
+            return None
+        dpr = max(1.0, float(self.devicePixelRatioF()))
+        physical_size = max(1, int(round(size * dpr)))
+        dpr_key = max(1, int(round(dpr * 100.0)))
+        key = (state, int(size), dpr_key)
+        cached = self._scaled_pixmaps.get(key)
+        if cached is not None and not cached.isNull():
+            return cached
+        scaled = pixmap.scaled(
+            QSize(physical_size, physical_size),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        scaled.setDevicePixelRatio(dpr)
+        self._scaled_pixmaps[key] = scaled
+        return scaled
+
+    def paintEvent(self, event):
+        pixmap = self._scaled_pixmap(self._current_state(), self._button_size())
+        if pixmap is None:
+            return super().paintEvent(event)
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        logical_size = pixmap.deviceIndependentSize()
+        width = float(logical_size.width())
+        height = float(logical_size.height())
+        scale = 0.96 if self.isDown() else 1.0
+        draw_width = width * scale
+        draw_height = height * scale
+        x = (float(self.width()) - draw_width) / 2.0
+        y = (float(self.height()) - draw_height) / 2.0
+        painter.drawPixmap(
+            QRectF(x, y, draw_width, draw_height),
+            pixmap,
+            QRectF(pixmap.rect()),
+        )
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_start_pos = event.position().toPoint()
+            self._drag_active = False
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if (
+            self._drag_start_pos is not None
+            and event.buttons() & Qt.MouseButton.LeftButton
+            and (event.position().toPoint() - self._drag_start_pos).manhattanLength()
+            >= QApplication.startDragDistance()
+        ):
+            self._drag_active = True
+            self.setDown(False)
+            drag = QDrag(self)
+            mime = QMimeData()
+            mime.setData(PLAY_BUTTON_DRAG_MIME, b"move")
+            drag.setMimeData(mime)
+            pixmap = QPixmap(self.size())
+            pixmap.fill(Qt.GlobalColor.transparent)
+            self.render(pixmap)
+            drag.setPixmap(pixmap)
+            drag.setHotSpot(event.position().toPoint())
+            drag.exec(Qt.DropAction.MoveAction)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._drag_active:
+            self._drag_start_pos = None
+            self._drag_active = False
+            self.setDown(False)
+            event.accept()
+            return
+        self._drag_start_pos = None
+        super().mouseReleaseEvent(event)
+
+
+class TexturedLoopButton(QPushButton):
+    """Checkable loop button that uses the authored loop texture."""
+
+    _ASSET_NAMES = {
+        "selected": "Loop Icon Selected.png",
+        "unselected": "Loop Icon Unselected.png",
+    }
+    _FALLBACK_ASSET_NAME = "Loop Icon.png"
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._ui_scale_factor = 1.0
+        self._compact_ui = False
+        self._pixmaps: Dict[str, QPixmap] = {}
+        self._scaled_pixmaps: Dict[Tuple[str, int, int, int], QPixmap] = {}
+        self._load_pixmaps()
+        self.setText("" if self._pixmaps else "Loop")
+        self.setToolTip("Loop")
+        self.setAccessibleName("Loop")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setCheckable(True)
+        self._apply_metrics()
+
+    def _asset_roots(self) -> List[Path]:
+        roots: List[Path] = []
+        if getattr(sys, "frozen", False):
+            bundle_root = Path(getattr(sys, "_MEIPASS", Path.cwd()))
+            roots.append(bundle_root / "aniviewer" / "assets")
+            roots.append(bundle_root / "assets")
+        roots.append(Path(__file__).resolve().parent.parent / "assets")
+        roots.append(Path.cwd() / "assets")
+        return roots
+
+    def _load_pixmaps(self) -> None:
+        for state, filename in self._ASSET_NAMES.items():
+            for root in self._asset_roots():
+                candidate = root / filename
+                if candidate.exists():
+                    pixmap = QPixmap(str(candidate))
+                    if not pixmap.isNull():
+                        self._pixmaps[state] = pixmap
+                    break
+        if self._pixmaps:
+            fallback = self._pixmaps.get("selected") or self._pixmaps.get("unselected")
+            if fallback is not None:
+                self._pixmaps.setdefault("selected", fallback)
+                self._pixmaps.setdefault("unselected", fallback)
+            return
+        for root in self._asset_roots():
+            candidate = root / self._FALLBACK_ASSET_NAME
+            if candidate.exists():
+                pixmap = QPixmap(str(candidate))
+                if not pixmap.isNull():
+                    self._pixmaps["selected"] = pixmap
+                    self._pixmaps["unselected"] = pixmap
+                break
+
+    def set_ui_scale_factor(self, factor: float) -> None:
+        self._ui_scale_factor = clamp_ui_scale(factor)
+        self._apply_metrics()
+
+    def set_compact_ui(self, enabled: bool) -> None:
+        self._compact_ui = bool(enabled)
+        self._apply_metrics()
+
+    def _button_size(self) -> int:
+        base_size = 32 if self._compact_ui else 38
+        return scale_int(base_size, self._ui_scale_factor, minimum=26)
+
+    def _apply_metrics(self) -> None:
+        size = self._button_size()
+        self.setFixedSize(size, size)
+        self.setStyleSheet("QPushButton { border: 0px; background: transparent; padding: 0px; }")
+        self._scaled_pixmaps.clear()
+        self.updateGeometry()
+        self.update()
+
+    @staticmethod
+    def _darken_pixmap(pixmap: QPixmap, amount: float) -> QPixmap:
+        if pixmap.isNull() or amount <= 0.0:
+            return pixmap
+        factor = max(0.0, min(1.0, 1.0 - amount))
+        image = pixmap.toImage().convertToFormat(QImage.Format.Format_ARGB32)
+        for y in range(image.height()):
+            for x in range(image.width()):
+                color = image.pixelColor(x, y)
+                if color.alpha() <= 0:
+                    continue
+                image.setPixelColor(
+                    x,
+                    y,
+                    QColor(
+                        int(round(color.red() * factor)),
+                        int(round(color.green() * factor)),
+                        int(round(color.blue() * factor)),
+                        color.alpha(),
+                    ),
+                )
+        return QPixmap.fromImage(image)
+
+    def _current_state(self) -> str:
+        return "selected" if self.isChecked() else "unselected"
+
+    def _scaled_pixmap(self, state: str, size: int, darken_amount: float = 0.0) -> Optional[QPixmap]:
+        pixmap = self._pixmaps.get(state) or self._pixmaps.get("selected") or self._pixmaps.get("unselected")
+        if pixmap is None or pixmap.isNull():
+            return None
+        dpr = max(1.0, float(self.devicePixelRatioF()))
+        physical_size = max(1, int(round(size * dpr)))
+        dpr_key = max(1, int(round(dpr * 100.0)))
+        darken_key = max(0, min(100, int(round(float(darken_amount) * 100.0))))
+        key = (state, int(size), dpr_key, darken_key)
+        cached = self._scaled_pixmaps.get(key)
+        if cached is not None and not cached.isNull():
+            return cached
+        scaled = pixmap.scaled(
+            QSize(physical_size, physical_size),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        if darken_key > 0:
+            scaled = self._darken_pixmap(scaled, darken_key / 100.0)
+        scaled.setDevicePixelRatio(dpr)
+        self._scaled_pixmaps[key] = scaled
+        return scaled
+
+    def paintEvent(self, event):
+        state = self._current_state()
+        darken_amount = 0.34 if not self.isChecked() else 0.0
+        if self.isDown() and not self.isChecked():
+            darken_amount = 0.42
+        pixmap = self._scaled_pixmap(state, self._button_size(), darken_amount)
+        if pixmap is None:
+            return super().paintEvent(event)
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        logical_size = pixmap.deviceIndependentSize()
+        width = float(logical_size.width())
+        height = float(logical_size.height())
+        scale = 0.96 if self.isDown() else 1.0
+        draw_width = width * scale
+        draw_height = height * scale
+        x = (float(self.width()) - draw_width) / 2.0
+        y = (float(self.height()) - draw_height) / 2.0
+        target = QRectF(x, y, draw_width, draw_height)
+        painter.drawPixmap(target, pixmap, QRectF(pixmap.rect()))
+
+
+class PlaybackButtonDropSlot(QWidget):
+    """Drop target that can host the textured playback button."""
+
+    playButtonDropped = pyqtSignal(str)
+
+    def __init__(self, slot_key: str, parent=None):
+        super().__init__(parent)
+        self.slot_key = str(slot_key or "timeline")
+        self._button: Optional[TexturedPlaybackButton] = None
+        self._button_size = 38
+        self._drop_hover = False
+        self.setObjectName("playButtonDropSlot")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setAcceptDrops(True)
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self._layout = QHBoxLayout(self)
+        self._layout.setContentsMargins(0, 0, 0, 0)
+        self._layout.setSpacing(0)
+        self.set_button_size(self._button_size)
+        self._refresh_style()
+
+    def set_button_size(self, size: int) -> None:
+        self._button_size = max(1, int(size))
+        self.setFixedSize(self._button_size, self._button_size)
+        if self._button is not None:
+            self._button.setFixedSize(self._button_size, self._button_size)
+        self._refresh_style()
+
+    def play_button(self) -> Optional[TexturedPlaybackButton]:
+        return self._button
+
+    def is_empty(self) -> bool:
+        return self._button is None
+
+    def set_play_button(self, button: Optional[TexturedPlaybackButton]) -> None:
+        if button is self._button:
+            return
+        if self._button is not None:
+            self._layout.removeWidget(self._button)
+        self._button = button
+        if button is not None:
+            button.setParent(self)
+            self._layout.addWidget(button)
+            button.show()
+            button.setFixedSize(self._button_size, self._button_size)
+        self._drop_hover = False
+        self._refresh_style()
+
+    def clear_play_button(self, button: Optional[TexturedPlaybackButton] = None) -> None:
+        if self._button is None:
+            return
+        if button is not None and self._button is not button:
+            return
+        self._layout.removeWidget(self._button)
+        self._button = None
+        self._drop_hover = False
+        self._refresh_style()
+
+    def _refresh_style(self) -> None:
+        if self._button is not None:
+            self.setStyleSheet("QWidget#playButtonDropSlot { border: 0px; background: transparent; }")
+            return
+        if self._drop_hover:
+            highlight = self.palette().color(self.palette().ColorRole.Highlight)
+            border = highlight.name()
+            background = (
+                f"rgba({highlight.red()}, {highlight.green()}, {highlight.blue()}, 46)"
+            )
+        else:
+            border = "rgba(0, 0, 0, 72)"
+            background = "rgba(0, 0, 0, 30)"
+        self.setStyleSheet(
+            "QWidget#playButtonDropSlot {"
+            f" background-color: {background};"
+            f" border: 1px solid {border};"
+            " border-radius: 4px;"
+            "}"
+        )
+
+    @staticmethod
+    def _event_has_play_button(event) -> bool:
+        mime = event.mimeData()
+        return bool(mime and mime.hasFormat(PLAY_BUTTON_DRAG_MIME))
+
+    def dragEnterEvent(self, event):
+        if self._event_has_play_button(event):
+            self._drop_hover = True
+            self._refresh_style()
+            event.acceptProposedAction()
+            return
+        event.ignore()
+
+    def dragMoveEvent(self, event):
+        if self._event_has_play_button(event):
+            event.acceptProposedAction()
+            return
+        event.ignore()
+
+    def dragLeaveEvent(self, event):
+        self._drop_hover = False
+        self._refresh_style()
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event):
+        if self._event_has_play_button(event):
+            self._drop_hover = False
+            self._refresh_style()
+            self.playButtonDropped.emit(self.slot_key)
+            event.acceptProposedAction()
+            return
+        event.ignore()
 
 
 class KeyframeMarkerBar(QWidget):
@@ -47,8 +773,8 @@ class KeyframeMarkerBar(QWidget):
         self._view_start: float = 0.0
         self._view_duration: float = 0.0
         self._compact_ui = False
-        self.setMinimumHeight(24)
-        self.setMaximumHeight(28)
+        self._ui_scale_factor = 1.0
+        self._apply_size_metrics()
         self.setMouseTracking(True)
         self._drag_active = False
         self._drag_moved = False
@@ -98,13 +824,22 @@ class KeyframeMarkerBar(QWidget):
 
     def set_compact_ui(self, enabled: bool):
         self._compact_ui = bool(enabled)
-        if self._compact_ui:
-            self.setMinimumHeight(18)
-            self.setMaximumHeight(22)
-        else:
-            self.setMinimumHeight(24)
-            self.setMaximumHeight(28)
+        self._apply_size_metrics()
         self.update()
+
+    def set_ui_scale_factor(self, factor: float):
+        self._ui_scale_factor = clamp_ui_scale(factor)
+        self._apply_size_metrics()
+        self.update()
+
+    def _apply_size_metrics(self):
+        factor = getattr(self, "_ui_scale_factor", 1.0)
+        if self._compact_ui:
+            self.setMinimumHeight(scale_int(18, factor, minimum=12))
+            self.setMaximumHeight(scale_int(22, factor, minimum=14))
+        else:
+            self.setMinimumHeight(scale_int(24, factor, minimum=16))
+            self.setMaximumHeight(scale_int(28, factor, minimum=18))
 
     def set_marker_colors(
         self,
@@ -589,16 +1324,17 @@ class TimelineLaneRow(QWidget):
         super().__init__(parent)
         self.lane_spec = lane_spec
         self._compact_ui = False
+        self._ui_scale_factor = 1.0
         layout = QVBoxLayout(self)
         layout.setContentsMargins(6, 0, 6, 0)
         layout.setSpacing(2)
 
-        self.header_widget = QWidget()
+        self.header_widget = QWidget(self)
         header = QHBoxLayout()
         header.setContentsMargins(0, 0, 0, 0)
         header.setSpacing(6)
 
-        self.label = ElidedLabel(lane_spec.label)
+        self.label = ElidedLabel(lane_spec.label, self.header_widget)
         self.label.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
         self.label.setMinimumWidth(0)
         self.label.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
@@ -606,7 +1342,7 @@ class TimelineLaneRow(QWidget):
 
         header.addStretch(1)
 
-        self.activate_btn = QToolButton()
+        self.activate_btn = QToolButton(self.header_widget)
         self.activate_btn.setText("Target")
         self.activate_btn.setToolTip("Set this lane as the target for new keyframes")
         self.activate_btn.setCheckable(True)
@@ -615,7 +1351,7 @@ class TimelineLaneRow(QWidget):
         self.activate_btn.setEnabled(lane_spec.targetable)
         header.addWidget(self.activate_btn)
 
-        self.delete_btn = QToolButton()
+        self.delete_btn = QToolButton(self.header_widget)
         self.delete_btn.setText("x")
         self.delete_btn.setToolTip("Delete this keyframe lane")
         self.delete_btn.setAutoRaise(True)
@@ -627,7 +1363,7 @@ class TimelineLaneRow(QWidget):
         self.header_widget.setVisible(lane_spec.show_header)
         layout.addWidget(self.header_widget)
 
-        self.bar = KeyframeLaneBar(lane_spec.key)
+        self.bar = KeyframeLaneBar(lane_spec.key, self)
         self.bar.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         layout.addWidget(self.bar)
 
@@ -646,12 +1382,28 @@ class TimelineLaneRow(QWidget):
         if hasattr(self.bar, "set_compact_ui"):
             self.bar.set_compact_ui(enabled)
 
+    def set_ui_scale_factor(self, factor: float):
+        self._ui_scale_factor = clamp_ui_scale(factor)
+        layout = self.layout()
+        if layout is not None:
+            layout.setContentsMargins(
+                scale_int(6, self._ui_scale_factor),
+                0,
+                scale_int(6, self._ui_scale_factor),
+                0,
+            )
+            layout.setSpacing(scale_int(2, self._ui_scale_factor))
+        if hasattr(self.bar, "set_ui_scale_factor"):
+            self.bar.set_ui_scale_factor(self._ui_scale_factor)
+        self._update_label_style(self.activate_btn.isChecked())
+        self.updateGeometry()
+
     def _update_label_style(self, active: bool):
         parts = []
         if active:
             parts.append("font-weight: bold; color: #dfe8ff;")
         if self._compact_ui:
-            parts.append("font-size: 9pt;")
+            parts.append(f"font-size: {scale_float(9, self._ui_scale_factor, minimum=6.0):.2f}pt;")
         self.label.setStyleSheet(" ".join(parts))
 
 
@@ -663,36 +1415,38 @@ class TimelineGroupWidget(QWidget):
         self.group_spec = group_spec
         self._collapsed = bool(collapsed)
         self._compact_ui = False
+        self._ui_scale_factor = 1.0
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
 
-        self.header_widget = QWidget()
+        self.header_widget = QWidget(self)
         header = QHBoxLayout()
+        self.header_layout = header
         header.setContentsMargins(6, 0, 6, 0)
         header.setSpacing(6)
 
-        self.toggle_btn = QToolButton()
+        self.toggle_btn = QToolButton(self.header_widget)
         self.toggle_btn.setText(">" if self._collapsed else "v")
         self.toggle_btn.setCheckable(True)
         self.toggle_btn.setChecked(not self._collapsed)
         self.toggle_btn.clicked.connect(self._toggle_collapsed)
         header.addWidget(self.toggle_btn)
 
-        self.thumb_label = QLabel()
+        self.thumb_label = QLabel(self.header_widget)
         self.thumb_label.setFixedSize(16, 16)
         self.thumb_label.setScaledContents(False)
         self.thumb_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.thumb_label.setVisible(False)
         header.addWidget(self.thumb_label)
 
-        self.title_label = QLabel(group_spec.label)
+        self.title_label = QLabel(group_spec.label, self.header_widget)
         self.title_label.setStyleSheet("font-weight: bold;")
         header.addWidget(self.title_label)
         header.addStretch()
 
-        self.add_btn = QToolButton()
+        self.add_btn = QToolButton(self.header_widget)
         self.add_btn.setText("+")
         self.add_btn.setToolTip("Add keyframe lane")
         self.add_btn.setEnabled(group_spec.addable)
@@ -704,7 +1458,7 @@ class TimelineGroupWidget(QWidget):
         self.header_widget.setVisible(group_spec.show_header)
         layout.addWidget(self.header_widget)
 
-        self.lanes_container = QWidget()
+        self.lanes_container = QWidget(self)
         self.lanes_layout = QVBoxLayout(self.lanes_container)
         self.lanes_layout.setContentsMargins(0, 0, 0, 0)
         self.lanes_layout.setSpacing(2)
@@ -723,10 +1477,26 @@ class TimelineGroupWidget(QWidget):
 
     def set_compact_ui(self, enabled: bool):
         self._compact_ui = bool(enabled)
-        thumb_size = 12 if self._compact_ui else 16
+        thumb_size = scale_int(12 if self._compact_ui else 16, self._ui_scale_factor, minimum=8)
         self.thumb_label.setFixedSize(thumb_size, thumb_size)
         if not self.thumb_label.pixmap():
             self.thumb_label.setVisible(False)
+
+    def set_ui_scale_factor(self, factor: float):
+        self._ui_scale_factor = clamp_ui_scale(factor)
+        layout = self.layout()
+        if layout is not None:
+            layout.setSpacing(scale_int(4, self._ui_scale_factor))
+        self.header_layout.setContentsMargins(
+            scale_int(6, self._ui_scale_factor),
+            0,
+            scale_int(6, self._ui_scale_factor),
+            0,
+        )
+        self.header_layout.setSpacing(scale_int(6, self._ui_scale_factor))
+        self.lanes_layout.setSpacing(scale_int(2, self._ui_scale_factor))
+        self.set_compact_ui(self._compact_ui)
+        self.updateGeometry()
 
     def set_thumbnail(self, pixmap: Optional[QPixmap]):
         if pixmap:
@@ -755,6 +1525,7 @@ class TimelineWidget(QWidget):
     beat_marker_dragged = pyqtSignal(int, float)
     keyframe_lane_add_requested = pyqtSignal(object)
     keyframe_lane_remove_requested = pyqtSignal(object)
+    play_button_drop_requested = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -774,6 +1545,7 @@ class TimelineWidget(QWidget):
         self._beat_grid_enabled: bool = False
         self._beat_edit_enabled: bool = False
         self._compact_ui: bool = False
+        self._ui_scale_factor: float = 1.0
         self._marker_color_override: Optional[QColor] = None
         self._marker_selected_color_override: Optional[QColor] = None
         self._simple_marker_mode: bool = False
@@ -785,14 +1557,22 @@ class TimelineWidget(QWidget):
 
         self.controls_layout = QHBoxLayout()
         self.controls_layout.setContentsMargins(0, 0, 0, 0)
-        self.play_btn = QPushButton("Play")
+        self.play_button_slot = PlaybackButtonDropSlot("timeline", self)
+        self.play_button_slot.playButtonDropped.connect(self.play_button_drop_requested.emit)
+        self.play_btn = TexturedPlaybackButton(self.play_button_slot)
         self.play_btn.clicked.connect(self.play_toggled.emit)
-        self.controls_layout.addWidget(self.play_btn)
+        self.play_button_slot.set_play_button(self.play_btn)
+        self.controls_layout.addWidget(self.play_button_slot)
 
-        self.loop_checkbox = QCheckBox("Loop")
-        self.loop_checkbox.setChecked(True)
-        self.loop_checkbox.stateChanged.connect(self.loop_toggled.emit)
-        self.controls_layout.addWidget(self.loop_checkbox)
+        self.loop_btn = TexturedLoopButton(self)
+        self.loop_btn.setChecked(True)
+        self.loop_btn.toggled.connect(
+            lambda checked: self.loop_toggled.emit(
+                Qt.CheckState.Checked.value if checked else Qt.CheckState.Unchecked.value
+            )
+        )
+        self.loop_checkbox = self.loop_btn
+        self.controls_layout.addWidget(self.loop_btn)
 
         self.time_label = QLabel("0.00 / 0.00s")
         self.controls_layout.addWidget(self.time_label)
@@ -803,13 +1583,9 @@ class TimelineWidget(QWidget):
         self.lane_target_label = QLabel("Target Lane")
         self.controls_layout.addWidget(self.lane_target_label)
         self.lane_target_combo = QComboBox()
-        self.lane_target_combo.setMinimumWidth(220)
+        self.lane_target_combo.setMinimumWidth(scale_int(220, self._ui_scale_factor, minimum=120))
         self.lane_target_combo.currentIndexChanged.connect(self._on_lane_combo_changed)
         self.controls_layout.addWidget(self.lane_target_combo)
-        self.collapse_btn = QToolButton()
-        self.collapse_btn.setText("Collapse")
-        self.collapse_btn.clicked.connect(self._toggle_tracks_collapsed)
-        self.controls_layout.addWidget(self.collapse_btn)
         self.controls_layout.addStretch()
 
         self.main_layout.addLayout(self.controls_layout)
@@ -825,7 +1601,7 @@ class TimelineWidget(QWidget):
         self.tracks_scroll.setWidget(self.tracks_container)
         self.main_layout.addWidget(self.tracks_scroll)
 
-        self.timeline_slider = QSlider(Qt.Orientation.Horizontal)
+        self.timeline_slider = TexturedTimelineSlider(Qt.Orientation.Horizontal)
         self.timeline_slider.setMinimum(0)
         self.timeline_slider.setMaximum(1)
         self.timeline_slider.valueChanged.connect(self._on_slider_value_changed)
@@ -835,22 +1611,65 @@ class TimelineWidget(QWidget):
         self.timeline_scrollbar.setVisible(False)
         self.timeline_scrollbar.valueChanged.connect(self._on_scrollbar_value_changed)
         self.main_layout.addWidget(self.timeline_scrollbar)
+        self.set_lane_groups([])
 
     def set_compact_ui(self, enabled: bool):
         self._compact_ui = bool(enabled)
-        spacing = 4 if self._compact_ui else 6
+        spacing = scale_int(4 if self._compact_ui else 6, self._ui_scale_factor)
         self.tracks_layout.setSpacing(spacing)
         if self._compact_ui:
-            self.setStyleSheet("QLabel { font-size: 9pt; } QPushButton, QToolButton { padding: 2px 6px; }")
+            font_pt = scale_float(9, self._ui_scale_factor, minimum=6.0)
+            pad_v = scale_int(2, self._ui_scale_factor)
+            pad_h = scale_int(6, self._ui_scale_factor)
+            self.setStyleSheet(
+                f"QLabel {{ font-size: {font_pt:.2f}pt; }}"
+                f"QPushButton, QToolButton {{ padding: {pad_v}px {pad_h}px; }}"
+            )
         else:
             self.setStyleSheet("")
         for group in self._group_widgets.values():
             group.set_compact_ui(self._compact_ui)
         for row in self._lane_rows.values():
             row.set_compact_ui(self._compact_ui)
+        if hasattr(self, "timeline_slider") and hasattr(self.timeline_slider, "set_compact_ui"):
+            self.timeline_slider.set_compact_ui(self._compact_ui)
+        if hasattr(self, "play_btn") and hasattr(self.play_btn, "set_compact_ui"):
+            self.play_btn.set_compact_ui(self._compact_ui)
+        self._sync_play_button_slot_size()
+        if hasattr(self, "loop_btn") and hasattr(self.loop_btn, "set_compact_ui"):
+            self.loop_btn.set_compact_ui(self._compact_ui)
+        self._apply_simple_marker_mode_layout()
+
+    def set_ui_scale_factor(self, factor: float):
+        self._ui_scale_factor = clamp_ui_scale(factor)
+        self.lane_target_combo.setMinimumWidth(scale_int(220, self._ui_scale_factor, minimum=120))
+        self.set_compact_ui(self._compact_ui)
+        for group in self._group_widgets.values():
+            group.set_ui_scale_factor(self._ui_scale_factor)
+        for row in self._lane_rows.values():
+            row.set_ui_scale_factor(self._ui_scale_factor)
+        if hasattr(self, "timeline_slider") and hasattr(self.timeline_slider, "set_ui_scale_factor"):
+            self.timeline_slider.set_ui_scale_factor(self._ui_scale_factor)
+        if hasattr(self, "play_btn") and hasattr(self.play_btn, "set_ui_scale_factor"):
+            self.play_btn.set_ui_scale_factor(self._ui_scale_factor)
+        self._sync_play_button_slot_size()
+        if hasattr(self, "loop_btn") and hasattr(self.loop_btn, "set_ui_scale_factor"):
+            self.loop_btn.set_ui_scale_factor(self._ui_scale_factor)
+        self.updateGeometry()
+
+    def _sync_play_button_slot_size(self) -> None:
+        if hasattr(self, "play_button_slot") and hasattr(self, "play_btn"):
+            size = self.play_btn.sizeHint().width()
+            if hasattr(self.play_btn, "_button_size"):
+                size = self.play_btn._button_size()
+            self.play_button_slot.set_button_size(size)
 
     def set_play_button_text(self, text: str):
-        self.play_btn.setText(text)
+        normalized = str(text or "").strip().lower()
+        if hasattr(self.play_btn, "set_playing") and normalized in {"play", "pause"}:
+            self.play_btn.set_playing(normalized == "pause")
+        else:
+            self.play_btn.setText(text)
 
     def set_time_label(self, text: str):
         self.time_label.setText(text)
@@ -897,8 +1716,9 @@ class TimelineWidget(QWidget):
         self._update_lane_view_window()
 
     def set_lane_groups(self, groups: List[TimelineGroupSpec]):
+        groups = list(groups or [])
         self._simple_marker_mode = (
-            len(groups or []) == 1
+            len(groups) == 1
             and bool(groups[0].lanes)
             and not groups[0].show_header
             and all(not lane.show_header for lane in groups[0].lanes)
@@ -907,23 +1727,33 @@ class TimelineWidget(QWidget):
             item = self.tracks_layout.takeAt(idx)
             widget = item.widget()
             if widget:
+                widget.hide()
                 widget.deleteLater()
         self._lane_rows.clear()
         self._group_widgets.clear()
 
+        if not groups:
+            self.tracks_layout.addStretch()
+            self._apply_simple_marker_mode_layout()
+            self.tracks_scroll.setVisible(False)
+            self._refresh_lane_target_combo([])
+            return
+
+        self.tracks_scroll.setVisible(not self._tracks_collapsed)
         for group in groups:
             collapsed = self._group_collapsed.get(group.key, False)
-            group_widget = TimelineGroupWidget(group, collapsed=collapsed)
+            group_widget = TimelineGroupWidget(group, collapsed=collapsed, parent=self.tracks_container)
             group_widget.addRequested.connect(self.keyframe_lane_add_requested.emit)
             group_widget.toggle_btn.clicked.connect(
                 lambda _, key=group.key, widget=group_widget: self._store_group_state(key, widget)
             )
+            group_widget.set_ui_scale_factor(self._ui_scale_factor)
             group_widget.set_compact_ui(self._compact_ui)
             self.tracks_layout.addWidget(group_widget)
             self._group_widgets[group.key] = group_widget
 
             for lane_spec in group.lanes:
-                row = TimelineLaneRow(lane_spec)
+                row = TimelineLaneRow(lane_spec, parent=group_widget.lanes_container)
                 row.bar.markerClicked.connect(
                     lambda time, key=lane_spec.key: self._on_lane_marker_clicked(key, time)
                 )
@@ -959,6 +1789,7 @@ class TimelineWidget(QWidget):
                 if selection:
                     row.bar.set_selected_markers(selection)
                 row.set_active(self._active_lane == lane_spec.key)
+                row.set_ui_scale_factor(self._ui_scale_factor)
                 row.set_compact_ui(self._compact_ui)
                 self._lane_rows[lane_spec.key] = row
                 group_widget.lanes_layout.addWidget(row)
@@ -968,25 +1799,24 @@ class TimelineWidget(QWidget):
         self._refresh_lane_target_combo(groups)
 
     def _apply_simple_marker_mode_layout(self):
+        factor = getattr(self, "_ui_scale_factor", 1.0)
         if self._simple_marker_mode:
-            self.main_layout.setSpacing(1)
-            self.controls_layout.setSpacing(4)
+            self.main_layout.setSpacing(scale_int(1, factor))
+            self.controls_layout.setSpacing(scale_int(4, factor))
             self.tracks_layout.setSpacing(0)
             self.tracks_layout.setContentsMargins(0, 0, 0, 0)
             self.tracks_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-            self.tracks_scroll.setMinimumHeight(24)
-            self.tracks_scroll.setMaximumHeight(32)
-            self.collapse_btn.setVisible(False)
+            self.tracks_scroll.setMinimumHeight(scale_int(24, factor, minimum=16))
+            self.tracks_scroll.setMaximumHeight(scale_int(32, factor, minimum=20))
         else:
-            self.main_layout.setSpacing(6)
-            self.controls_layout.setSpacing(6)
-            spacing = 4 if self._compact_ui else 6
+            self.main_layout.setSpacing(scale_int(6, factor))
+            self.controls_layout.setSpacing(scale_int(6, factor))
+            spacing = scale_int(4 if self._compact_ui else 6, factor)
             self.tracks_layout.setSpacing(spacing)
             self.tracks_layout.setContentsMargins(0, 0, 0, 0)
             self.tracks_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
             self.tracks_scroll.setMinimumHeight(0)
             self.tracks_scroll.setMaximumHeight(16777215)
-            self.collapse_btn.setVisible(True)
 
     def set_lane_thumbnail(self, lane_key: TimelineLaneKey, pixmap: Optional[QPixmap]):
         row = self._lane_rows.get(lane_key)
@@ -997,6 +1827,13 @@ class TimelineWidget(QWidget):
         group = self._group_widgets.get(group_key)
         if group:
             group.set_thumbnail(pixmap)
+
+    def group_has_thumbnail(self, group_key: Tuple[str, int]) -> bool:
+        group = self._group_widgets.get(group_key)
+        if not group:
+            return False
+        pixmap = group.thumb_label.pixmap()
+        return bool(pixmap and not pixmap.isNull() and not group.thumb_label.isHidden())
 
     def set_beat_markers(self, beats: List[float], duration: float):
         self._beat_markers = list(beats or [])
@@ -1026,6 +1863,10 @@ class TimelineWidget(QWidget):
                 self._marker_color_override,
                 self._marker_selected_color_override,
             )
+
+    def set_timeline_slider_tint_color(self, color: Optional[QColor]) -> None:
+        if hasattr(self, "timeline_slider") and hasattr(self.timeline_slider, "set_tint_color"):
+            self.timeline_slider.set_tint_color(color)
 
     def set_marker_selection(self, markers: List[Tuple[TimelineLaneKey, float]]):
         self._lane_selections = {}
@@ -1197,7 +2038,9 @@ class TimelineWidget(QWidget):
         self.tracks_scroll.setVisible(not self._tracks_collapsed)
         self.timeline_slider.setVisible(not self._tracks_collapsed)
         self.timeline_scrollbar.setVisible(not self._tracks_collapsed and self.timeline_scrollbar.maximum() > 0)
-        self.collapse_btn.setText("Expand" if self._tracks_collapsed else "Collapse")
+        collapse_btn = getattr(self, "collapse_btn", None)
+        if collapse_btn is not None:
+            collapse_btn.setText("Expand" if self._tracks_collapsed else "Collapse")
 
     def _on_lane_marker_clicked(self, lane_key: TimelineLaneKey, time_value: float):
         self.keyframe_marker_clicked.emit(time_value)

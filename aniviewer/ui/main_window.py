@@ -25,9 +25,11 @@ import io
 import runpy
 import xml.etree.ElementTree as ET
 import zlib
+import time
 from glob import glob
 from pathlib import Path
 from typing import Optional, Dict, List, Set, Tuple, Any, Callable
+from xml.sax.saxutils import quoteattr
 
 import numpy as np
 from dataclasses import dataclass, replace
@@ -38,10 +40,10 @@ from PyQt6.QtWidgets import (
     QPushButton, QLabel, QFileDialog, QMessageBox,
     QSplitter, QProgressDialog, QDialog, QInputDialog, QToolButton,
     QLineEdit, QTextEdit, QPlainTextEdit, QAbstractSpinBox, QComboBox,
-    QStackedWidget
+    QStackedWidget, QAbstractButton
 )
 from PyQt6.QtCore import Qt, QSettings, QTimer, QEvent, QProcess, QEventLoop, QThread, QObject, pyqtSignal
-from PyQt6.QtGui import QSurfaceFormat, QColor, QPalette, QShortcut, QKeySequence, QPixmap, QImage, QIcon, QCursor
+from PyQt6.QtGui import QSurfaceFormat, QColor, QPalette, QShortcut, QKeySequence, QPixmap, QImage, QIcon, QCursor, QFont
 from PyQt6.QtWidgets import QGraphicsDropShadowEffect
 from PIL import Image, ImageChops, ImageDraw
 from OpenGL.GL import *
@@ -62,6 +64,7 @@ from core.island_tiles import (
 from core.audio_manager import AudioManager
 from core.metronome import Metronome
 from utils.buddy_manifest import BuddyManifest
+from utils.ui_scaling import clamp_ui_scale, scale_int, scale_stylesheet_font_sizes
 from renderer.opengl_widget import (
     OpenGLAnimationWidget,
     TileBatch,
@@ -71,7 +74,13 @@ from renderer.opengl_widget import (
 )
 from renderer.sprite_renderer import BlendMode
 from .log_widget import LogWidget
-from .timeline import TimelineWidget, TimelineLaneKey, TimelineGroupSpec, TimelineLaneSpec
+from .timeline import (
+    TimelineWidget,
+    TimelineLaneKey,
+    TimelineGroupSpec,
+    TimelineLaneSpec,
+    PlaybackButtonDropSlot,
+)
 from .control_panel import ControlPanel
 from .layer_panel import LayerPanel
 from .settings_dialog import SettingsDialog, ExportSettings
@@ -91,6 +100,7 @@ from .sprite_picker_dialog import SpritePickerDialog
 from .constraints_dialog import ConstraintEditorDialog
 from .dof_asset_grabber_dialog import DofAssetGrabberDialog
 from utils.diagnostics import DiagnosticsManager, DiagnosticsConfig
+from utils.performance_profiler import get_profiler, profile_scope
 from utils.ffmpeg_installer import resolve_ffmpeg_path, query_ffmpeg_encoders
 from utils.pytoshop_installer import PytoshopInstaller, PythonPackageInstaller
 from utils.ae_rig_exporter import AERigExporter
@@ -118,6 +128,17 @@ from utils.monster_name_rosetta_refresh import (
     resolve_source_triplet,
 )
 from utils.keybinds import keybind_actions, default_keybinds, normalize_keybind_sequence
+from utils.conversion_diagnostics import (
+    compact_diagnostic_text,
+    conversion_window_diagnostics_enabled,
+    emit_conversion_diagnostic,
+    install_qmessagebox_diagnostics,
+    set_conversion_window_diagnostics_enabled,
+    start_conversion_window_diagnostics,
+    stop_conversion_window_diagnostics,
+)
+
+install_qmessagebox_diagnostics(QMessageBox)
 
 try:
     import UnityPy  # type: ignore
@@ -219,31 +240,53 @@ class BinConversionWorker(QObject):
 
     finished = pyqtSignal(dict)
 
-    def __init__(self, viewer: "MSMAnimationViewer", bin_path: str, force: bool = False, announce: bool = True):
+    def __init__(
+        self,
+        viewer: "MSMAnimationViewer",
+        bin_path: str,
+        force: bool = False,
+        announce: bool = True,
+        forced_converter_key: Optional[str] = None,
+    ):
         super().__init__()
         self._viewer = viewer
         self._bin_path = bin_path
         self._force = bool(force)
         self._announce = bool(announce)
+        self._forced_converter_key = forced_converter_key
 
     def run(self) -> None:
         logs: List[Tuple[str, str]] = []
         warnings: List[Tuple[str, str]] = []
+        converted_payload: Optional[Dict[str, Any]] = None
+        start_time = time.perf_counter()
         try:
-            json_path = self._viewer._convert_bin_file(
-                self._bin_path,
-                force=self._force,
-                announce=self._announce,
-                log_sink=logs,
-                warning_sink=warnings,
-                refresh_on_success=False,
-                command_runner=MSMAnimationViewer._run_converter_command_blocking,
-            )
+            if self._viewer._can_use_basic_rev6_fast_conversion(self._forced_converter_key):
+                json_path, converted_payload = self._viewer._convert_rev6_bin_file_for_basic_mode(
+                    self._bin_path,
+                    force=self._force,
+                    announce=self._announce,
+                    log_sink=logs,
+                    warning_sink=warnings,
+                )
+            else:
+                json_path = self._viewer._convert_bin_file(
+                    self._bin_path,
+                    force=self._force,
+                    announce=self._announce,
+                    log_sink=logs,
+                    warning_sink=warnings,
+                    refresh_on_success=False,
+                    command_runner=MSMAnimationViewer._run_converter_command_blocking,
+                    forced_converter_key=self._forced_converter_key,
+                )
             payload = {
                 "success": bool(json_path),
                 "json_path": json_path,
+                "converted_payload": converted_payload,
                 "logs": logs,
                 "warning": warnings[-1] if warnings else None,
+                "convert_elapsed_ms": (time.perf_counter() - start_time) * 1000.0,
             }
         except Exception as exc:
             payload = {
@@ -251,14 +294,1057 @@ class BinConversionWorker(QObject):
                 "json_path": None,
                 "logs": logs,
                 "warning": ("Conversion Failed", str(exc)),
+                "convert_elapsed_ms": (time.perf_counter() - start_time) * 1000.0,
             }
         self.finished.emit(payload)
 
 
+class ConverterCommandWorker(QObject):
+    """Run a converter command off the UI thread."""
+
+    finished = pyqtSignal(dict)
+    log_message = pyqtSignal(str, str)
+
+    def __init__(self, cmd: List[str], cwd: Optional[str]):
+        super().__init__()
+        self._cmd = list(cmd)
+        self._cwd = cwd
+
+    def run(self) -> None:
+        try:
+            self.log_message.emit("Converter command started.", "INFO")
+            result = MSMAnimationViewer._run_converter_command_blocking(
+                self._cmd,
+                self._cwd,
+                output_callback=self.log_message.emit,
+            )
+            payload = {
+                "returncode": int(result.returncode),
+                "stdout": result.stdout or "",
+                "stderr": result.stderr or "",
+                "logs_streamed": True,
+            }
+        except Exception as exc:
+            payload = {
+                "returncode": 1,
+                "stdout": "",
+                "stderr": str(exc),
+                "logs_streamed": True,
+            }
+            self.log_message.emit(str(exc), "WARNING")
+        self.finished.emit(payload)
+
+
+class DofRev6PackageWorker(QObject):
+    """Convert a selected DOF animation into a rev6-style data package."""
+
+    finished = pyqtSignal(dict)
+    log_message = pyqtSignal(str, str)
+    _SPRITE_IMAGE_EXTENSIONS = {".png", ".avif", ".webp", ".jpg", ".jpeg", ".tga", ".psd"}
+
+    def __init__(
+        self,
+        dof_converter_path: str,
+        rev6_converter_path: str,
+        input_path: str,
+        dof_root: str,
+        package_root: str,
+        source_stem: str,
+        bin_name: str,
+        xml_name: str,
+        png_name: str,
+        option_args: List[str],
+    ):
+        super().__init__()
+        self._dof_converter_path = dof_converter_path
+        self._rev6_converter_path = rev6_converter_path
+        self._input_path = input_path
+        self._dof_root = dof_root
+        self._package_root = package_root
+        self._source_stem = source_stem
+        self._bin_name = bin_name
+        self._xml_name = xml_name
+        self._png_name = png_name
+        self._option_args = list(option_args)
+
+    def _log(self, logs: List[Tuple[str, str]], message: str, level: str = "INFO") -> None:
+        text = str(message or "").strip()
+        if not text:
+            return
+        logs.append((text, level))
+        self.log_message.emit(text, level)
+
+    @staticmethod
+    def _rewrite_xml_image_path(xml_path: Path, image_path: str) -> None:
+        try:
+            text = xml_path.read_text(encoding="utf-8")
+        except Exception:
+            text = ""
+        if text:
+            updated, count = re.subn(
+                r'imagePath="[^"]*"',
+                f'imagePath="{image_path}"',
+                text,
+                count=1,
+            )
+            if count:
+                xml_path.write_text(updated, encoding="utf-8")
+                return
+        tree = ET.parse(xml_path)
+        root = tree.getroot()
+        root.set("imagePath", image_path)
+        tree.write(xml_path, encoding="utf-8")
+
+    @staticmethod
+    def _xml_attr_text(attrib: Dict[str, Any]) -> str:
+        return " ".join(
+            f"{key}={quoteattr(str(value))}"
+            for key, value in attrib.items()
+        )
+
+    @classmethod
+    def _write_texturepacker_style_xml(cls, root: ET.Element, xml_path: Path) -> None:
+        header_lines = [
+            '<?xml version="1.0" encoding="UTF-8"?>',
+            '<!-- Created with TexturePacker http://www.codeandweb.com/texturepacker-->',
+            '<!--Format:',
+            'n  => name of the sprite',
+            'x  => sprite x pos in texture',
+            'y  => sprite y pos in texture',
+            'w  => sprite width (may be trimmed)',
+            'h  => sprite height (may be trimmed)',
+            'pX => x pos of the pivot point (relative to sprite width)',
+            'pY => y pos of the pivot point (relative to sprite height)',
+            "oX => sprite's x-corner offset (only available if trimmed)",
+            "oY => sprite's y-corner offset (only available if trimmed)",
+            "oW => sprite's original width (only available if trimmed)",
+            "oH => sprite's original height (only available if trimmed)",
+            "r => 'y' only set if sprite is rotated",
+            'with polygon mode enabled:',
+            'vertices   => points in sprite coordinate system (x0,y0,x1,y1,x2,y2, ...)',
+            'verticesUV => points in sheet coordinate system (x0,y0,x1,y1,x2,y2, ...)',
+            'triangles  => sprite triangulation, 3 vertex indices per triangle',
+            '-->',
+        ]
+        root_attrs = cls._xml_attr_text(dict(root.attrib))
+        root_open = f"<{root.tag}{(' ' + root_attrs) if root_attrs else ''}>"
+        lines = list(header_lines)
+        lines.append(root_open)
+        for child in list(root):
+            attrs = cls._xml_attr_text(dict(child.attrib))
+            open_tag = f"{child.tag}{(' ' + attrs) if attrs else ''}"
+            has_text = bool(child.text and child.text.strip())
+            if len(child) == 0 and not has_text:
+                lines.append(f"    <{open_tag}/>")
+                continue
+            serialized = ET.tostring(child, encoding="unicode", short_empty_elements=True)
+            serialized = serialized.replace(" />", "/>")
+            for line in serialized.splitlines():
+                lines.append(f"    {line}" if line.strip() else line)
+        lines.append(f"</{root.tag}>")
+        xml_path.parent.mkdir(parents=True, exist_ok=True)
+        xml_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    @classmethod
+    def _canonical_sprite_ref_name(cls, name: Any) -> str:
+        text = str(name or "").strip().replace("\\", "/")
+        if not text:
+            return ""
+        base = text.rsplit("/", 1)[-1]
+        path = Path(base)
+        if path.suffix.lower() in cls._SPRITE_IMAGE_EXTENSIONS:
+            return path.stem
+        return base
+
+    @classmethod
+    def _normalize_atlas_root_sprite_names(cls, root: ET.Element) -> int:
+        changed = 0
+        for sprite_elem in root.findall(".//sprite"):
+            raw_name = sprite_elem.attrib.get("n") or ""
+            normalized = cls._canonical_sprite_ref_name(raw_name)
+            if normalized and normalized != raw_name:
+                sprite_elem.set("n", normalized)
+                changed += 1
+        return changed
+
+    @classmethod
+    def _normalize_atlas_sprite_names(cls, xml_path: Path) -> int:
+        try:
+            tree = ET.parse(xml_path)
+            root = tree.getroot()
+        except Exception:
+            return 0
+        changed = cls._normalize_atlas_root_sprite_names(root)
+        if changed:
+            cls._write_texturepacker_style_xml(root, xml_path)
+        return changed
+
+    @staticmethod
+    def _strip_polygon_mesh_xml(xml_path: Path) -> None:
+        def _fmt_float(value: float, decimals: int = 6) -> str:
+            text = f"{value:.{decimals}f}".rstrip("0").rstrip(".")
+            return "0" if text in ("", "-0") else text
+
+        def _float_attr(elem: ET.Element, name: str, default: float) -> float:
+            try:
+                value = float(elem.get(name, default))
+            except (TypeError, ValueError):
+                return float(default)
+            return value if math.isfinite(value) else float(default)
+
+        def _parse_vertex_pairs(raw_text: Optional[str]) -> List[Tuple[float, float]]:
+            if not raw_text:
+                return []
+            parts = raw_text.split()
+            if len(parts) < 4 or len(parts) % 2:
+                return []
+            vertices: List[Tuple[float, float]] = []
+            try:
+                for idx in range(0, len(parts), 2):
+                    x = float(parts[idx])
+                    y = float(parts[idx + 1])
+                    if not (math.isfinite(x) and math.isfinite(y)):
+                        return []
+                    vertices.append((x, y))
+            except (TypeError, ValueError):
+                return []
+            return vertices
+
+        try:
+            tree = ET.parse(xml_path)
+            root = tree.getroot()
+        except Exception:
+            root = None
+            tree = None
+
+        if root is not None and tree is not None:
+            changed = False
+            for attr_name in ("pivotMode", "pivot_mode", "version"):
+                if attr_name in root.attrib:
+                    root.attrib.pop(attr_name, None)
+                    changed = True
+
+            for sprite_elem in root.findall(".//sprite"):
+                vertices_elem = sprite_elem.find("vertices")
+                vertices = _parse_vertex_pairs(vertices_elem.text if vertices_elem is not None else None)
+                if vertices:
+                    min_x = min(vx for vx, _ in vertices)
+                    max_x = max(vx for vx, _ in vertices)
+                    min_y = min(vy for _, vy in vertices)
+                    max_y = max(vy for _, vy in vertices)
+                    width = _float_attr(sprite_elem, "w", max_x - min_x)
+                    height = _float_attr(sprite_elem, "h", max_y - min_y)
+                    current_ow = _float_attr(sprite_elem, "oW", width)
+                    current_oh = _float_attr(sprite_elem, "oH", height)
+                    sprite_elem.set("oX", _fmt_float(min_x))
+                    sprite_elem.set("oY", _fmt_float(min_y))
+                    sprite_elem.set("oW", _fmt_float(max(current_ow, max_x, min_x + width, width)))
+                    sprite_elem.set("oH", _fmt_float(max(current_oh, max_y, min_y + height, height)))
+                    changed = True
+                for tag in ("vertices", "verticesUV", "triangles"):
+                    child = sprite_elem.find(tag)
+                    while child is not None:
+                        sprite_elem.remove(child)
+                        changed = True
+                        child = sprite_elem.find(tag)
+                if len(sprite_elem) == 0 and sprite_elem.text and not sprite_elem.text.strip():
+                    sprite_elem.text = None
+                    changed = True
+
+            if changed:
+                DofRev6PackageWorker._write_texturepacker_style_xml(root, xml_path)
+                return
+
+        try:
+            text = xml_path.read_text(encoding="utf-8")
+        except Exception:
+            return
+        if not text:
+            return
+        updated = text
+        for tag in ("vertices", "verticesUV", "triangles"):
+            updated = re.sub(
+                rf"<{tag}>.*?</{tag}>",
+                "",
+                updated,
+                flags=re.DOTALL,
+            )
+        updated = re.sub(r'\s+pivotMode="[^"]*"', "", updated, count=1)
+        if updated != text:
+            xml_path.write_text(updated, encoding="utf-8")
+
+    @staticmethod
+    def _load_json_with_source(json_path: Path, xml_name: str) -> Dict[str, Any]:
+        payload = json.loads(json_path.read_text(encoding="utf-8"))
+        sources = payload.get("sources", [])
+        if isinstance(sources, list):
+            for source in sources:
+                if isinstance(source, dict):
+                    source["src"] = xml_name
+        payload["sources"] = sources if isinstance(sources, list) else []
+        payload["rev"] = 6
+        if "blend_version" not in payload:
+            payload["blend_version"] = 2
+        return payload
+
+    @classmethod
+    def _normalize_payload_sprite_refs(cls, payload: Dict[str, Any]) -> int:
+        changed = 0
+        anims = payload.get("anims")
+        if not isinstance(anims, list):
+            return changed
+
+        for anim in anims:
+            if not isinstance(anim, dict):
+                continue
+            layers = anim.get("layers")
+            if not isinstance(layers, list):
+                continue
+            for layer in layers:
+                if not isinstance(layer, dict):
+                    continue
+
+                layer_sprite = layer.get("sprite")
+                if isinstance(layer_sprite, str):
+                    normalized = cls._canonical_sprite_ref_name(layer_sprite)
+                    if normalized and normalized != layer_sprite:
+                        layer["sprite"] = normalized
+                        changed += 1
+
+                anchor_map = layer.get("sprite_anchor_map")
+                if isinstance(anchor_map, dict) and anchor_map:
+                    normalized_map: Dict[str, Any] = {}
+                    map_changed = False
+                    for key, value in anchor_map.items():
+                        if not isinstance(key, str):
+                            normalized_map[key] = value
+                            continue
+                        normalized_key = cls._canonical_sprite_ref_name(key)
+                        if normalized_key and normalized_key != key:
+                            map_changed = True
+                            changed += 1
+                        else:
+                            normalized_key = key
+                        if normalized_key not in normalized_map:
+                            normalized_map[normalized_key] = value
+                    if map_changed:
+                        layer["sprite_anchor_map"] = normalized_map
+
+                frames = layer.get("frames")
+                if not isinstance(frames, list):
+                    continue
+                for frame in frames:
+                    if not isinstance(frame, dict):
+                        continue
+                    sprite = frame.get("sprite")
+                    if not isinstance(sprite, dict):
+                        continue
+                    raw_name = sprite.get("string")
+                    if not isinstance(raw_name, str):
+                        continue
+                    normalized = cls._canonical_sprite_ref_name(raw_name)
+                    if normalized and normalized != raw_name:
+                        sprite["string"] = normalized
+                        changed += 1
+        return changed
+
+    @staticmethod
+    def _coerce_float(value: Any, default: float = 0.0) -> float:
+        try:
+            result = float(value)
+        except (TypeError, ValueError):
+            return float(default)
+        return result if math.isfinite(result) else float(default)
+
+    @staticmethod
+    def _frame_time(frame: Dict[str, Any]) -> float:
+        return DofRev6PackageWorker._coerce_float(frame.get("time"), 0.0)
+
+    @staticmethod
+    def _frame_immediate(frame: Dict[str, Any], channel: str) -> int:
+        data = frame.get(channel)
+        if not isinstance(data, dict):
+            return -1
+        try:
+            return int(data.get("immediate", -1))
+        except (TypeError, ValueError):
+            return -1
+
+    @staticmethod
+    def _numeric_track_value(
+        frames: List[Dict[str, Any]],
+        time_value: float,
+        channel: str,
+        field: str,
+        default: float,
+    ) -> float:
+        keys: List[Tuple[float, float, int]] = []
+        for frame in frames:
+            data = frame.get(channel)
+            if not isinstance(data, dict):
+                continue
+            immediate = DofRev6PackageWorker._frame_immediate(frame, channel)
+            if immediate == -1:
+                continue
+            keys.append(
+                (
+                    DofRev6PackageWorker._frame_time(frame),
+                    DofRev6PackageWorker._coerce_float(data.get(field), default),
+                    immediate,
+                )
+            )
+        if not keys:
+            return float(default)
+        keys.sort(key=lambda item: item[0])
+
+        prev_key: Optional[Tuple[float, float, int]] = None
+        next_key: Optional[Tuple[float, float, int]] = None
+        for key in keys:
+            if key[0] <= time_value + 1e-9:
+                prev_key = key
+            elif key[0] > time_value + 1e-9:
+                next_key = key
+                break
+
+        if prev_key is None:
+            return keys[0][1]
+        if prev_key[2] == 1 or next_key is None:
+            return prev_key[1]
+        if prev_key[2] == 0:
+            duration = next_key[0] - prev_key[0]
+            if duration > 1e-9:
+                mix = max(0.0, min(1.0, (time_value - prev_key[0]) / duration))
+                return prev_key[1] + (next_key[1] - prev_key[1]) * mix
+        return prev_key[1]
+
+    @staticmethod
+    def _numeric_track_immediate_at_time(
+        frames: List[Dict[str, Any]],
+        time_value: float,
+        channel: str,
+        default: int = 0,
+    ) -> int:
+        keys: List[Tuple[float, int]] = []
+        for frame in frames:
+            data = frame.get(channel)
+            if not isinstance(data, dict):
+                continue
+            immediate = DofRev6PackageWorker._frame_immediate(frame, channel)
+            if immediate == -1:
+                continue
+            keys.append((DofRev6PackageWorker._frame_time(frame), immediate))
+        if not keys:
+            return int(default)
+        keys.sort(key=lambda item: item[0])
+
+        prev_key: Optional[Tuple[float, int]] = None
+        for key in keys:
+            if key[0] <= time_value + 1e-9:
+                prev_key = key
+            elif key[0] > time_value + 1e-9:
+                break
+
+        if prev_key is None:
+            return int(keys[0][1])
+        return int(prev_key[1])
+
+    @staticmethod
+    def _interpolated_sprite_name(
+        prev_key: Tuple[float, str, int],
+        next_key: Tuple[float, str, int],
+        time_value: float,
+    ) -> Optional[str]:
+        prev_time, prev_name, _ = prev_key
+        next_time, next_name, _ = next_key
+        if not prev_name or not next_name or next_time <= prev_time:
+            return None
+        prev_match = re.match(r"^(.*?)(\d+)$", prev_name)
+        next_match = re.match(r"^(.*?)(\d+)$", next_name)
+        if not prev_match or not next_match or prev_match.group(1) != next_match.group(1):
+            return None
+        start_idx = int(prev_match.group(2))
+        end_idx = int(next_match.group(2))
+        if start_idx == end_idx:
+            return prev_name
+        duration = next_time - prev_time
+        ratio = max(0.0, min(0.9999, (time_value - prev_time) / duration))
+        span = end_idx - start_idx
+        steps = abs(span)
+        if steps <= 0:
+            return prev_name
+        advance = min(steps - 1, int(ratio * steps))
+        candidate_idx = start_idx + advance if span > 0 else start_idx - advance
+        return f"{prev_match.group(1)}{str(candidate_idx).zfill(len(prev_match.group(2)))}"
+
+    @staticmethod
+    def _sprite_track_value(frames: List[Dict[str, Any]], time_value: float) -> str:
+        keys: List[Tuple[float, str, int]] = []
+        for frame in frames:
+            data = frame.get("sprite")
+            if not isinstance(data, dict):
+                continue
+            immediate = DofRev6PackageWorker._frame_immediate(frame, "sprite")
+            if immediate == -1:
+                continue
+            keys.append(
+                (
+                    DofRev6PackageWorker._frame_time(frame),
+                    str(data.get("string") or ""),
+                    immediate,
+                )
+            )
+        if not keys:
+            return ""
+        keys.sort(key=lambda item: item[0])
+
+        prev_key: Optional[Tuple[float, str, int]] = None
+        next_key: Optional[Tuple[float, str, int]] = None
+        for key in keys:
+            if key[0] <= time_value + 1e-9:
+                prev_key = key
+            elif key[0] > time_value + 1e-9:
+                next_key = key
+                break
+
+        if prev_key is None:
+            return keys[0][1]
+        if prev_key[2] == 0 and next_key is not None:
+            interpolated = DofRev6PackageWorker._interpolated_sprite_name(prev_key, next_key, time_value)
+            if interpolated:
+                return interpolated
+        return prev_key[1]
+
+    @staticmethod
+    def _sprite_anchor_alias_candidates(sprite_name: str) -> List[str]:
+        base = str(sprite_name or "").strip()
+        if not base:
+            return []
+        candidates: List[str] = []
+        seen: Set[str] = set()
+
+        def enqueue(value: str) -> None:
+            value = str(value or "").strip()
+            if not value or value in seen:
+                return
+            seen.add(value)
+            candidates.append(value)
+
+        enqueue(base)
+        normalized = base.replace("\\", "/")
+        if "/" in normalized:
+            enqueue(normalized.rsplit("/", 1)[-1])
+
+        index = 0
+        while index < len(candidates):
+            candidate = candidates[index]
+            if "." in candidate:
+                enqueue(candidate.rsplit(".", 1)[0])
+            else:
+                for ext in (".png", ".avif", ".webp"):
+                    enqueue(candidate + ext)
+            numeric_working = candidate
+            while True:
+                reduced = re.sub(r"([ _-])\d+$", "", numeric_working)
+                if reduced == numeric_working or not reduced:
+                    break
+                enqueue(reduced)
+                numeric_working = reduced
+            alpha_working = candidate
+            while True:
+                reduced = re.sub(r"([ _-])[A-Za-z]$", "", alpha_working)
+                if reduced == alpha_working or not reduced:
+                    break
+                enqueue(reduced)
+                alpha_working = reduced
+            index += 1
+
+        return candidates
+
+    @staticmethod
+    def _resolve_sprite_anchor(
+        anchor_map: Dict[str, Any],
+        sprite_name: str,
+    ) -> Optional[Tuple[float, float]]:
+        if not isinstance(anchor_map, dict) or not sprite_name:
+            return None
+        candidates = DofRev6PackageWorker._sprite_anchor_alias_candidates(sprite_name)
+        for candidate in candidates:
+            value = anchor_map.get(candidate)
+            if isinstance(value, (list, tuple)) and len(value) >= 2:
+                return (
+                    DofRev6PackageWorker._coerce_float(value[0], 0.0),
+                    DofRev6PackageWorker._coerce_float(value[1], 0.0),
+                )
+        lowered = {str(key).lower(): value for key, value in anchor_map.items() if isinstance(key, str)}
+        for candidate in candidates:
+            value = lowered.get(candidate.lower())
+            if isinstance(value, (list, tuple)) and len(value) >= 2:
+                return (
+                    DofRev6PackageWorker._coerce_float(value[0], 0.0),
+                    DofRev6PackageWorker._coerce_float(value[1], 0.0),
+                )
+        return None
+
+    @staticmethod
+    def _bake_sprite_anchor_maps_for_rev6(payload: Dict[str, Any]) -> Tuple[int, int]:
+        adjusted_layers = 0
+        adjusted_frames = 0
+        anims = payload.get("anims")
+        if not isinstance(anims, list):
+            return adjusted_layers, adjusted_frames
+
+        for anim in anims:
+            if not isinstance(anim, dict):
+                continue
+            layers = anim.get("layers")
+            if not isinstance(layers, list):
+                continue
+            for layer in layers:
+                if not isinstance(layer, dict):
+                    continue
+                anchor_map = layer.get("sprite_anchor_map")
+                if not isinstance(anchor_map, dict) or not anchor_map:
+                    continue
+                frames = layer.get("frames")
+                if not isinstance(frames, list) or not frames:
+                    layer.pop("sprite_anchor_map", None)
+                    continue
+
+                layer_anchor_x = DofRev6PackageWorker._coerce_float(layer.get("anchor_x"), 0.0)
+                layer_anchor_y = DofRev6PackageWorker._coerce_float(layer.get("anchor_y"), 0.0)
+                layer_adjustments = 0
+                frame_dicts = [frame for frame in frames if isinstance(frame, dict)]
+                source_frames = copy.deepcopy(frame_dicts)
+
+                def corrected_position_for(
+                    time_value: float,
+                    sprite_name: str,
+                ) -> Optional[Tuple[float, float]]:
+                    mapped_anchor = DofRev6PackageWorker._resolve_sprite_anchor(anchor_map, sprite_name)
+                    if mapped_anchor is None:
+                        return None
+
+                    offset_x = layer_anchor_x - mapped_anchor[0]
+                    offset_y = layer_anchor_y - mapped_anchor[1]
+
+                    base_pos_x = DofRev6PackageWorker._numeric_track_value(source_frames, time_value, "pos", "x", 0.0)
+                    base_pos_y = DofRev6PackageWorker._numeric_track_value(source_frames, time_value, "pos", "y", 0.0)
+                    scale_x = DofRev6PackageWorker._numeric_track_value(source_frames, time_value, "scale", "x", 100.0) / 100.0
+                    scale_y = DofRev6PackageWorker._numeric_track_value(source_frames, time_value, "scale", "y", 100.0) / 100.0
+                    rotation = DofRev6PackageWorker._numeric_track_value(source_frames, time_value, "rotation", "value", 0.0)
+                    rot_rad = math.radians(rotation)
+                    cos_r = math.cos(rot_rad)
+                    sin_r = math.sin(rot_rad)
+                    scaled_x = offset_x * scale_x
+                    scaled_y = offset_y * scale_y
+                    adjusted_x = base_pos_x + (cos_r * scaled_x - sin_r * scaled_y)
+                    adjusted_y = base_pos_y + (sin_r * scaled_x + cos_r * scaled_y)
+                    return float(adjusted_x), float(adjusted_y)
+
+                def build_pos_only_frame(time_value: float, pos: Tuple[float, float], immediate: int) -> Dict[str, Any]:
+                    return {
+                        "time": float(time_value),
+                        "pos": {
+                            "immediate": int(immediate),
+                            "x": float(pos[0]),
+                            "y": float(pos[1]),
+                        },
+                        "scale": {"immediate": -1, "x": 0.0, "y": 0.0},
+                        "rotation": {"immediate": -1, "value": 0.0},
+                        "opacity": {"immediate": -1, "value": 0.0},
+                        "sprite": {"immediate": -1, "string": ""},
+                        "rgb": {"immediate": -1, "red": 255, "green": 255, "blue": 255},
+                    }
+
+                additional_frames: List[Dict[str, Any]] = []
+                frame_times = sorted(
+                    {
+                        DofRev6PackageWorker._frame_time(frame)
+                        for frame in frame_dicts
+                    }
+                )
+                sprite_key_times = sorted(
+                    {
+                        DofRev6PackageWorker._frame_time(frame)
+                        for frame in source_frames
+                        if DofRev6PackageWorker._frame_immediate(frame, "sprite") != -1
+                    }
+                )
+                for time_value in sprite_key_times:
+                    if time_value <= 0.0:
+                        continue
+                    current_sprite = DofRev6PackageWorker._sprite_track_value(source_frames, time_value)
+                    if not current_sprite:
+                        continue
+                    previous_times = [sample_time for sample_time in frame_times if sample_time < time_value - 1e-9]
+                    if not previous_times:
+                        continue
+                    previous_time = previous_times[-1]
+                    epsilon = min(0.0001, max((time_value - previous_time) * 0.25, 0.0))
+                    if epsilon <= 1e-9:
+                        continue
+                    pre_time = time_value - epsilon
+                    previous_sprite = DofRev6PackageWorker._sprite_track_value(source_frames, pre_time)
+                    if not previous_sprite or previous_sprite == current_sprite:
+                        continue
+                    pre_pos = corrected_position_for(pre_time, previous_sprite)
+                    if pre_pos is None:
+                        continue
+                    additional_frames.append(build_pos_only_frame(pre_time, pre_pos, 1))
+
+                for frame in frame_dicts:
+                    time_value = DofRev6PackageWorker._frame_time(frame)
+                    sprite_name = DofRev6PackageWorker._sprite_track_value(source_frames, time_value)
+                    corrected_pos = corrected_position_for(time_value, sprite_name)
+                    if corrected_pos is None:
+                        continue
+
+                    pos_immediate = DofRev6PackageWorker._frame_immediate(frame, "pos")
+                    if pos_immediate == -1:
+                        pos_immediate = DofRev6PackageWorker._numeric_track_immediate_at_time(
+                            source_frames,
+                            time_value,
+                            "pos",
+                            0,
+                        )
+                    frame["pos"] = {
+                        "immediate": int(pos_immediate),
+                        "x": float(corrected_pos[0]),
+                        "y": float(corrected_pos[1]),
+                    }
+                    layer_adjustments += 1
+
+                if additional_frames:
+                    frames.extend(additional_frames)
+                    frames.sort(key=lambda item: DofRev6PackageWorker._frame_time(item) if isinstance(item, dict) else 0.0)
+                    layer_adjustments += len(additional_frames)
+
+                layer.pop("sprite_anchor_map", None)
+                if layer_adjustments:
+                    adjusted_layers += 1
+                    adjusted_frames += layer_adjustments
+
+        return adjusted_layers, adjusted_frames
+
+    @staticmethod
+    def _bake_centered_dof_origin_for_rev6(payload: Dict[str, Any]) -> Tuple[int, int, float, float]:
+        dof_meta = payload.get("dof_meta")
+        if not isinstance(dof_meta, dict):
+            return 0, 0, 0.0, 0.0
+        if dof_meta.get("rev6_center_origin_baked"):
+            return 0, 0, 0.0, 0.0
+        anims = payload.get("anims")
+        if not isinstance(anims, list):
+            return 0, 0, 0.0, 0.0
+
+        adjusted_layers = 0
+        adjusted_frames = 0
+        last_offset_x = 0.0
+        last_offset_y = 0.0
+        for anim in anims:
+            if not isinstance(anim, dict) or not anim.get("centered"):
+                continue
+            width = DofRev6PackageWorker._coerce_float(anim.get("width"), 0.0)
+            height = DofRev6PackageWorker._coerce_float(anim.get("height"), 0.0)
+            if width <= 0.0 or height <= 0.0:
+                continue
+            offset_x = width * 0.5
+            offset_y = height * 0.5
+            layers = anim.get("layers")
+            if not isinstance(layers, list):
+                continue
+            for layer in layers:
+                if not isinstance(layer, dict):
+                    continue
+                frames = layer.get("frames")
+                if not isinstance(frames, list):
+                    continue
+                layer_adjusted = False
+                for frame in frames:
+                    if not isinstance(frame, dict):
+                        continue
+                    pos = frame.get("pos")
+                    if not isinstance(pos, dict):
+                        continue
+                    if DofRev6PackageWorker._frame_immediate(frame, "pos") == -1:
+                        continue
+                    pos["x"] = DofRev6PackageWorker._coerce_float(pos.get("x"), 0.0) + offset_x
+                    pos["y"] = DofRev6PackageWorker._coerce_float(pos.get("y"), 0.0) + offset_y
+                    adjusted_frames += 1
+                    layer_adjusted = True
+                if layer_adjusted:
+                    adjusted_layers += 1
+                    last_offset_x = offset_x
+                    last_offset_y = offset_y
+
+        if adjusted_frames:
+            dof_meta["rev6_center_origin_baked"] = True
+        return adjusted_layers, adjusted_frames, last_offset_x, last_offset_y
+
+    @staticmethod
+    def _scale_dof_anchors_for_hires_rev6(payload: Dict[str, Any], factor: float = 0.5) -> Tuple[int, int]:
+        dof_meta = payload.get("dof_meta")
+        if not isinstance(dof_meta, dict):
+            return 0, 0
+        try:
+            factor_value = float(factor)
+        except (TypeError, ValueError):
+            return 0, 0
+        if not math.isfinite(factor_value) or abs(factor_value - 1.0) <= 1e-9:
+            return 0, 0
+        if dof_meta.get("rev6_hires_anchor_scale_baked"):
+            return 0, 0
+
+        adjusted_layers = 0
+        adjusted_map_entries = 0
+        anims = payload.get("anims")
+        if not isinstance(anims, list):
+            return 0, 0
+        for anim in anims:
+            if not isinstance(anim, dict):
+                continue
+            layers = anim.get("layers")
+            if not isinstance(layers, list):
+                continue
+            for layer in layers:
+                if not isinstance(layer, dict):
+                    continue
+                layer_changed = False
+                if "anchor_x" in layer:
+                    layer["anchor_x"] = DofRev6PackageWorker._coerce_float(layer.get("anchor_x"), 0.0) * factor_value
+                    layer_changed = True
+                if "anchor_y" in layer:
+                    layer["anchor_y"] = DofRev6PackageWorker._coerce_float(layer.get("anchor_y"), 0.0) * factor_value
+                    layer_changed = True
+
+                anchor_map = layer.get("sprite_anchor_map")
+                if isinstance(anchor_map, dict):
+                    for key, value in list(anchor_map.items()):
+                        if not isinstance(value, (list, tuple)) or len(value) < 2:
+                            continue
+                        anchor_map[key] = [
+                            DofRev6PackageWorker._coerce_float(value[0], 0.0) * factor_value,
+                            DofRev6PackageWorker._coerce_float(value[1], 0.0) * factor_value,
+                        ]
+                        adjusted_map_entries += 1
+                        layer_changed = True
+                if layer_changed:
+                    adjusted_layers += 1
+
+        if adjusted_layers:
+            dof_meta["rev6_hires_anchor_scale_baked"] = factor_value
+        return adjusted_layers, adjusted_map_entries
+
+    @staticmethod
+    def _pick_output_file(paths: List[Path], preferred_stems: List[str]) -> Path:
+        if not paths:
+            raise RuntimeError("Expected converter output was not created.")
+        lowered = [stem.lower() for stem in preferred_stems if stem]
+        for stem in lowered:
+            for path in paths:
+                if path.stem.lower() == stem:
+                    return path
+        return paths[0]
+
+    @staticmethod
+    def _unique_path(path: Path) -> Path:
+        if not path.exists():
+            return path
+        parent = path.parent
+        stem = path.name
+        counter = 2
+        while True:
+            candidate = parent / f"{stem}_{counter}"
+            if not candidate.exists():
+                return candidate
+            counter += 1
+
+    def run(self) -> None:
+        logs: List[Tuple[str, str]] = []
+        temp_root = Path(tempfile.mkdtemp(prefix="dof_rev6_package_"))
+        cleanup_temp = False
+        package_root = Path(self._package_root)
+        try:
+            self._log(logs, f"Preparing temporary workspace: {temp_root}")
+            self._log(logs, f"Input asset: {self._input_path}")
+            self._log(logs, f"Package target: {package_root}")
+            dof_output_dir = temp_root / "xml_resources"
+            dof_output_dir.mkdir(parents=True, exist_ok=True)
+
+            is_bundle = self._input_path.lower().startswith("bundle://")
+            cmd_input = self._input_path
+            cmd = MSMAnimationViewer._build_python_command(self._dof_converter_path) + [
+                cmd_input,
+                "--output",
+                str(dof_output_dir),
+            ]
+            if is_bundle:
+                cmd += ["--bundle-root", self._dof_root, "--assets-root", self._dof_root]
+            else:
+                cmd += ["--assets-root", self._dof_root]
+            cmd += list(self._option_args)
+
+            self._log(logs, "Running DOF converter...")
+            result = MSMAnimationViewer._run_converter_command_blocking(
+                cmd,
+                os.path.dirname(self._dof_converter_path),
+                output_callback=lambda message, level: self._log(logs, message, level),
+            )
+            if result.returncode != 0:
+                message = (result.stderr or result.stdout or "").strip() or "DOF converter failed."
+                raise RuntimeError(message)
+
+            self._log(logs, "DOF converter finished; scanning generated JSON/XML/PNG output.")
+            json_files = sorted(dof_output_dir.glob("*.json"))
+            xml_files = sorted(dof_output_dir.glob("*.xml"))
+            if not json_files:
+                raise RuntimeError("No JSON output produced by DOF converter.")
+            if not xml_files:
+                raise RuntimeError("No XML output produced by DOF converter.")
+
+            preferred_stems = [self._source_stem, Path(self._bin_name).stem]
+            json_path = self._pick_output_file(json_files, preferred_stems)
+            xml_path = self._pick_output_file(xml_files, [json_path.stem, self._source_stem])
+            self._log(logs, f"Selected JSON: {json_path.name}")
+            self._log(logs, f"Selected XML: {xml_path.name}")
+
+            png_candidates = sorted((temp_root / "gfx" / "monsters").glob("*.png"))
+            png_candidates += sorted(dof_output_dir.glob("*.png"))
+            if not png_candidates:
+                raise RuntimeError("No PNG atlas output produced by DOF converter.")
+            png_path = self._pick_output_file(png_candidates, [xml_path.stem, json_path.stem])
+            self._log(logs, f"Selected atlas PNG: {png_path.name}")
+
+            self._log(logs, "Preparing rev6 package folders.")
+            package_temp = temp_root / "package"
+            data_root = package_temp / "data"
+            bin_dir = data_root / "xml_bin"
+            xml_dir = data_root / "xml_resources"
+            png_dir = data_root / "gfx" / "monsters"
+            bin_dir.mkdir(parents=True, exist_ok=True)
+            xml_dir.mkdir(parents=True, exist_ok=True)
+            png_dir.mkdir(parents=True, exist_ok=True)
+
+            image_ref = f"gfx/monsters/{self._png_name}"
+            self._log(logs, "Stripping polygon mesh data from atlas XML for game compatibility.")
+            self._strip_polygon_mesh_xml(xml_path)
+            self._log(logs, f"Rewriting atlas image path to {image_ref}.")
+            self._rewrite_xml_image_path(xml_path, image_ref)
+            self._log(logs, f"Rewriting animation JSON source reference to {self._xml_name}.")
+            payload = self._load_json_with_source(json_path, self._xml_name)
+            normalized_payload_refs = self._normalize_payload_sprite_refs(payload)
+            normalized_atlas_refs = self._normalize_atlas_sprite_names(xml_path)
+            if normalized_payload_refs or normalized_atlas_refs:
+                self._log(
+                    logs,
+                    (
+                        "Normalized DOF sprite lookup names for Rev6 compatibility: "
+                        f"{normalized_payload_refs} animation reference(s), "
+                        f"{normalized_atlas_refs} atlas sprite name(s)."
+                    ),
+                )
+            origin_layers, origin_frames, origin_x, origin_y = self._bake_centered_dof_origin_for_rev6(payload)
+            if origin_frames:
+                self._log(
+                    logs,
+                    (
+                        "Baked centered DOF origin into Rev6 canvas space: "
+                        f"+{origin_x:.3f}, +{origin_y:.3f} on "
+                        f"{origin_frames} position key(s) across {origin_layers} layer(s)."
+                    ),
+                )
+            anchor_layers, anchor_map_entries = self._scale_dof_anchors_for_hires_rev6(payload)
+            if anchor_layers:
+                self._log(
+                    logs,
+                    (
+                        "Scaled DOF anchors for Rev6 hires geometry: "
+                        f"{anchor_layers} layer(s), {anchor_map_entries} swap-anchor entr"
+                        f"{'y' if anchor_map_entries == 1 else 'ies'}."
+                    ),
+                )
+            baked_layers, baked_frames = self._bake_sprite_anchor_maps_for_rev6(payload)
+            if baked_frames:
+                self._log(
+                    logs,
+                    (
+                        "Baked "
+                        f"{baked_frames} sprite-anchor frame adjustment(s) "
+                        f"across {baked_layers} layer(s) for Rev6 BIN geometry."
+                    ),
+                )
+            else:
+                self._log(logs, "No sprite-anchor frame adjustments were needed for the Rev6 BIN.")
+
+            xml_target = xml_dir / self._xml_name
+            png_target = png_dir / self._png_name
+            bin_target = bin_dir / self._bin_name
+            self._log(logs, "Copying atlas XML and PNG into the package.")
+            shutil.copy2(xml_path, xml_target)
+            shutil.copy2(png_path, png_target)
+
+            work_dir = temp_root / "bin_work"
+            work_dir.mkdir(parents=True, exist_ok=True)
+            work_json = work_dir / f"{Path(self._bin_name).stem}.json"
+            self._log(logs, f"Writing temporary rev6 JSON for BIN export: {work_json.name}")
+            work_json.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+            self._log(logs, "Writing rev6 BIN...")
+            bin_cmd = MSMAnimationViewer._build_python_command(self._rev6_converter_path) + [
+                "b",
+                str(work_json),
+            ]
+            bin_result = MSMAnimationViewer._run_converter_command_blocking(
+                bin_cmd,
+                os.path.dirname(self._rev6_converter_path),
+                output_callback=lambda message, level: self._log(logs, message, level),
+            )
+            if bin_result.returncode != 0:
+                message = (bin_result.stderr or bin_result.stdout or "").strip() or "rev6 BIN export failed."
+                raise RuntimeError(message)
+            produced_bin = work_json.with_suffix(".bin")
+            if not produced_bin.exists():
+                raise RuntimeError("rev6 converter completed but no BIN was created.")
+            self._log(logs, f"Copying BIN into package: {self._bin_name}")
+            shutil.copy2(produced_bin, bin_target)
+
+            package_root.parent.mkdir(parents=True, exist_ok=True)
+            package_root = self._unique_path(package_root)
+            self._log(logs, f"Moving completed package to: {package_root}")
+            shutil.move(str(package_temp), str(package_root))
+            cleanup_temp = True
+
+            self.finished.emit(
+                {
+                    "success": True,
+                    "package_root": str(package_root),
+                    "bin_path": str(package_root / "data" / "xml_bin" / self._bin_name),
+                    "xml_path": str(package_root / "data" / "xml_resources" / self._xml_name),
+                    "png_path": str(package_root / "data" / "gfx" / "monsters" / self._png_name),
+                    "logs": logs,
+                    "logs_streamed": True,
+                }
+            )
+        except Exception as exc:
+            self._log(logs, str(exc), "ERROR")
+            self.finished.emit(
+                {
+                    "success": False,
+                    "error": str(exc),
+                    "temp_root": str(temp_root),
+                    "logs": logs,
+                    "logs_streamed": True,
+                }
+            )
+        finally:
+            if cleanup_temp:
+                shutil.rmtree(temp_root, ignore_errors=True)
+
+
 class MSMAnimationViewer(QMainWindow):
     """Main application window"""
-    
-    def __init__(self):
+
+    def __init__(self, simple_viewer_mode: bool = False):
         super().__init__()
 
         self.project_root = _detect_project_root()
@@ -278,6 +1364,10 @@ class MSMAnimationViewer(QMainWindow):
                 # Fallback to default behavior; if it still fails the viewer can continue without faulthandler.
                 pass
         self.settings = QSettings('MSMAnimationViewer', 'Settings')
+        self.performance_profiler_enabled: bool = False
+        self.performance_profiler_slow_threshold_ms: float = 50.0
+        self.performance_profiler_report_interval_sec: float = 8.0
+        self._read_performance_profiler_settings()
         self.shader_registry = ShaderRegistry(self.project_root)
         shader_blob = self.settings.value('shaders/overrides', '', type=str)
         shader_overrides: Dict[str, Any] = {}
@@ -443,6 +1533,8 @@ class MSMAnimationViewer(QMainWindow):
         self.rev2_bin2json_path: Optional[str] = ""
         self.dof_anim_to_json_path: Optional[str] = ""
         self._dof_convert_process: Optional[QProcess] = None
+        self._dof_convert_thread: Optional[QThread] = None
+        self._dof_convert_worker: Optional[QObject] = None
         self._bin_convert_thread: Optional[QThread] = None
         self._bin_convert_worker: Optional[BinConversionWorker] = None
         self._dof_convert_asset_path: Optional[str] = None
@@ -452,15 +1544,17 @@ class MSMAnimationViewer(QMainWindow):
         self._dof_bundle_mode: bool = False
         self._dof_bundle_cache_path: Optional[str] = None
         self._dof_bundle_anim_cache: List[str] = []
+        self._batch_export_fast_switch: bool = False
+        self._batch_export_needs_audio: bool = False
         self._dof_particle_library_root: Optional[str] = None
         self._dof_particle_library: Optional[DofParticleLibrary] = None
         self._dof_particle_entry_cache: Dict[Tuple[str, str], List[ParticleRenderEntry]] = {}
         self._dof_control_point_cache: Dict[Tuple[str, str], Dict[str, DofControlPoint]] = {}
         self._dof_source_node_cache: Dict[Tuple[str, str], Dict[str, DofAnimNode]] = {}
-        # When packaged as an EXE, repeated QMessageBox warnings for failed bin parses
-        # become disruptive. Suppress those modals in frozen builds and rely on the log.
-        self._suppress_bin_error_popups: bool = bool(getattr(sys, "frozen", False))
-        
+        # Repeated QMessageBox warnings during converter fallback attempts are
+        # especially disruptive on Windows. Rely on the log for these paths.
+        self._suppress_bin_error_popups: bool = bool(getattr(sys, "frozen", False) or os.name == "nt")
+
         self.current_json_data: Optional[Dict] = None
         self.original_json_data: Optional[Dict] = None
         self.current_blend_version: int = 1
@@ -488,9 +1582,12 @@ class MSMAnimationViewer(QMainWindow):
         self._island_name_by_id: Dict[int, str] = {}
         self.current_search_text: str = ""
         self._downloads_xml_bin_roots: List[str] = []
-        
+
         # Export settings
         self.export_settings = ExportSettings()
+        if not self.export_settings.use_barebones_file_browser and self.dof_search_enabled:
+            self.dof_search_enabled = False
+            self.settings.setValue('dof/search_enabled', False)
         self.anchor_debug_enabled: bool = bool(self.export_settings.anchor_debug_logging)
         self.constraints_enabled: bool = bool(self.settings.value('constraints/enabled', True, type=bool))
         self.constraints: List[ConstraintSpec] = self._load_constraints_from_settings()
@@ -545,6 +1642,7 @@ class MSMAnimationViewer(QMainWindow):
         self.active_costume_key: Optional[str] = None
         self.base_layer_cache: Optional[List[LayerData]] = None
         self.base_texture_atlases: List[TextureAtlas] = []
+        self.base_atlas_cache: Dict[Tuple[Any, ...], TextureAtlas] = {}
         self.costume_atlas_cache: Dict[str, TextureAtlas] = {}
         self.animation_shader_runtime_overrides: Dict[str, Dict[str, Any]] = {}
         self.active_costume_attachments: List[Dict[str, Any]] = []
@@ -588,6 +1686,11 @@ class MSMAnimationViewer(QMainWindow):
         )
         self.export_include_viewport_background: bool = self.settings.value(
             'export/include_viewport_background',
+            False,
+            type=bool,
+        )
+        self.export_all_loaded_animations: bool = self.settings.value(
+            'export/all_loaded_animations',
             False,
             type=bool,
         )
@@ -662,6 +1765,15 @@ class MSMAnimationViewer(QMainWindow):
             False,
             type=bool,
         )
+        self.spatial3d_support_enabled: bool = False
+        self.spatial3d_view_enabled: bool = False
+        self.spatial3d_mode: str = "spatiallabs"
+        self.spatial3d_swap_eyes: bool = False
+        self.spatial3d_depth_strength: float = 0.5
+        self.spatial3d_screen_plane: float = 0.0
+        self.spatial3d_view_x: float = 0.0
+        self.spatial3d_view_y: float = 0.0
+        self._read_spatial3d_settings()
         self._layer_thumbnail_cache: Dict[object, Optional[QPixmap]] = {}
         self._atlas_image_cache: Dict[str, Optional[Image.Image]] = {}
         self._layer_sprite_preview_state: Dict[int, Tuple[Any, ...]] = {}
@@ -685,7 +1797,13 @@ class MSMAnimationViewer(QMainWindow):
         self._migration_settings_bridge: Optional[SettingsDialog] = None
         self._dof_asset_grabber_dialog: Optional[DofAssetGrabberDialog] = None
         self._migration_panel_profiles: List[Dict[str, Any]] = []
+        self._migration_source_scope_key: str = "all"
+        self._migration_source_scope: Dict[str, Any] = {"key": "all", "mode": "all"}
         self._migration_last_output_path: str = ""
+        self._migration_last_preview_animation_names: List[str] = []
+        self._migration_last_preview_dof_output_path: str = ""
+        self._migration_current_preview_force_dof_pivots: bool = False
+        self._dof_migration_context: Optional[Dict[str, Any]] = None
         self._keyframe_clipboard: Optional[Dict[str, Any]] = None
         self._hang_watchdog_active: bool = False
         self.buddy_audio_tracks: Dict[str, str] = {}
@@ -706,9 +1824,22 @@ class MSMAnimationViewer(QMainWindow):
         self._panel_toggle_guard: bool = False
         self._compact_ui_enabled: bool = False
         self._simple_mode_enabled: bool = False
+        self._simple_viewer_mode_enabled: bool = bool(simple_viewer_mode)
+        self._simple_viewer_baked_animation_id: Optional[int] = None
+        self._simple_viewer_banner_logged: bool = False
+        self._basic_costume_refresh_generation: int = 0
+        self._basic_audio_load_generation: int = 0
+        self._automatic_revision_grabber_enabled: bool = bool(
+            self.settings.value("ui/automatic_revision_grabber", True, type=bool)
+        )
+        self._simple_bin_revision_key: str = self._normalize_simple_bin_revision_key(
+            self.settings.value("ui/simple_bin_revision", "rev6", type=str)
+        )
         self._focus_restore: Optional[Tuple[bool, bool]] = None
         self._timeline_visible: bool = True
         self._content_splitter_last_sizes: Optional[List[int]] = None
+        self._content_splitter_programmatic_update: bool = False
+        self._startup_timeline_minimize_after_show_done: bool = False
         self._log_visible: bool = True
         self._log_splitter_last_sizes: Optional[List[int]] = None
         self.viewport_tool_mode: str = "cursor"
@@ -719,6 +1850,10 @@ class MSMAnimationViewer(QMainWindow):
         self.monster_migration_panel: Optional[MonsterMigrationPanel] = None
         self._active_right_panel_mode: str = "layers"
         self.viewport_tool_buttons: List[QToolButton] = []
+        self.viewport_tool_play_slots: List[PlaybackButtonDropSlot] = []
+        self._play_button_location: str = str(
+            self.settings.value("ui/play_button_location", "timeline", type=str) or "timeline"
+        )
         self.viewport_tool_cursor_btn: Optional[QToolButton] = None
         self.viewport_tool_zoom_btn: Optional[QToolButton] = None
         self.blue_mode_toggle_btn: Optional[QToolButton] = None
@@ -729,9 +1864,14 @@ class MSMAnimationViewer(QMainWindow):
         self._viewport_zoom_cursor: Optional[QCursor] = None
         self._ui_theme_base_palette: Optional[QPalette] = None
         self._ui_theme_tertiary_color: Optional[QColor] = None
+        self._ui_theme_quaternary_color: Optional[QColor] = None
+        self._ui_base_font: Optional[QFont] = None
+        self._ui_scale_factor: float = self._read_ui_scale_factor()
 
+        self._apply_ui_scale_from_settings(refresh_widgets=False)
         self._apply_ui_theme_colors()
         self.init_ui()
+        self._apply_ui_theme_colors()
         self._apply_anchor_logging_preferences()
         self._setup_shortcuts()
         self.audio_manager = AudioManager(self)
@@ -758,38 +1898,58 @@ class MSMAnimationViewer(QMainWindow):
         self.multi_view_containers: List[QWidget] = []
         self.multi_view_labels: List[QLabel] = []
         self.load_settings()
-        
+        if self._simple_viewer_mode_enabled:
+            self._apply_simple_viewer_launch_mode()
+        self._schedule_startup_timeline_minimize()
+
         # Find bin2json script
         self.find_bin2json()
-    
+
     def init_ui(self):
         """Initialize the user interface"""
         self.setWindowTitle("My Singing Monsters Animation Viewer")
         self.setGeometry(100, 100, 1400, 900)
-        
+
         # Central widget
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
-        
+
         main_layout = QVBoxLayout(central_widget)
-        
+
         # Top toolbar
         toolbar_layout = QHBoxLayout()
-        
+
         self.path_label = QLabel("Game Path: Not Set")
         toolbar_layout.addWidget(self.path_label)
-        
-        browse_btn = QPushButton("Browse Game Path")
-        browse_btn.clicked.connect(self.browse_game_path)
-        toolbar_layout.addWidget(browse_btn)
 
-        dof_browse_btn = QPushButton("Browse DOF Game Path")
-        dof_browse_btn.clicked.connect(self.browse_dof_path)
-        toolbar_layout.addWidget(dof_browse_btn)
+        self.simple_bin_revision_label = QLabel("BIN revision:")
+        toolbar_layout.addWidget(self.simple_bin_revision_label)
 
-        downloads_browse_btn = QPushButton("Browse Downloads Path")
-        downloads_browse_btn.clicked.connect(self.browse_downloads_path)
-        toolbar_layout.addWidget(downloads_browse_btn)
+        self.simple_bin_revision_combo = QComboBox()
+        self.simple_bin_revision_combo.setToolTip(
+            "Manual mode: choose the BIN parser directly when Automatic revision grabber is disabled."
+        )
+        for label, key in self._simple_bin_revision_options():
+            self.simple_bin_revision_combo.addItem(label, key)
+        selected_revision_index = self.simple_bin_revision_combo.findData(self._simple_bin_revision_key)
+        if selected_revision_index < 0:
+            selected_revision_index = self.simple_bin_revision_combo.findData("rev6")
+        self.simple_bin_revision_combo.setCurrentIndex(max(0, selected_revision_index))
+        self.simple_bin_revision_combo.currentIndexChanged.connect(self._on_simple_bin_revision_changed)
+        toolbar_layout.addWidget(self.simple_bin_revision_combo)
+        self._apply_bin_revision_selector_visibility()
+
+        self.browse_game_path_btn = QPushButton("Browse Game Path")
+        self.browse_game_path_btn.clicked.connect(self.browse_game_path)
+        toolbar_layout.addWidget(self.browse_game_path_btn)
+
+        self.dof_browse_btn = QPushButton("Browse DOF Game Path")
+        self.dof_browse_btn.clicked.connect(self.browse_dof_path)
+        toolbar_layout.addWidget(self.dof_browse_btn)
+
+        self.downloads_browse_btn = QPushButton("Browse Downloads Path")
+        self.downloads_browse_btn.clicked.connect(self.browse_downloads_path)
+        toolbar_layout.addWidget(self.downloads_browse_btn)
 
         toolbar_layout.addStretch()
 
@@ -841,14 +2001,14 @@ class MSMAnimationViewer(QMainWindow):
             )
             self.blue_mode_toggle_btn.toggled.connect(self.on_blue_mode_toggled)
             toolbar_layout.addWidget(self.blue_mode_toggle_btn)
-        
-        sprite_workshop_btn = QPushButton("Sprite Workshop")
-        sprite_workshop_btn.clicked.connect(self.show_sprite_workshop)
-        toolbar_layout.addWidget(sprite_workshop_btn)
 
-        midi_editor_btn = QPushButton("MIDI Editor")
-        midi_editor_btn.clicked.connect(self.show_midi_editor)
-        toolbar_layout.addWidget(midi_editor_btn)
+        self.sprite_workshop_btn = QPushButton("Sprite Workshop")
+        self.sprite_workshop_btn.clicked.connect(self.show_sprite_workshop)
+        toolbar_layout.addWidget(self.sprite_workshop_btn)
+
+        self.midi_editor_btn = QPushButton("MIDI Editor")
+        self.midi_editor_btn.clicked.connect(self.show_midi_editor)
+        toolbar_layout.addWidget(self.midi_editor_btn)
 
         self.multi_view_btn = QPushButton("Multi View…")
         self.multi_view_btn.setToolTip("Load additional animations side-by-side in the viewer")
@@ -861,16 +2021,16 @@ class MSMAnimationViewer(QMainWindow):
         self.clear_multi_view_btn.clicked.connect(self.clear_multi_view_animations)
         toolbar_layout.addWidget(self.clear_multi_view_btn)
 
-        settings_btn = QPushButton("Settings")
-        settings_btn.clicked.connect(self.show_settings)
-        toolbar_layout.addWidget(settings_btn)
-        
+        self.settings_btn = QPushButton("Settings")
+        self.settings_btn.clicked.connect(self.show_settings)
+        toolbar_layout.addWidget(self.settings_btn)
+
         main_layout.addLayout(toolbar_layout)
-        
+
         # Splitter for main content
         self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
         self.main_splitter.setHandleWidth(2)
-        
+
         # Left panel - Controls
         self.control_panel = ControlPanel()
         self.control_panel.set_bpm_value(self.current_bpm)
@@ -881,6 +2041,7 @@ class MSMAnimationViewer(QMainWindow):
         self.control_panel.set_solid_bg_color(self.solid_bg_color)
         self.control_panel.set_viewport_bg_color_mode(self.viewport_bg_color_mode)
         self.control_panel.set_export_include_viewport_bg(self.export_include_viewport_background)
+        self.control_panel.set_export_all_animations(self.export_all_loaded_animations)
         self.control_panel.set_viewport_bg_enabled(self.viewport_bg_enabled)
         self.control_panel.set_viewport_bg_keep_aspect(self.viewport_bg_keep_aspect)
         self.control_panel.set_viewport_bg_zoom_fill(self.viewport_bg_zoom_fill)
@@ -907,6 +2068,7 @@ class MSMAnimationViewer(QMainWindow):
         self.control_panel.set_propagate_user_transforms(self.propagate_user_transforms)
         self.control_panel.set_preserve_children_on_record(self.preserve_children_on_record)
         self.control_panel.set_simple_keyframe_mode(self.simple_keyframe_mode)
+        self._sync_spatial3d_controls()
         self.control_panel_host = QWidget()
         control_panel_host_layout = QVBoxLayout(self.control_panel_host)
         control_panel_host_layout.setContentsMargins(0, 0, 0, 0)
@@ -916,7 +2078,7 @@ class MSMAnimationViewer(QMainWindow):
         self.control_panel_host.setMinimumWidth(200)
         self.main_splitter.addWidget(self.control_panel_host)
         self._apply_control_panel_width_policy()
-        
+
         # Center - OpenGL viewer
         self.gl_widget = OpenGLAnimationWidget(shader_registry=self.shader_registry)
         self.gl_widget.set_costume_pivot_adjustment_enabled(False)
@@ -953,6 +2115,7 @@ class MSMAnimationViewer(QMainWindow):
         )
         self.gl_widget.set_viewport_background_image_enabled(self.viewport_bg_image_enabled)
         self.gl_widget.set_viewport_background_image_path(self.viewport_bg_image_path)
+        self._apply_spatial3d_settings_to_widget(self.gl_widget)
         self._refresh_viewport_tool_buttons()
         self.gl_widget.animation_time_changed.connect(self.on_animation_time_changed)
         self.gl_widget.animation_looped.connect(self.on_animation_looped)
@@ -960,6 +2123,7 @@ class MSMAnimationViewer(QMainWindow):
         self.gl_widget.transform_action_committed.connect(self._record_transform_action)
         self.gl_widget.tile_render_stats.connect(self._on_tile_render_stats)
         self.gl_widget.runtime_error.connect(self._on_gl_runtime_error)
+        self.gl_widget.spatial3d_status_changed.connect(self.on_spatial3d_status_changed)
         stored_tile_path = self.settings.value("terrain/tile_render_path", "", type=str) or ""
         if stored_tile_path:
             self.gl_widget.set_tile_render_path(stored_tile_path)
@@ -1020,7 +2184,7 @@ class MSMAnimationViewer(QMainWindow):
         self.control_panel.terrain_tile_y_spin.valueChanged.connect(self._on_terrain_tile_transform_changed)
         self.control_panel.terrain_tile_rot_spin.valueChanged.connect(self._on_terrain_tile_transform_changed)
         self.control_panel.terrain_tile_scale_spin.valueChanged.connect(self._on_terrain_tile_transform_changed)
-        
+
         # Right panel - Layer visibility
         self.layer_panel = LayerPanel()
         self.connect_layer_panel_signals()
@@ -1043,7 +2207,7 @@ class MSMAnimationViewer(QMainWindow):
         self.right_panel_host.setMaximumWidth(420)
 
         self.main_splitter.addWidget(self.right_panel_host)
-        
+
         self.main_splitter.setCollapsible(0, True)
         self.main_splitter.setCollapsible(1, False)
         self.main_splitter.setCollapsible(2, True)
@@ -1052,15 +2216,18 @@ class MSMAnimationViewer(QMainWindow):
         self.main_splitter.setStretchFactor(2, 0)
         self.main_splitter.setSizes([520, 860, 320])
         self.main_splitter.splitterMoved.connect(self._on_main_splitter_moved)
-        
+
         # Timeline and log inside a vertical splitter
         self.timeline = TimelineWidget()
         self.connect_timeline_signals()
+        self.timeline.play_button_drop_requested.connect(self._on_play_button_drop_requested)
         self.timeline.set_beat_grid_visible(self.show_beat_grid)
         self.timeline.set_beat_edit_enabled(self.show_beat_grid and self.allow_beat_edit)
+        self._move_play_button_to_location(self._play_button_location, save=False)
         self.log_widget = LogWidget()
         self._init_diagnostics()
-        
+        self._configure_performance_profiler(reset=True)
+
         self.content_splitter = QSplitter(Qt.Orientation.Vertical)
         self.content_splitter.setHandleWidth(2)
         self.content_splitter.addWidget(self.main_splitter)
@@ -1070,7 +2237,7 @@ class MSMAnimationViewer(QMainWindow):
         self.content_splitter.setCollapsible(1, True)
         self.content_splitter.setSizes([700, 200])
         self.content_splitter.splitterMoved.connect(self._on_content_splitter_moved)
-        
+
         self.log_splitter = QSplitter(Qt.Orientation.Vertical)
         self.log_splitter.addWidget(self.content_splitter)
         self.log_splitter.addWidget(self.log_widget)
@@ -1078,10 +2245,12 @@ class MSMAnimationViewer(QMainWindow):
         self.log_splitter.setStretchFactor(1, 1)
         self.log_splitter.setCollapsible(1, True)
         self.log_splitter.splitterMoved.connect(self._on_log_splitter_moved)
-        
+
         main_layout.addWidget(self.log_splitter, stretch=1)
 
         self.log_widget.log("Application started", "INFO")
+        if self.performance_profiler_enabled:
+            self.log_widget.log("Performance profiler enabled.", "INFO")
         self._update_right_panel_mode(force_refresh=True)
         app = QApplication.instance()
         if app:
@@ -1130,6 +2299,99 @@ class MSMAnimationViewer(QMainWindow):
         color = QColor(str(raw).strip())
         return color if color.isValid() else None
 
+    def _read_ui_scale_factor(self) -> float:
+        return clamp_ui_scale(self.settings.value("ui/scale_factor", 1.0, type=float))
+
+    def _ui_scaled_int(self, value: int, *, minimum: int = 1) -> int:
+        return scale_int(value, getattr(self, "_ui_scale_factor", 1.0), minimum=minimum)
+
+    def _apply_ui_scale_from_settings(
+        self,
+        *,
+        save: bool = False,
+        refresh_widgets: bool = True,
+    ) -> None:
+        self._apply_ui_scale(
+            self._read_ui_scale_factor(),
+            save=save,
+            refresh_widgets=refresh_widgets,
+        )
+
+    def _apply_ui_scale(
+        self,
+        factor: float,
+        *,
+        save: bool = False,
+        refresh_widgets: bool = True,
+    ) -> None:
+        self._ui_scale_factor = clamp_ui_scale(factor)
+        app = QApplication.instance()
+        if app is not None:
+            if self._ui_base_font is None:
+                self._ui_base_font = QFont(app.font())
+            base_font = self._ui_base_font
+            scaled_font = QFont(base_font)
+            if base_font.pointSizeF() > 0:
+                scaled_font.setPointSizeF(max(1.0, base_font.pointSizeF() * self._ui_scale_factor))
+            elif base_font.pixelSize() > 0:
+                scaled_font.setPixelSize(scale_int(base_font.pixelSize(), self._ui_scale_factor, minimum=1))
+            app.setFont(scaled_font)
+            self.setFont(scaled_font)
+        if save:
+            self.settings.setValue("ui/scale_factor", self._ui_scale_factor)
+        if refresh_widgets:
+            self._apply_widget_ui_scale()
+
+    def _apply_stylesheet_ui_scale(self, root: QWidget) -> None:
+        widgets = [root]
+        widgets.extend(root.findChildren(QWidget))
+        for widget in widgets:
+            current_style = widget.styleSheet()
+            last_scaled = widget.property("_ui_scale_last_stylesheet")
+            base_style = widget.property("_ui_scale_base_stylesheet")
+            if current_style != last_scaled:
+                base_style = current_style
+                widget.setProperty("_ui_scale_base_stylesheet", base_style)
+
+            scaled_style = scale_stylesheet_font_sizes(base_style or "", self._ui_scale_factor)
+            if current_style != scaled_style:
+                widget.setStyleSheet(scaled_style)
+            widget.setProperty("_ui_scale_last_stylesheet", scaled_style)
+
+            style = widget.style()
+            if style is not None:
+                try:
+                    style.unpolish(widget)
+                    style.polish(widget)
+                except Exception:
+                    pass
+            widget.updateGeometry()
+
+    def _apply_widget_ui_scale(self) -> None:
+        self._apply_stylesheet_ui_scale(self)
+
+        for attr_name in (
+            "control_panel",
+            "layer_panel",
+            "timeline",
+            "monster_migration_panel",
+        ):
+            widget = getattr(self, attr_name, None)
+            if widget is not None and hasattr(widget, "set_ui_scale_factor"):
+                widget.set_ui_scale_factor(self._ui_scale_factor)
+
+        if getattr(self, "control_panel_host", None) is not None:
+            self.control_panel_host.setMinimumWidth(self._ui_scaled_int(200))
+        if getattr(self, "right_panel_host", None) is not None:
+            self.right_panel_host.setMinimumWidth(self._ui_scaled_int(200))
+            self.right_panel_host.setMaximumWidth(self._ui_scaled_int(420))
+        if hasattr(self, "control_panel"):
+            self._apply_control_panel_width_policy()
+        self._apply_viewport_tool_button_sizes()
+        if hasattr(self, "content_splitter"):
+            self._set_timeline_splitter_to_minimum_expanded()
+        self.updateGeometry()
+
     def _apply_ui_theme_colors(self) -> None:
         app = QApplication.instance()
         if app is None:
@@ -1142,10 +2404,13 @@ class MSMAnimationViewer(QMainWindow):
         primary_enabled = bool(self.settings.value("ui/theme/primary_enabled", False, type=bool))
         secondary_enabled = bool(self.settings.value("ui/theme/secondary_enabled", False, type=bool))
         tertiary_enabled = bool(self.settings.value("ui/theme/tertiary_enabled", False, type=bool))
+        quaternary_enabled = bool(self.settings.value("ui/theme/quaternary_enabled", False, type=bool))
         primary_color = self._theme_setting_color("ui/theme/primary_color") if primary_enabled else None
         secondary_color = self._theme_setting_color("ui/theme/secondary_color") if secondary_enabled else None
         tertiary_color = self._theme_setting_color("ui/theme/tertiary_color") if tertiary_enabled else None
+        quaternary_color = self._theme_setting_color("ui/theme/quaternary_color") if quaternary_enabled else None
         self._ui_theme_tertiary_color = QColor(tertiary_color) if tertiary_color is not None else None
+        self._ui_theme_quaternary_color = QColor(quaternary_color) if quaternary_color is not None else None
 
         if primary_color is not None:
             base_color = palette.color(QPalette.ColorRole.Base)
@@ -1199,9 +2464,13 @@ class MSMAnimationViewer(QMainWindow):
             self._apply_viewport_tool_button_styles()
         if hasattr(self, "timeline") and self.timeline is not None:
             self.timeline.set_keyframe_marker_colors(self._ui_theme_tertiary_color)
+            if hasattr(self.timeline, "set_timeline_slider_tint_color"):
+                self.timeline.set_timeline_slider_tint_color(self._ui_theme_quaternary_color)
         self.update()
 
     def _apply_ui_preferences(self):
+        self._apply_ui_scale_from_settings(save=False, refresh_widgets=True)
+        self._apply_bin_revision_preferences()
         compact = bool(self.settings.value("ui/compact_ui", False, type=bool))
         self._set_compact_ui(compact, save=False)
         simple_mode = bool(self.settings.value("ui/simple_mode", False, type=bool))
@@ -1228,8 +2497,172 @@ class MSMAnimationViewer(QMainWindow):
             self._set_focus_mode(True, save=False)
         else:
             self._set_panel_visibility(left_visible, right_visible, save=False)
-        self._set_timeline_visibility(timeline_visible, save=False)
-        self._set_log_visibility(log_visible, save=False)
+        self._set_timeline_visibility(timeline_visible, save=False, force=True)
+        self._set_log_visibility(log_visible, save=False, force=True)
+
+    def _schedule_startup_timeline_minimize(self) -> None:
+        for delay_ms in (0, 25, 100, 250):
+            QTimer.singleShot(delay_ms, self._set_timeline_splitter_to_minimum_expanded)
+
+    def _minimum_expanded_timeline_height(self) -> int:
+        timeline = getattr(self, "timeline", None)
+        if timeline is None:
+            return 1
+        timeline.ensurePolished()
+        layout = timeline.layout()
+        if layout is not None:
+            layout.activate()
+            layout_min = layout.minimumSize().height()
+        else:
+            layout_min = 0
+        min_hint = timeline.minimumSizeHint().height()
+        return max(1, int(min_hint), int(layout_min))
+
+    def _set_timeline_splitter_to_minimum_expanded(self) -> None:
+        if not self._timeline_visible:
+            return
+        if not hasattr(self, "content_splitter") or not hasattr(self, "timeline"):
+            return
+        self.timeline.setVisible(True)
+        sizes = self.content_splitter.sizes()
+        total = sum(sizes) if sizes else 0
+        if total <= 1:
+            total = max(1, int(self.content_splitter.height() or self.height()))
+        if total <= 1:
+            return
+        timeline_height = min(max(1, self._minimum_expanded_timeline_height()), total - 1)
+        self._content_splitter_programmatic_update = True
+        try:
+            self.content_splitter.setSizes([max(1, total - timeline_height), timeline_height])
+        finally:
+            self._content_splitter_programmatic_update = False
+
+    def _simple_viewer_cache_fps(self) -> int:
+        try:
+            value = int(self.control_panel.fps_spin.value())
+        except Exception:
+            value = 60
+        return max(1, min(240, value))
+
+    @staticmethod
+    def _simple_bin_revision_options() -> List[Tuple[str, str]]:
+        return [
+            ("Rev6", "rev6"),
+            ("Rev5", "rev5"),
+            ("Rev4", "rev4"),
+            ("Rev3 (Monster Choir)", "choir"),
+            ("Rev2", "rev2"),
+            ("Rev2 (My Muppets Show)", "muppets"),
+            ("Rev1", "rev1_classic"),
+            ("Rev1 (Legacy Mobile)", "legacy"),
+        ]
+
+    @staticmethod
+    def _normalize_simple_bin_revision_key(value: Optional[str]) -> str:
+        key = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+        aliases = {
+            "": "rev6",
+            "auto": "rev6",
+            "auto_detect": "rev6",
+            "autodetect": "rev6",
+            "automatic": "rev6",
+            "rev3": "choir",
+            "rev2_muppets": "muppets",
+            "muppet": "muppets",
+            "muppets_show": "muppets",
+            "rev1": "rev1_classic",
+            "oldest": "rev1_classic",
+            "rev1_launch": "rev1_classic",
+            "classic": "rev1_classic",
+            "rev1_legacy": "legacy",
+            "legacy_mobile": "legacy",
+        }
+        key = aliases.get(key, key)
+        valid = {option_key for _label, option_key in MSMAnimationViewer._simple_bin_revision_options()}
+        if key in valid:
+            return key
+        return "rev6"
+
+    def _selected_basic_bin_converter_key(self) -> Optional[str]:
+        if self._automatic_revision_grabber_enabled:
+            return None
+        key = self._normalize_simple_bin_revision_key(self._simple_bin_revision_key)
+        return key
+
+    def _apply_bin_revision_preferences(self) -> None:
+        self._automatic_revision_grabber_enabled = bool(
+            self.settings.value("ui/automatic_revision_grabber", True, type=bool)
+        )
+        self._apply_bin_revision_selector_visibility()
+
+    def _apply_bin_revision_selector_visibility(self) -> None:
+        manual_visible = not bool(getattr(self, "_automatic_revision_grabber_enabled", True))
+        for attr_name in ("simple_bin_revision_label", "simple_bin_revision_combo"):
+            widget = getattr(self, attr_name, None)
+            if widget is not None:
+                widget.setVisible(manual_visible)
+
+    def _basic_viewer_fast_load_enabled(self) -> bool:
+        return bool(self._simple_viewer_mode_enabled)
+
+    def _on_simple_bin_revision_changed(self, _index: int) -> None:
+        combo = getattr(self, "simple_bin_revision_combo", None)
+        if combo is None:
+            return
+        key = self._normalize_simple_bin_revision_key(combo.currentData())
+        self._simple_bin_revision_key = key
+        self.settings.setValue("ui/simple_bin_revision", key)
+
+    def _apply_simple_viewer_launch_mode(self) -> None:
+        """Apply the launch-only focused viewing/export profile."""
+        self._set_compact_ui(True, save=False)
+        if hasattr(self.control_panel, "set_basic_viewer_mode"):
+            self.control_panel.set_basic_viewer_mode(True)
+            self.control_panel.set_active_section("files")
+        if hasattr(self, "gl_widget"):
+            self.gl_widget.set_baked_frame_cache_enabled(True, fps=self._simple_viewer_cache_fps())
+        if self._focus_mode_enabled:
+            self._set_focus_mode(False, save=False)
+        self._set_panel_visibility(True, False, save=False)
+        self._set_log_visibility(False, save=False, force=True)
+        self._apply_simple_viewer_toolbar_visibility()
+        self._update_panel_toggle_buttons()
+        if not self._simple_viewer_banner_logged:
+            self.log_widget.log(
+                "Basic mode enabled: focused controls and evaluated frame cache active.",
+                "INFO",
+            )
+            self._simple_viewer_banner_logged = True
+
+    def _apply_simple_viewer_toolbar_visibility(self) -> None:
+        if not self._simple_viewer_mode_enabled:
+            return
+        for attr_name in (
+            "sprite_workshop_btn",
+            "midi_editor_btn",
+            "multi_view_btn",
+            "clear_multi_view_btn",
+            "layers_toggle_btn",
+            "log_toggle_btn",
+            "focus_mode_btn",
+        ):
+            widget = getattr(self, attr_name, None)
+            if widget is not None:
+                widget.setVisible(False)
+        self._apply_bin_revision_selector_visibility()
+
+    def _start_simple_viewer_bake_for_current_animation(self) -> None:
+        if not self._simple_viewer_mode_enabled:
+            return
+        gl_widget = getattr(self, "gl_widget", None)
+        if gl_widget is None or not gl_widget.player.animation:
+            return
+        fps = self._simple_viewer_cache_fps()
+        gl_widget.set_baked_frame_cache_enabled(True, fps=fps)
+        animation_id = id(gl_widget.player.animation)
+        self._simple_viewer_baked_animation_id = animation_id
+        gl_widget.start_baked_frame_cache_prewarm(fps=fps)
+        self.log_widget.log(f"Pre-baking evaluated frames for basic mode at {fps} FPS.", "INFO")
 
     def _apply_control_panel_preferences(self):
         if not hasattr(self, "control_panel"):
@@ -1314,7 +2747,11 @@ class MSMAnimationViewer(QMainWindow):
             return
         panel.run_requested.connect(self._on_migration_panel_run_requested)
         panel.preview_source_requested.connect(self._on_migration_panel_preview_source_requested)
+        panel.preview_target_requested.connect(self._on_migration_panel_preview_target_requested)
         panel.preview_output_requested.connect(self._on_migration_panel_preview_output_requested)
+        panel.source_tracks_requested.connect(self._on_migration_panel_source_tracks_requested)
+        panel.target_tracks_requested.connect(self._on_migration_panel_target_tracks_requested)
+        panel.source_location_changed.connect(self._on_migration_panel_source_location_changed)
         panel.refresh_requested.connect(self._on_migration_panel_refresh_requested)
         panel.open_legacy_tools_requested.connect(self.show_settings)
 
@@ -1331,6 +2768,7 @@ class MSMAnimationViewer(QMainWindow):
             available_revisions=available_revisions,
             active_profile_index=active_profile_index,
         )
+        panel.set_source_location_key(self._migration_source_scope_key, emit=False)
         panel.set_last_output_path(self._migration_last_output_path)
 
     def _set_right_panel_mode(self, mode: str) -> None:
@@ -1351,6 +2789,10 @@ class MSMAnimationViewer(QMainWindow):
             return
         if section_key is None:
             section_key = control_panel.current_section_key()
+        if self._basic_viewer_fast_load_enabled():
+            if self._active_right_panel_mode != "layers":
+                self._set_right_panel_mode("layers")
+            return
         is_export = str(section_key or "").strip().lower() == "export"
         target_mode = "migration" if is_export else "layers"
         mode_changed = target_mode != self._active_right_panel_mode
@@ -1364,6 +2806,24 @@ class MSMAnimationViewer(QMainWindow):
     def _on_migration_panel_refresh_requested(self) -> None:
         self._refresh_monster_migration_panel_context()
 
+    def _on_migration_panel_source_location_changed(self, scope: object) -> None:
+        if not isinstance(scope, dict):
+            scope = {"key": "all", "mode": "all"}
+        key = str(scope.get("key") or "all")
+        mode = str(scope.get("mode") or "all")
+        if mode not in {"all", "profile", "path"}:
+            scope = {"key": "all", "mode": "all"}
+            key = "all"
+        self._migration_source_scope_key = key
+        self._migration_source_scope = dict(scope)
+        if self.monster_migration_panel is not None:
+            self.monster_migration_panel.set_source_location_key(key, emit=False)
+        if key == "all":
+            self.log_widget.log("Migration source discovery reset to all configured program paths.", "INFO")
+        else:
+            self.log_widget.log("Migration source discovery changed to selected configured path scope.", "INFO")
+        self._refresh_monster_migration_panel_context()
+
     def _on_migration_panel_run_requested(self, request: object) -> None:
         if not isinstance(request, MonsterMigrationRequest):
             return
@@ -1375,6 +2835,9 @@ class MSMAnimationViewer(QMainWindow):
                 "No path profiles are configured. Add one in Settings -> Paths first.",
             )
             return
+        if request.source.is_dof_source:
+            self._start_dof_monster_migration(request, profiles)
+            return
         success = self._run_monster_migration(request, profiles)
         if not success:
             return
@@ -1384,13 +2847,101 @@ class MSMAnimationViewer(QMainWindow):
             self._on_migration_panel_preview_output_requested(self._migration_last_output_path)
 
     def _on_migration_panel_preview_source_requested(self, source: object) -> None:
+        preferred_animation_names: Optional[List[str]] = None
+        if isinstance(source, dict):
+            preferred_raw = source.get("preferred_animation_names")
+            if isinstance(preferred_raw, list):
+                preferred_animation_names = [str(name) for name in preferred_raw if str(name or "").strip()]
+            source = source.get("source")
         if not isinstance(source, MigrationSourceOption):
+            return
+        if source.is_dof_source:
+            preview_json = source.json_path
+            if not preview_json and source.dof_root and source.dof_input_path:
+                preview_json = self._dof_output_json_for_root_input(source.dof_root, source.dof_input_path)
+            if preview_json and os.path.exists(preview_json):
+                self._load_migration_preview_path(
+                    preview_json,
+                    f"DOF source {source.stem}",
+                    preferred_animation_names=preferred_animation_names,
+                )
+                return
+            QMessageBox.information(
+                self,
+                "Preview Requires JSON",
+                "This DOF source has not been converted to JSON yet. Run migration to create the Rev6 package, or convert it from the Files tab first.",
+            )
             return
         source_path = source.preferred_source_path
         if not source_path:
             QMessageBox.warning(self, "Missing Source", "Selected source has no readable BIN/JSON path.")
             return
-        self._load_migration_preview_path(source_path, f"source {source.stem}")
+        self._load_migration_preview_path(
+            source_path,
+            f"source {source.stem}",
+            preferred_animation_names=preferred_animation_names,
+        )
+
+    def _on_migration_panel_source_tracks_requested(self, source: object) -> None:
+        panel = getattr(self, "monster_migration_panel", None)
+        if panel is None or not isinstance(source, MigrationSourceOption):
+            return
+        tracks = self._migration_track_names_for_source(source)
+        panel.set_source_track_options(source, tracks)
+
+    def _on_migration_panel_preview_target_requested(self, payload: object) -> None:
+        if not isinstance(payload, dict):
+            return
+        try:
+            profile_index = int(payload.get("profile_index", 0))
+        except (TypeError, ValueError):
+            profile_index = 0
+        profiles = list(self._migration_panel_profiles or [])
+        if profile_index < 0 or profile_index >= len(profiles):
+            QMessageBox.warning(self, "Missing Target", "Choose a valid target profile.")
+            return
+        target_token = self._normalize_migration_token(str(payload.get("target_token") or ""))
+        if not target_token:
+            QMessageBox.warning(self, "Missing Target", "Enter a target monster token first.")
+            return
+        record = self._find_main_game_monster_record(profiles[profile_index], f"monster_{target_token}")
+        if not record or not record.has_source():
+            QMessageBox.warning(
+                self,
+                "Missing Target",
+                f"Could not find monster_{target_token} in the selected target profile's main game path.",
+            )
+            return
+        target_path = record.bin_path or record.json_path
+        if not target_path:
+            QMessageBox.warning(self, "Missing Target", "Selected target has no readable BIN/JSON path.")
+            return
+        preferred_raw = payload.get("preferred_animation_names")
+        preferred_animation_names: Optional[List[str]] = None
+        if isinstance(preferred_raw, list):
+            preferred_animation_names = [str(name) for name in preferred_raw if str(name or "").strip()]
+        self._load_migration_preview_path(
+            target_path,
+            f"target monster_{target_token}",
+            preferred_animation_names=preferred_animation_names,
+        )
+
+    def _on_migration_panel_target_tracks_requested(self, payload: object) -> None:
+        panel = getattr(self, "monster_migration_panel", None)
+        if panel is None or not isinstance(payload, dict):
+            return
+        try:
+            profile_index = int(payload.get("profile_index", 0))
+        except (TypeError, ValueError):
+            profile_index = 0
+        target_token = self._normalize_migration_token(str(payload.get("target_token") or ""))
+        try:
+            raw_target_island = payload.get("target_island")
+            target_island = int(raw_target_island) if raw_target_island is not None else None
+        except (TypeError, ValueError):
+            target_island = None
+        tracks = self._migration_track_names_for_target(profile_index, target_token, target_island)
+        panel.set_target_track_options(profile_index, target_token, target_island, tracks)
 
     def _on_migration_panel_preview_output_requested(self, output_path: str) -> None:
         path = (output_path or "").strip()
@@ -1401,10 +2952,221 @@ class MSMAnimationViewer(QMainWindow):
                 "Migrated output path does not exist yet. Run migration first.",
             )
             return
-        self._load_migration_preview_path(path, "migrated output")
+        self._load_migration_preview_path(
+            path,
+            "migrated output",
+            preferred_animation_names=self._migration_last_preview_animation_names,
+        )
 
-    def _load_migration_preview_path(self, path: str, label: str) -> bool:
-        payload = self._read_migration_payload(path)
+    def _select_loaded_preview_animation(
+        self,
+        payload: Dict[str, Any],
+        path: str,
+        preferred_animation_names: Optional[List[str]] = None,
+    ) -> Optional[str]:
+        combo = self.control_panel.anim_combo
+        if combo.count() <= 0:
+            return None
+
+        ordered_names: List[str] = []
+        seen: Set[str] = set()
+
+        def add_name(name: Any) -> None:
+            text = str(name or "").strip()
+            key = text.lower()
+            if not text or key in seen:
+                return
+            seen.add(key)
+            ordered_names.append(text)
+
+        compatible_names = self._atlas_compatible_animation_names(payload, path)
+        compatible_keys = {
+            str(name or "").strip().lower()
+            for name in compatible_names
+            if str(name or "").strip()
+        }
+
+        if compatible_names:
+            for name in preferred_animation_names or []:
+                if str(name or "").strip().lower() in compatible_keys:
+                    add_name(name)
+            for name in compatible_names:
+                add_name(name)
+            for name in preferred_animation_names or []:
+                add_name(name)
+        else:
+            for name in preferred_animation_names or []:
+                add_name(name)
+
+        for index in range(combo.count()):
+            add_name(combo.itemText(index))
+
+        target_index = 0
+        target_name = combo.itemText(0)
+        available = {
+            combo.itemText(index).strip().lower(): index
+            for index in range(combo.count())
+            if combo.itemText(index).strip()
+        }
+        for name in ordered_names:
+            index = available.get(name.strip().lower())
+            if index is not None:
+                target_index = index
+                target_name = combo.itemText(index)
+                break
+
+        if combo.currentIndex() == target_index:
+            self.on_animation_selected(target_index)
+        else:
+            combo.setCurrentIndex(target_index)
+        return target_name
+
+    def _atlas_compatible_animation_names(self, payload: Dict[str, Any], path: str) -> List[str]:
+        sources = payload.get("sources") if isinstance(payload, dict) else None
+        anims = payload.get("anims") if isinstance(payload, dict) else None
+        if not isinstance(sources, list) or not sources or not isinstance(anims, list):
+            return []
+
+        json_dir = os.path.dirname(path) if path else None
+        atlas_lookups: Dict[int, Set[str]] = {}
+        for source_index, source in enumerate(sources):
+            if not isinstance(source, dict):
+                continue
+            source_name = str(source.get("src") or "").strip()
+            if not source_name:
+                continue
+            xml_path = self._resolve_source_xml_path(source_name, json_dir)
+            if not xml_path:
+                continue
+            lookup = self._migration_atlas_lookup_keys(Path(xml_path))
+            if lookup:
+                try:
+                    source_id = int(source.get("id", source_index))
+                except (TypeError, ValueError):
+                    source_id = source_index
+                atlas_lookups[source_id] = lookup
+                atlas_lookups.setdefault(source_index, lookup)
+
+        if not atlas_lookups:
+            return []
+
+        compatible: List[str] = []
+        for anim_index, anim in enumerate(anims):
+            if not isinstance(anim, dict):
+                continue
+            layers = anim.get("layers")
+            if not isinstance(layers, list):
+                continue
+            refs_seen = 0
+            missing = 0
+            for layer in layers:
+                if not isinstance(layer, dict):
+                    continue
+                try:
+                    source_id = int(layer.get("src", 0))
+                except (TypeError, ValueError):
+                    source_id = 0
+                lookup = atlas_lookups.get(source_id) or next(iter(atlas_lookups.values()))
+                frames = layer.get("frames")
+                if not isinstance(frames, list):
+                    continue
+                for frame in frames:
+                    if not isinstance(frame, dict):
+                        continue
+                    sprite = frame.get("sprite")
+                    if not isinstance(sprite, dict):
+                        continue
+                    sprite_name = str(sprite.get("string") or "").strip()
+                    if not sprite_name:
+                        continue
+                    refs_seen += 1
+                    if not self._migration_sprite_lookup_keys(sprite_name).intersection(lookup):
+                        missing += 1
+                        break
+                if missing:
+                    break
+            if refs_seen and not missing:
+                compatible.append(str(anim.get("name") or f"Animation {anim_index + 1}"))
+        return compatible
+
+    def _read_migration_preview_payload(self, path: str) -> Optional[Dict[str, Any]]:
+        if str(path or "").lower().endswith(".bin"):
+            try:
+                module = self._load_rev6_animation_module()
+                if module is not None:
+                    return module.BinAnim.from_file(str(path)).to_dict()
+            except Exception as exc:
+                self.log_widget.log(
+                    f"Direct Rev6 preview parse failed; falling back to auto converter: {exc}",
+                    "INFO",
+                )
+        return self._read_migration_payload(path)
+
+    def _migration_atlas_looks_like_baked_dof_rev6(self, xml_path: str) -> bool:
+        try:
+            root = ET.parse(xml_path).getroot()
+        except Exception:
+            return False
+        if str(root.tag or "").lower() != "textureatlas":
+            return False
+        if (root.get("pivotMode") or root.get("pivot_mode") or root.get("version")):
+            return False
+        if str(root.get("hires") or "").strip().lower() != "true":
+            return False
+        sprites = list(root.findall("sprite"))
+        if len(sprites) < 8:
+            return False
+        basename = os.path.basename(str(xml_path or "")).lower()
+        if not (basename.startswith("monster_") and basename.endswith("_sheet.xml")):
+            return False
+        mesh_children = 0
+        non_default_pivots = 0
+        for sprite_elem in sprites:
+            if list(sprite_elem):
+                mesh_children += 1
+            try:
+                px = float(sprite_elem.get("pX", 0.5))
+                py = float(sprite_elem.get("pY", 0.5))
+            except (TypeError, ValueError):
+                px = 0.5
+                py = 0.5
+            if abs(px - 0.5) > 0.001 or abs(py - 0.5) > 0.001:
+                non_default_pivots += 1
+        if mesh_children:
+            return False
+        return (non_default_pivots / max(1, len(sprites))) >= 0.75
+
+    def _migration_preview_should_use_baked_dof_rev6(
+        self,
+        path: str,
+        payload: Dict[str, Any],
+    ) -> bool:
+        if self._is_last_dof_migration_preview_path(path):
+            return True
+        sources = payload.get("sources") if isinstance(payload, dict) else None
+        if not isinstance(sources, list) or not sources:
+            return False
+        if not self._atlas_compatible_animation_names(payload, path):
+            return False
+        json_dir = os.path.dirname(path) if path else None
+        for source in sources:
+            if not isinstance(source, dict):
+                continue
+            xml_name = str(source.get("src") or "").strip()
+            if not xml_name:
+                continue
+            xml_path = self._resolve_source_xml_path(xml_name, json_dir)
+            if xml_path and self._migration_atlas_looks_like_baked_dof_rev6(xml_path):
+                return True
+        return False
+
+    def _load_migration_preview_path(
+        self,
+        path: str,
+        label: str,
+        preferred_animation_names: Optional[List[str]] = None,
+    ) -> bool:
+        payload = self._read_migration_preview_payload(path)
         if payload is None:
             QMessageBox.warning(
                 self,
@@ -1412,13 +3174,32 @@ class MSMAnimationViewer(QMainWindow):
                 f"Could not parse payload for {label}:\n{path}",
             )
             return False
-        self._apply_json_payload(path, payload, announce=False)
-        if self.control_panel.anim_combo.count() > 0:
-            self.control_panel.anim_combo.setCurrentIndex(0)
+        force_baked_dof_rev6 = self._migration_preview_should_use_baked_dof_rev6(path, payload)
+        self._apply_json_payload(
+            path,
+            payload,
+            announce=False,
+            force_dof_rev6_baked_preview=force_baked_dof_rev6,
+        )
+        if self._migration_current_preview_force_dof_pivots:
+            self.log_widget.log(
+                "Applied viewer-only baked DOF Rev6 pivot handling for migrated output preview.",
+                "INFO",
+            )
+        selected_name = self._select_loaded_preview_animation(
+            payload,
+            path,
+            preferred_animation_names=preferred_animation_names,
+        )
         self.log_widget.log(
             f"Loaded {label} in viewport for compatibility preview: {os.path.basename(path)}",
             "SUCCESS",
         )
+        if selected_name:
+            self.log_widget.log(
+                f"Preview selected animation: {selected_name}",
+                "INFO",
+            )
         return True
 
     def _set_panel_visibility(self, left_visible: bool, right_visible: bool, *, save: bool = True):
@@ -1449,9 +3230,9 @@ class MSMAnimationViewer(QMainWindow):
         if save:
             self.settings.setValue("ui/focus_mode", self._focus_mode_enabled)
 
-    def _set_timeline_visibility(self, visible: bool, *, save: bool = True):
+    def _set_timeline_visibility(self, visible: bool, *, save: bool = True, force: bool = False):
         visible = bool(visible)
-        if self._timeline_visible == visible:
+        if self._timeline_visible == visible and not force:
             return
         self._timeline_visible = visible
         if not hasattr(self, "content_splitter"):
@@ -1478,9 +3259,9 @@ class MSMAnimationViewer(QMainWindow):
     def _on_timeline_toggle(self, checked: bool):
         self._set_timeline_visibility(bool(checked), save=True)
 
-    def _set_log_visibility(self, visible: bool, *, save: bool = True):
+    def _set_log_visibility(self, visible: bool, *, save: bool = True, force: bool = False):
         visible = bool(visible)
-        if self._log_visible == visible:
+        if self._log_visible == visible and not force:
             return
         self._log_visible = visible
         if not hasattr(self, "log_splitter"):
@@ -1581,6 +3362,7 @@ class MSMAnimationViewer(QMainWindow):
         container.setAutoFillBackground(True)
         container.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.viewport_tool_strip_container = container
+        self.viewport_tool_play_slots.clear()
         layout = QHBoxLayout(container)
         layout.setContentsMargins(8, 6, 8, 8)
         layout.setSpacing(6)
@@ -1589,8 +3371,10 @@ class MSMAnimationViewer(QMainWindow):
             btn = QToolButton()
             btn.setCheckable(True)
             btn.setAutoRaise(False)
-            btn.setFixedSize(38, 38)
-            btn.setIconSize(QPixmap(25, 25).size())
+            button_size = self._ui_scaled_int(38)
+            icon_size = self._ui_scaled_int(25)
+            btn.setFixedSize(button_size, button_size)
+            btn.setIconSize(QPixmap(icon_size, icon_size).size())
             return btn
 
         self._viewport_tool_icon_cursor_selected = self._load_viewport_tool_icon("Cursor Icon Selected.png")
@@ -1612,17 +3396,122 @@ class MSMAnimationViewer(QMainWindow):
         self.viewport_tool_buttons.append(self.viewport_tool_zoom_btn)
         layout.addWidget(self.viewport_tool_zoom_btn)
 
-        for _ in range(5):
-            placeholder_btn = _make_button()
-            placeholder_btn.setCheckable(False)
-            placeholder_btn.setToolTip("Reserved")
-            self.viewport_tool_buttons.append(placeholder_btn)
-            layout.addWidget(placeholder_btn)
+        for index in range(5):
+            slot = PlaybackButtonDropSlot(f"viewport:{index}", container)
+            slot.setToolTip("Drop Play/Pause here")
+            slot.playButtonDropped.connect(self._on_play_button_drop_requested)
+            slot.set_button_size(self._ui_scaled_int(38))
+            self.viewport_tool_play_slots.append(slot)
+            layout.addWidget(slot)
 
         layout.addStretch(1)
         self._apply_viewport_tool_button_styles()
         self._refresh_viewport_tool_buttons()
         return container
+
+    def _apply_viewport_tool_button_sizes(self) -> None:
+        button_size = self._ui_scaled_int(38)
+        icon_size = self._ui_scaled_int(25)
+        for btn in getattr(self, "viewport_tool_buttons", []) or []:
+            if btn is None:
+                continue
+            btn.setFixedSize(button_size, button_size)
+            btn.setIconSize(QPixmap(icon_size, icon_size).size())
+        for slot in getattr(self, "viewport_tool_play_slots", []) or []:
+            if slot is not None:
+                slot.set_button_size(button_size)
+        if getattr(self, "viewport_tool_strip_container", None) is not None:
+            layout = self.viewport_tool_strip_container.layout()
+            if layout is not None:
+                layout.setContentsMargins(
+                    self._ui_scaled_int(8),
+                    self._ui_scaled_int(6),
+                    self._ui_scaled_int(8),
+                    self._ui_scaled_int(8),
+                )
+                layout.setSpacing(self._ui_scaled_int(6))
+        self._sync_play_button_host_metrics()
+
+    def _normalize_play_button_location(self, location: object) -> str:
+        text = str(location or "timeline").strip().lower()
+        if text in {"timeline", "default"}:
+            return "timeline"
+        if text.startswith("viewport:"):
+            try:
+                index = int(text.split(":", 1)[1])
+            except (TypeError, ValueError):
+                return "timeline"
+            if 0 <= index < len(getattr(self, "viewport_tool_play_slots", []) or []):
+                return f"viewport:{index}"
+        return "timeline"
+
+    def _play_button_destination_slot(self, location: str) -> Optional[PlaybackButtonDropSlot]:
+        normalized = self._normalize_play_button_location(location)
+        if normalized == "timeline":
+            timeline = getattr(self, "timeline", None)
+            return getattr(timeline, "play_button_slot", None) if timeline is not None else None
+        try:
+            index = int(normalized.split(":", 1)[1])
+        except (TypeError, ValueError, IndexError):
+            return None
+        slots = getattr(self, "viewport_tool_play_slots", []) or []
+        if 0 <= index < len(slots):
+            return slots[index]
+        return None
+
+    def _all_play_button_slots(self) -> List[PlaybackButtonDropSlot]:
+        slots: List[PlaybackButtonDropSlot] = []
+        timeline = getattr(self, "timeline", None)
+        timeline_slot = getattr(timeline, "play_button_slot", None) if timeline is not None else None
+        if timeline_slot is not None:
+            slots.append(timeline_slot)
+        slots.extend(slot for slot in (getattr(self, "viewport_tool_play_slots", []) or []) if slot is not None)
+        return slots
+
+    def _sync_play_button_host_metrics(self) -> None:
+        timeline = getattr(self, "timeline", None)
+        play_btn = getattr(timeline, "play_btn", None) if timeline is not None else None
+        if play_btn is None:
+            return
+        if self._normalize_play_button_location(getattr(self, "_play_button_location", "timeline")) == "timeline":
+            if hasattr(timeline, "_sync_play_button_slot_size"):
+                timeline._sync_play_button_slot_size()
+            return
+        if hasattr(play_btn, "set_compact_ui"):
+            play_btn.set_compact_ui(False)
+        if hasattr(play_btn, "set_ui_scale_factor"):
+            play_btn.set_ui_scale_factor(getattr(self, "_ui_scale_factor", 1.0))
+        slot = self._play_button_destination_slot(self._play_button_location)
+        if slot is not None:
+            slot.set_button_size(self._ui_scaled_int(38))
+
+    def _move_play_button_to_location(self, location: object, *, save: bool = True) -> None:
+        timeline = getattr(self, "timeline", None)
+        if timeline is None or not hasattr(timeline, "play_btn"):
+            return
+        normalized = self._normalize_play_button_location(location)
+        destination = self._play_button_destination_slot(normalized)
+        if destination is None:
+            normalized = "timeline"
+            destination = self._play_button_destination_slot(normalized)
+        if destination is None:
+            return
+
+        play_btn = timeline.play_btn
+        for slot in self._all_play_button_slots():
+            slot.clear_play_button(play_btn)
+        if normalized == "timeline" and hasattr(play_btn, "set_compact_ui"):
+            play_btn.set_compact_ui(getattr(self, "_compact_ui_enabled", False))
+        elif hasattr(play_btn, "set_compact_ui"):
+            play_btn.set_compact_ui(False)
+        destination.set_play_button(play_btn)
+        self._play_button_location = normalized
+        self._sync_play_button_host_metrics()
+        if save:
+            self.settings.setValue("ui/play_button_location", normalized)
+
+    def _on_play_button_drop_requested(self, location: str) -> None:
+        self._move_play_button_to_location(location, save=True)
 
     def _apply_viewport_tool_button_styles(self) -> None:
         app = QApplication.instance()
@@ -1713,6 +3602,8 @@ class MSMAnimationViewer(QMainWindow):
     def _on_content_splitter_moved(self, _pos: int, _index: int):
         if not hasattr(self, "content_splitter"):
             return
+        if self._content_splitter_programmatic_update:
+            return
         sizes = self.content_splitter.sizes()
         if len(sizes) != 2:
             return
@@ -1754,6 +3645,7 @@ class MSMAnimationViewer(QMainWindow):
             self.monster_migration_panel.set_compact_ui(self._compact_ui_enabled)
         if hasattr(self, "timeline"):
             self.timeline.set_compact_ui(self._compact_ui_enabled)
+        self._sync_play_button_host_metrics()
         if save:
             self.settings.setValue("ui/compact_ui", self._compact_ui_enabled)
 
@@ -1789,6 +3681,31 @@ class MSMAnimationViewer(QMainWindow):
 
     def on_simple_mode_toggled(self, enabled: bool):
         self._set_simple_mode(enabled, save=True)
+
+    def on_barebones_file_mode_changed(self, enabled: bool):
+        """Persist and apply the Files tab browser mode."""
+        self.export_settings.use_barebones_file_browser = bool(enabled)
+        self.export_settings.save()
+        self.control_panel.set_barebones_file_mode(self.export_settings.use_barebones_file_browser)
+        if not self.export_settings.use_barebones_file_browser:
+            self._disable_dof_search_for_monster_browser(log=True)
+        self.refresh_file_list()
+
+    def _disable_dof_search_for_monster_browser(self, *, log: bool = False) -> bool:
+        """Disable DOF asset search when the file UI is using Monster Browser mode."""
+        if self.export_settings.use_barebones_file_browser:
+            return False
+        was_enabled = bool(self.dof_search_enabled)
+        self.dof_search_enabled = False
+        self.settings.setValue('dof/search_enabled', False)
+        if hasattr(self, "control_panel"):
+            self.control_panel.set_dof_search_mode(False)
+        if was_enabled and log and hasattr(self, "log_widget"):
+            self.log_widget.log(
+                "DOF asset search disabled because Monster Browser mode is active.",
+                "INFO",
+            )
+        return was_enabled
 
     def _setup_shortcuts(self):
         """Configure application-wide shortcuts."""
@@ -1887,6 +3804,11 @@ class MSMAnimationViewer(QMainWindow):
         self._set_scale_gizmo_state(not current)
 
     def eventFilter(self, watched, event):
+        if event.type() == QEvent.Type.Show and self._conversion_popup_diagnostics_active():
+            self._log_conversion_popup_show(watched)
+            if isinstance(watched, QWidget):
+                QTimer.singleShot(0, lambda widget=watched: self._log_conversion_popup_show(widget))
+                QTimer.singleShot(50, lambda widget=watched: self._log_conversion_popup_show(widget))
         if (
             event.type() == QEvent.Type.ShortcutOverride
             and self._redo_alt_override_enabled
@@ -1896,6 +3818,120 @@ class MSMAnimationViewer(QMainWindow):
             self._handle_redo_shortcut()
             return True
         return super().eventFilter(watched, event)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._startup_timeline_minimize_after_show_done:
+            self._startup_timeline_minimize_after_show_done = True
+            self._schedule_startup_timeline_minimize()
+
+    def _conversion_popup_diagnostics_active(self) -> bool:
+        """Return True while converter activity is running in the main window."""
+        if not conversion_window_diagnostics_enabled():
+            return False
+        try:
+            app = QApplication.instance()
+            if app is not None and bool(app.property("aniviewer_conversion_diagnostics_active")):
+                return True
+            if self._bin_convert_thread and self._bin_convert_thread.isRunning():
+                return True
+            if self._dof_convert_thread and self._dof_convert_thread.isRunning():
+                return True
+            if self._dof_convert_process and self._dof_convert_process.state() != QProcess.ProcessState.NotRunning:
+                return True
+        except Exception:
+            return False
+        return False
+
+    @staticmethod
+    def _compact_diagnostic_text(value: object, *, limit: int = 700) -> str:
+        return compact_diagnostic_text(value, limit=limit)
+
+    def _emit_conversion_diagnostic(self, message: str) -> None:
+        line = f"[Aniviewer live window logger] {message}"
+        emit_conversion_diagnostic(message)
+        if hasattr(self, "log_widget"):
+            self.log_widget.log(line, "WARNING")
+
+    def _log_conversion_popup_show(self, widget: object) -> None:
+        """Log transient Qt windows during conversion without interfering with them."""
+        if not isinstance(widget, QWidget):
+            return
+        try:
+            if not widget.isWindow():
+                return
+            flags = widget.windowFlags()
+        except Exception:
+            return
+        transient_flags = (
+            Qt.WindowType.Popup
+            | Qt.WindowType.Tool
+            | Qt.WindowType.Dialog
+            | Qt.WindowType.ToolTip
+            | Qt.WindowType.SplashScreen
+        )
+        if not (flags & transient_flags):
+            return
+        try:
+            title = widget.windowTitle()
+            class_name = widget.metaObject().className()
+        except Exception:
+            title = ""
+            class_name = type(widget).__name__
+
+        details: List[str] = []
+        if title:
+            details.append(f"title={self._compact_diagnostic_text(title)}")
+        details.append(f"class={class_name}")
+
+        if isinstance(widget, QMessageBox):
+            msg_text = self._compact_diagnostic_text(widget.text())
+            info_text = self._compact_diagnostic_text(widget.informativeText())
+            detailed_text = self._compact_diagnostic_text(widget.detailedText(), limit=1200)
+            if msg_text:
+                details.append(f"text={msg_text}")
+            if info_text:
+                details.append(f"info={info_text}")
+            if detailed_text:
+                details.append(f"details={detailed_text}")
+
+        label_texts: List[str] = []
+        for label in widget.findChildren(QLabel):
+            text = self._compact_diagnostic_text(label.text())
+            if text and text not in label_texts:
+                label_texts.append(text)
+            if len(label_texts) >= 8:
+                break
+        if label_texts:
+            details.append("labels=" + " | ".join(label_texts))
+
+        button_texts: List[str] = []
+        for button in widget.findChildren(QAbstractButton):
+            text = self._compact_diagnostic_text(button.text())
+            if text and text not in button_texts:
+                button_texts.append(text)
+            if len(button_texts) >= 6:
+                break
+        if button_texts:
+            details.append("buttons=" + ", ".join(button_texts))
+
+        try:
+            details.append(f"flags={int(flags)}")
+        except Exception:
+            details.append(f"flags={flags}")
+
+        detail_text = "; ".join(details)
+        key = (class_name, title, detail_text)
+        counts = getattr(self, "_conversion_popup_show_counts", None)
+        if counts is None:
+            counts = {}
+            self._conversion_popup_show_counts = counts
+        count = counts.get(key, 0) + 1
+        counts[key] = count
+        if count > 5 and count not in (10, 25, 50, 100):
+            return
+        repeat = f" repeat={count}" if count > 1 else ""
+        self._emit_conversion_diagnostic(f"Qt transient window shown during conversion{repeat}: {detail_text}")
 
     def _handle_undo_shortcut(self):
         """Undo the most recent edit action."""
@@ -2091,12 +4127,13 @@ class MSMAnimationViewer(QMainWindow):
         if success:
             self._diagnostics_config.export_path = target
             self.settings.setValue('diagnostics/export_path', target)
-    
+
     def connect_control_panel_signals(self):
         """Connect control panel signals"""
         self.control_panel.bin_selected.connect(self.on_bin_selected)
         self.control_panel.convert_bin_clicked.connect(self.convert_bin_to_json)
         self.control_panel.convert_dof_clicked.connect(self.convert_dof_to_json)
+        self.control_panel.convert_dof_rev6_clicked.connect(self.convert_dof_to_rev6_package)
         self.control_panel.dof_asset_grabber_clicked.connect(self.open_dof_asset_grabber)
         self.control_panel.refresh_files_clicked.connect(self.refresh_active_file_list)
         self.control_panel.file_search_changed.connect(self.on_file_search_changed)
@@ -2201,6 +4238,14 @@ class MSMAnimationViewer(QMainWindow):
         self.control_panel.export_include_viewport_bg_changed.connect(
             self.on_export_include_viewport_bg_changed
         )
+        self.control_panel.export_all_animations_changed.connect(
+            self.on_export_all_loaded_animations_changed
+        )
+        self.control_panel.spatial3d_enabled_changed.connect(self.on_spatial3d_enabled_changed)
+        self.control_panel.spatial3d_depth_changed.connect(self.on_spatial3d_depth_changed)
+        self.control_panel.spatial3d_screen_plane_changed.connect(self.on_spatial3d_screen_plane_changed)
+        self.control_panel.spatial3d_view_changed.connect(self.on_spatial3d_view_changed)
+        self.control_panel.spatial3d_swap_eyes_changed.connect(self.on_spatial3d_swap_eyes_changed)
         self.control_panel.section_changed.connect(self.on_control_panel_section_changed)
         self.control_panel.audio_enabled_changed.connect(self.on_audio_enabled_changed)
         self.control_panel.audio_volume_changed.connect(self.on_audio_volume_changed)
@@ -2251,6 +4296,7 @@ class MSMAnimationViewer(QMainWindow):
         self.control_panel.joint_solver_bake_current_requested.connect(self.on_joint_solver_bake_current_requested)
         self.control_panel.joint_solver_bake_range_requested.connect(self.on_joint_solver_bake_range_requested)
         self.control_panel.set_barebones_file_mode(self.export_settings.use_barebones_file_browser)
+        self.control_panel.barebones_file_mode_changed.connect(self.on_barebones_file_mode_changed)
         self._update_keyframe_history_controls()
         self.control_panel.compact_ui_toggled.connect(self.on_compact_ui_toggled)
         self.control_panel.simple_mode_toggled.connect(self.on_simple_mode_toggled)
@@ -2259,7 +4305,7 @@ class MSMAnimationViewer(QMainWindow):
                 self._on_control_panel_dof_include_mesh_xml_toggled
             )
 
-    
+
     def connect_layer_panel_signals(self):
         """Connect layer panel signals"""
         self.layer_panel.layer_visibility_changed.connect(self.toggle_layer_visibility)
@@ -2293,7 +4339,7 @@ class MSMAnimationViewer(QMainWindow):
         self.diagnostics.log_visibility(
             f"Layer '{layer.name}' set {text}", layer_id=layer.layer_id
         )
-    
+
     def connect_timeline_signals(self):
         """Connect timeline signals"""
         self.timeline.play_toggled.connect(self.toggle_playback)
@@ -2321,6 +4367,7 @@ class MSMAnimationViewer(QMainWindow):
         get_float = lambda key, default: s.value(f"diagnostics/{key}", default, type=float)
         get_str = lambda key, default: s.value(f"diagnostics/{key}", default, type=str)
 
+        set_conversion_window_diagnostics_enabled(get_bool("window_logger_enabled", True))
         cfg = DiagnosticsConfig(
             enabled=get_bool("enabled", False),
             highlight_layers=get_bool("highlight_layers", True),
@@ -2346,7 +4393,7 @@ class MSMAnimationViewer(QMainWindow):
         self._diagnostics_config = cfg
         self.diagnostics.apply_config(cfg)
         self.control_panel.set_diagnostics_enabled(cfg.enabled)
-    
+
     def find_bin2json(self):
         """Locate converter utilities shipped with the viewer."""
         script_dir = self.project_root
@@ -2830,6 +4877,7 @@ class MSMAnimationViewer(QMainWindow):
             self._invalidate_monster_name_rosetta_cache()
         if costume_asset_paths_changed:
             self.costume_cache.clear()
+            self.base_atlas_cache.clear()
             self.costume_atlas_cache.clear()
         self._downloads_xml_bin_roots = self._find_downloads_xml_bin_roots()
 
@@ -2863,7 +4911,7 @@ class MSMAnimationViewer(QMainWindow):
             self.path_label.setToolTip(f"Downloads: {self.downloads_path}")
         else:
             self.path_label.setToolTip("")
-    
+
     def browse_game_path(self):
         """Browse for game path"""
         path = QFileDialog.getExistingDirectory(self, "Select My Singing Monsters Game Folder")
@@ -2875,12 +4923,14 @@ class MSMAnimationViewer(QMainWindow):
                 self.shader_registry.set_game_path(self.game_path)
                 self.settings.setValue('game_path', path)
                 self._update_active_path_profile(game_path=path)
+                self.base_atlas_cache.clear()
+                self.costume_atlas_cache.clear()
                 self._update_path_label()
                 self.log_widget.log(f"Game path set to: {path}", "SUCCESS")
                 self.build_audio_library()
                 self.refresh_file_list()
             else:
-                QMessageBox.warning(self, "Invalid Path", 
+                QMessageBox.warning(self, "Invalid Path",
                                   "Selected folder doesn't contain a 'data' subfolder. "
                                   "Please select the root game folder.")
                 self.log_widget.log("Invalid game path selected", "ERROR")
@@ -2906,6 +4956,7 @@ class MSMAnimationViewer(QMainWindow):
         self.dof_path = folder
         self.settings.setValue('dof_path', folder)
         self._update_active_path_profile(dof_path=folder)
+        self.base_atlas_cache.clear()
         self._clear_dof_runtime_caches()
         self.log_widget.log(f"DOF Assets path set to: {folder}", "SUCCESS")
         self.build_dof_audio_library()
@@ -2925,6 +4976,7 @@ class MSMAnimationViewer(QMainWindow):
         self._update_active_path_profile(downloads_path=folder)
         self._invalidate_monster_name_rosetta_cache()
         self.costume_cache.clear()
+        self.base_atlas_cache.clear()
         self.costume_atlas_cache.clear()
         self._downloads_xml_bin_roots = self._find_downloads_xml_bin_roots()
         self._update_path_label()
@@ -3035,7 +5087,7 @@ class MSMAnimationViewer(QMainWindow):
             self.refresh_dof_file_list()
         else:
             self.refresh_file_list()
-    
+
     def refresh_file_list(self):
         """Refresh the list of available BIN/JSON files"""
         if not self.game_path and not self.downloads_path:
@@ -4546,6 +6598,10 @@ class MSMAnimationViewer(QMainWindow):
 
     def on_dof_search_toggled(self, enabled: bool):
         """Switch the file list between BIN/JSON and DOF assets."""
+        if enabled and not self.export_settings.use_barebones_file_browser:
+            self._disable_dof_search_for_monster_browser(log=True)
+            self.apply_file_filter()
+            return
         self.dof_search_enabled = bool(enabled)
         self.settings.setValue('dof/search_enabled', self.dof_search_enabled)
         self.control_panel.set_dof_search_mode(self.dof_search_enabled)
@@ -4645,10 +6701,10 @@ class MSMAnimationViewer(QMainWindow):
     def select_file_by_path(self, target_path: str) -> bool:
         """
         Attempt to select an entry in the combo box matching the given path.
-        
+
         Args:
             target_path: Absolute path of the file to select
-        
+
         Returns:
             True if the file was selected, False otherwise
         """
@@ -4890,7 +6946,8 @@ class MSMAnimationViewer(QMainWindow):
         atlases = self._load_texture_atlases_for_sources(
             sources,
             json_dir=json_dir,
-            use_cache=False
+            use_cache=True,
+            cache_kind="base",
         )
         self.gl_widget.texture_atlases = atlases
         self._rebuild_source_atlas_lookup(sources, atlases)
@@ -4955,6 +7012,75 @@ class MSMAnimationViewer(QMainWindow):
         self._refresh_costume_list()
         if previous_key and previous_key in self.costume_entry_map:
             self._restore_costume_selection(previous_key)
+
+    def _schedule_basic_costume_list_refresh(self, preserve_key: Optional[str] = None) -> None:
+        """Populate costumes after basic-mode first paint instead of blocking load."""
+        if not self._basic_viewer_fast_load_enabled():
+            return
+        if not self.current_json_path:
+            return
+        self._basic_costume_refresh_generation += 1
+        generation = self._basic_costume_refresh_generation
+        json_path = self.current_json_path
+
+        self.costume_entries = []
+        self.costume_entry_map = {}
+        self.control_panel.update_costume_options([], select_index=0)
+        self.control_panel.set_costume_convert_enabled(False)
+
+        def _refresh() -> None:
+            if generation != self._basic_costume_refresh_generation:
+                return
+            if json_path != self.current_json_path:
+                return
+            self._refresh_costume_list()
+            if preserve_key and preserve_key in self.costume_entry_map:
+                self._restore_costume_selection(preserve_key)
+                entry = self.costume_entry_map.get(preserve_key)
+                if entry is not None:
+                    if entry.legacy_sheet_path:
+                        self._apply_legacy_sheet_variant(entry)
+                    else:
+                        self._apply_costume_to_animation(entry)
+
+        QTimer.singleShot(250, _refresh)
+
+    def _schedule_basic_audio_load(self, animation_name: Optional[str]) -> None:
+        """Load matching audio after basic-mode viewport work has started."""
+        if not self._basic_viewer_fast_load_enabled():
+            return
+        self._basic_audio_load_generation += 1
+        generation = self._basic_audio_load_generation
+        name = str(animation_name or "").strip()
+        json_path = self.current_json_path
+        allow_dof_bundle_scan = bool(self._is_active_dof_audio_context())
+
+        self._set_audio_track_controls(None, [])
+        self.current_audio_path = None
+        self.current_audio_from_manifest = False
+        if getattr(self, "audio_manager", None):
+            self.audio_manager.clear()
+        self._handle_audio_cleared()
+        self.control_panel.update_audio_status("Audio: loading...", False)
+
+        if not name:
+            self.control_panel.update_audio_status("Audio: not available", False)
+            return
+
+        def _load() -> None:
+            if generation != self._basic_audio_load_generation:
+                return
+            if json_path != self.current_json_path:
+                return
+            if name != (self.current_animation_name or ""):
+                return
+            with profile_scope("load.animation.basic_audio_deferred"):
+                self.load_audio_for_animation(
+                    name,
+                    allow_dof_bundle_scan=allow_dof_bundle_scan,
+                )
+
+        QTimer.singleShot(350, _load)
 
     def _get_current_costume_entry(self) -> Optional[CostumeEntry]:
         """Return the CostumeEntry for the currently selected dropdown item."""
@@ -5968,9 +8094,11 @@ class MSMAnimationViewer(QMainWindow):
         animation = self.gl_widget.player.animation
         if not animation or not self.base_layer_cache:
             return
+        basic_fast_load = self._basic_viewer_fast_load_enabled()
 
         if entry is None:
             animation.layers = self._clone_layers(self.base_layer_cache)
+            self.gl_widget.invalidate_animation_cache()
             self.gl_widget.texture_atlases = list(self.base_texture_atlases)
             base_overrides = self._build_base_source_layer_atlas_overrides(animation.layers)
             self.gl_widget.set_layer_atlas_overrides(base_overrides)
@@ -5979,10 +8107,13 @@ class MSMAnimationViewer(QMainWindow):
             self._configure_costume_shaders(None, None)
             self._refresh_attachment_panel()
             self.gl_widget.update()
-            self.update_layer_panel()
-            self._capture_pose_baseline()
-            self._reset_edit_history()
-            self._refresh_timeline_keyframes()
+            if basic_fast_load:
+                self._start_simple_viewer_bake_for_current_animation()
+            else:
+                self.update_layer_panel()
+                self._capture_pose_baseline()
+                self._reset_edit_history()
+                self._refresh_timeline_keyframes()
             return
 
         costume_data = self._load_costume_definition(entry)
@@ -6064,6 +8195,7 @@ class MSMAnimationViewer(QMainWindow):
         self.gl_widget.texture_atlases = combined_atlases
 
         animation.layers = layers
+        self.gl_widget.invalidate_animation_cache()
         self._record_layer_defaults(animation.layers)
         self.active_costume_key = entry.key
         overrides, pivot_context = self._build_layer_atlas_overrides(
@@ -6081,6 +8213,9 @@ class MSMAnimationViewer(QMainWindow):
         self.gl_widget.set_costume_attachments(attachment_payloads, layers)
         self._refresh_attachment_panel()
         self.gl_widget.update()
+        if basic_fast_load:
+            self._start_simple_viewer_bake_for_current_animation()
+            return
         self.update_layer_panel()
         self.gl_widget.set_anchor_logging_enabled(self.anchor_debug_enabled)
         if self.anchor_debug_enabled:
@@ -7129,6 +9264,96 @@ class MSMAnimationViewer(QMainWindow):
 
         return roots
 
+    def _basic_texture_data_roots(self, json_dir: Optional[str]) -> List[str]:
+        """Return narrow texture roots for simple-mode BIN viewing."""
+        roots: List[str] = []
+        seen: Set[str] = set()
+
+        def add_root(path: Optional[str]) -> None:
+            if not path:
+                return
+            norm_path = os.path.normpath(path)
+            norm_key = os.path.normcase(norm_path)
+            if norm_key in seen or not os.path.isdir(norm_path):
+                return
+            seen.add(norm_key)
+            roots.append(norm_path)
+
+        if json_dir:
+            json_root = Path(json_dir)
+            add_root(str(json_root))
+            for parent in json_root.parents:
+                if parent.name.lower() == "data":
+                    add_root(str(parent))
+                    break
+
+        for xml_bin_root in self._get_downloads_xml_bin_roots():
+            parent = Path(xml_bin_root).parent
+            if parent.name.lower() == "data":
+                add_root(str(parent))
+            else:
+                add_root(str(parent / "data"))
+
+        if self.game_path:
+            add_root(os.path.join(self.game_path, "data"))
+            add_root(self.game_path)
+
+        if self.dof_path:
+            add_root(self.dof_path)
+
+        return roots
+
+    def _resolve_source_xml_path_basic(self, xml_file: str, json_dir: Optional[str]) -> Optional[str]:
+        """Resolve a source XML through the narrow simple-mode search path."""
+        if not xml_file:
+            return None
+        override = self._lookup_legacy_sheet_override(xml_file)
+        if override:
+            return override
+        if os.path.isabs(xml_file) and os.path.exists(xml_file):
+            return xml_file
+
+        relative_variants = self._resource_relative_variants(xml_file)
+        candidates: List[str] = []
+        if json_dir:
+            candidates.append(os.path.join(json_dir, xml_file))
+        for data_root in self._basic_texture_data_roots(json_dir):
+            for variant in relative_variants:
+                candidates.append(os.path.join(data_root, *variant.split("/")))
+
+        seen: Set[str] = set()
+        for candidate in candidates:
+            norm = os.path.normcase(os.path.normpath(candidate))
+            if norm in seen:
+                continue
+            seen.add(norm)
+            if os.path.exists(candidate):
+                return candidate
+        return None
+
+    def _load_texture_atlas_document_basic(
+        self,
+        xml_path: str,
+        json_dir: Optional[str],
+    ) -> Optional[TextureAtlas]:
+        """Load an atlas XML without broad development-folder probing."""
+        data_roots = []
+        inferred = self._infer_data_root_from_path(xml_path)
+        if inferred:
+            data_roots.append(inferred)
+        data_roots.extend(self._basic_texture_data_roots(json_dir))
+
+        seen: Set[str] = set()
+        for data_root in data_roots:
+            norm = os.path.normcase(os.path.normpath(data_root))
+            if norm in seen:
+                continue
+            seen.add(norm)
+            atlas = TextureAtlas()
+            if atlas.load_from_xml(xml_path, data_root):
+                return atlas
+        return None
+
     def _load_texture_atlas_document(self, xml_path: str) -> Optional[TextureAtlas]:
         """Parse an atlas XML manifest, probing multiple texture roots if needed."""
         data_roots = self._candidate_data_roots(xml_path)
@@ -7219,39 +9444,82 @@ class MSMAnimationViewer(QMainWindow):
         sources: List[Dict[str, Any]],
         *,
         json_dir: Optional[str],
-        use_cache: bool
+        use_cache: bool,
+        cache_kind: str = "costume",
     ) -> List[TextureAtlas]:
         """Create TextureAtlas objects for a set of source descriptors."""
         atlases: List[TextureAtlas] = []
         if not sources:
             return atlases
+        cache: Optional[Dict[Any, TextureAtlas]]
+        if not use_cache:
+            cache = None
+        elif cache_kind == "base":
+            cache = self.base_atlas_cache
+        else:
+            cache = self.costume_atlas_cache
         dof_context = bool(self.dof_search_enabled)
         if not dof_context and json_dir and self.dof_path:
             dof_context = self._path_is_under(json_dir, self.dof_path)
+        force_dof_pivots = (
+            cache_kind == "base"
+            and bool(getattr(self, "_migration_current_preview_force_dof_pivots", False))
+        )
+        atlas_mode_key = "dof_rev6_baked" if force_dof_pivots else ("dof" if dof_context else "standard")
+        basic_fast_atlas_load = (
+            self._basic_viewer_fast_load_enabled()
+            and cache_kind == "base"
+            and not force_dof_pivots
+        )
         for source in sources:
             xml_file = source.get("src")
-            xml_path = self._resolve_source_xml_path(xml_file, json_dir)
+            with profile_scope("load.animation.atlas_resolve"):
+                if basic_fast_atlas_load:
+                    xml_path = self._resolve_source_xml_path_basic(xml_file, json_dir)
+                else:
+                    xml_path = self._resolve_source_xml_path(xml_file, json_dir)
             if not xml_path:
                 self.log_widget.log(f"XML file not found: {xml_file}", "ERROR")
                 continue
             if not dof_context and self.dof_path:
                 dof_context = self._path_is_under(xml_path, self.dof_path)
             norm = os.path.normcase(os.path.normpath(xml_path))
-            atlas = self.costume_atlas_cache.get(norm) if use_cache else None
+            source_name = source.get("src") or os.path.basename(xml_path)
+            source_id_value = source.get("id")
+            cache_key: Any = norm
+            if cache_kind == "base":
+                cache_key = (
+                    norm,
+                    str(source_name or ""),
+                    str(source_id_value),
+                    bool(self.legacy_animation_active),
+                    atlas_mode_key,
+                )
+            atlas = cache.get(cache_key) if cache is not None else None
+            if atlas is not None and not self._cached_texture_atlas_valid(atlas, xml_path):
+                atlas = None
+                if cache is not None:
+                    cache.pop(cache_key, None)
             created = False
             if not atlas:
-                atlas = self._load_texture_atlas_document(xml_path)
+                with profile_scope("load.animation.atlas_document_load"):
+                    if basic_fast_atlas_load:
+                        atlas = self._load_texture_atlas_document_basic(xml_path, json_dir)
+                    else:
+                        atlas = self._load_texture_atlas_document(xml_path)
                 if not atlas:
                     self.log_widget.log(f"Failed to load texture atlas: {os.path.basename(xml_path)}", "ERROR")
                     continue
-                atlas.source_name = source.get("src") or os.path.basename(xml_path)
+                atlas.source_name = source_name
                 created = True
-                if use_cache:
-                    self.costume_atlas_cache[norm] = atlas
-            if dof_context and not getattr(atlas, "pivot_mode", None):
+                self._mark_texture_atlas_cache_metadata(atlas)
+                if cache is not None:
+                    cache[cache_key] = atlas
+            if force_dof_pivots:
+                atlas.pivot_mode = "dof_rev6_baked"
+            elif dof_context and not getattr(atlas, "pivot_mode", None):
                 atlas.pivot_mode = "dof"
             atlas.force_unpremultiply = bool(self.legacy_animation_active)
-            source_id_value = source.get("id")
             if source_id_value is not None:
                 try:
                     atlas.source_id = int(source_id_value)
@@ -7263,6 +9531,38 @@ class MSMAnimationViewer(QMainWindow):
             if not use_cache or created:
                 self.log_widget.log(f"Loaded texture atlas: {os.path.basename(xml_path)}", "SUCCESS")
         return atlases
+
+    @staticmethod
+    def _file_mtime_ns(path: Optional[str]) -> Optional[int]:
+        if not path:
+            return None
+        try:
+            return int(os.stat(path).st_mtime_ns)
+        except OSError:
+            return None
+
+    def _mark_texture_atlas_cache_metadata(self, atlas: TextureAtlas) -> None:
+        try:
+            setattr(atlas, "_cache_xml_mtime_ns", self._file_mtime_ns(getattr(atlas, "xml_path", None)))
+            setattr(atlas, "_cache_image_mtime_ns", self._file_mtime_ns(getattr(atlas, "image_path", None)))
+        except Exception:
+            pass
+
+    def _cached_texture_atlas_valid(self, atlas: TextureAtlas, xml_path: str) -> bool:
+        try:
+            cached_xml = getattr(atlas, "xml_path", None)
+            if not cached_xml:
+                return False
+            if os.path.normcase(os.path.normpath(cached_xml)) != os.path.normcase(os.path.normpath(xml_path)):
+                return False
+            if getattr(atlas, "_cache_xml_mtime_ns", None) != self._file_mtime_ns(cached_xml):
+                return False
+            image_path = getattr(atlas, "image_path", None)
+            if getattr(atlas, "_cache_image_mtime_ns", None) != self._file_mtime_ns(image_path):
+                return False
+            return True
+        except Exception:
+            return False
 
     def _rebuild_source_atlas_lookup(
         self,
@@ -7662,6 +9962,19 @@ class MSMAnimationViewer(QMainWindow):
             anim_flip = dof_meta.get("anim_flip_y", anim_flip)
         if isinstance(anim_flip, bool):
             animation.dof_anim_flip_y = anim_flip
+        meta_candidates = []
+        if isinstance(dof_meta, dict):
+            meta_candidates.append(dof_meta)
+        if isinstance(resource_dict, dict) and isinstance(resource_dict.get("dof_meta"), dict):
+            meta_candidates.append(resource_dict.get("dof_meta") or {})
+        for meta in meta_candidates:
+            try:
+                position_scale = float(meta.get("position_scale"))
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(position_scale) and position_scale > 0.0:
+                setattr(animation, "dof_position_scale", position_scale)
+                break
         self._apply_monster_layer_overrides(layers, source_token, resource_dict, source_path)
         return animation
 
@@ -8526,11 +10839,15 @@ class MSMAnimationViewer(QMainWindow):
                     f"Attachment target '{target}' not found; attachment '{payload.get('name')}' will be skipped.",
                     "WARNING"
                 )
-    
+
     def convert_bin_to_json(self):
+        with profile_scope("conversion.bin_start"):
+            return self._convert_bin_to_json_impl()
+
+    def _convert_bin_to_json_impl(self):
         """Convert selected BIN file to JSON"""
         if self._bin_convert_thread and self._bin_convert_thread.isRunning():
-            QMessageBox.warning(self, "Conversion Running", "A BIN conversion is already in progress.")
+            self._warn_bin_conversion("Conversion Running", "A BIN conversion is already in progress.")
             return
 
         current_data = self.control_panel.bin_combo.currentData()
@@ -8544,16 +10861,23 @@ class MSMAnimationViewer(QMainWindow):
             bin_path = ""
 
         if not bin_path or not bin_path.lower().endswith('.bin'):
-            QMessageBox.warning(self, "Error", "Please select a .bin file")
+            self._warn_bin_conversion("Error", "Please select a .bin file")
             return
-        
+
         if not os.path.exists(bin_path):
-            QMessageBox.warning(self, "Error", "Selected BIN file no longer exists")
+            self._warn_bin_conversion("Error", "Selected BIN file no longer exists")
             self.log_widget.log(f"Missing BIN file: {bin_path}", "ERROR")
             return
 
+        forced_converter_key = self._selected_basic_bin_converter_key()
         self._set_bin_conversion_active(True)
-        self._bin_convert_worker = BinConversionWorker(self, bin_path, force=False, announce=True)
+        self._bin_convert_worker = BinConversionWorker(
+            self,
+            bin_path,
+            force=False,
+            announce=True,
+            forced_converter_key=forced_converter_key,
+        )
         self._bin_convert_thread = QThread(self)
         self._bin_convert_worker.moveToThread(self._bin_convert_thread)
         self._bin_convert_thread.started.connect(self._bin_convert_worker.run)
@@ -8577,10 +10901,43 @@ class MSMAnimationViewer(QMainWindow):
         if not json_path:
             return
 
-        if not self.select_file_by_path(json_path):
-            self.refresh_file_list()
-            if not self.select_file_by_path(json_path):
+        select_start = time.perf_counter()
+        converted_payload = payload.get("converted_payload")
+        fast_payload_mode = (
+            self._simple_viewer_mode_enabled
+            and isinstance(converted_payload, dict)
+            and not self.dof_search_enabled
+        )
+        if fast_payload_mode:
+            combo = self.control_panel.bin_combo
+            signals_blocked = combo.blockSignals(True)
+            try:
+                self._update_file_index_for_paths([json_path])
+            finally:
+                combo.blockSignals(signals_blocked)
+            if not self._select_file_by_path_silent(json_path):
                 self.log_widget.log("Could not auto-select converted JSON file", "WARNING")
+            self._apply_json_payload(json_path, converted_payload)
+        else:
+            if not self.select_file_by_path(json_path):
+                if self._simple_viewer_mode_enabled and not self.dof_search_enabled:
+                    self._update_file_index_for_paths([json_path])
+            if not self.select_file_by_path(json_path):
+                self.refresh_file_list()
+                if not self.select_file_by_path(json_path):
+                    self.log_widget.log("Could not auto-select converted JSON file", "WARNING")
+        if self._simple_viewer_mode_enabled:
+            convert_ms = float(payload.get("convert_elapsed_ms") or 0.0)
+            select_load_ms = (time.perf_counter() - select_start) * 1000.0
+            self.log_widget.log(
+                (
+                    "Basic mode BIN timing: "
+                    f"convert={convert_ms:.0f} ms, "
+                    f"select/load={select_load_ms:.0f} ms, "
+                    f"total={convert_ms + select_load_ms:.0f} ms"
+                ),
+                "INFO",
+            )
 
     def _cleanup_bin_conversion_thread(self) -> None:
         """Release worker/thread objects after conversion exits."""
@@ -8592,6 +10949,107 @@ class MSMAnimationViewer(QMainWindow):
             self._bin_convert_thread.deleteLater()
             self._bin_convert_thread = None
 
+    def _select_file_by_path_silent(self, target_path: str) -> bool:
+        """Select a file combo entry without triggering load handlers."""
+        normalized_target = os.path.normcase(os.path.normpath(target_path))
+        combo = self.control_panel.bin_combo
+        signals_blocked = combo.blockSignals(True)
+        try:
+            for idx, entry in enumerate(self._get_filtered_file_index()):
+                if entry.normalized_path() == normalized_target:
+                    combo.setCurrentIndex(idx)
+                    return True
+            for idx in range(combo.count()):
+                data_path = combo.itemData(idx)
+                if not data_path:
+                    continue
+                if os.path.normcase(os.path.normpath(data_path)) == normalized_target:
+                    combo.setCurrentIndex(idx)
+                    return True
+        finally:
+            combo.blockSignals(signals_blocked)
+        return False
+
+    def _can_use_basic_rev6_fast_conversion(self, forced_converter_key: Optional[str]) -> bool:
+        """Return True when simple mode can safely bypass the converter subprocess."""
+        if not self._simple_viewer_mode_enabled:
+            return False
+        key = forced_converter_key
+        if key is None:
+            key = self._selected_basic_bin_converter_key()
+        key = self._normalize_simple_bin_revision_key(key) if key else None
+        return key == "rev6"
+
+    def _convert_rev6_bin_file_for_basic_mode(
+        self,
+        bin_path: str,
+        *,
+        force: bool = False,
+        announce: bool = True,
+        log_sink: Optional[List[Tuple[str, str]]] = None,
+        warning_sink: Optional[List[Tuple[str, str]]] = None,
+    ) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+        """Convert Rev6 BIN in-process for simple mode and return the parsed payload."""
+
+        def _log(message: str, level: str = "INFO") -> None:
+            if log_sink is not None:
+                log_sink.append((message, level))
+            else:
+                self.log_widget.log(message, level)
+
+        def _warn(title: str, message: str) -> None:
+            if warning_sink is not None:
+                warning_sink.append((title, message))
+            else:
+                self._warn_bin_conversion(title, message)
+
+        if not os.path.exists(bin_path):
+            _log(f"BIN file not found: {bin_path}", "ERROR")
+            if announce:
+                _warn("Error", "Selected BIN file no longer exists")
+            return None, None
+
+        module = self._load_rev6_animation_module()
+        if not module:
+            message = "Rev6 BIN converter missing; cannot parse rev6 files."
+            _log(message, "ERROR")
+            if announce:
+                _warn("Error", message)
+            return None, None
+
+        json_path = os.path.splitext(bin_path)[0] + ".json"
+        relative_display = self._relative_xml_bin_display(bin_path)
+        action = "Re-exporting" if force else "Converting"
+        _log(f"{action} {relative_display} to JSON...", "INFO")
+        _log("Manual BIN revision selected: Rev6. Skipping automatic revision grabber.", "INFO")
+        _log("Attempting Rev6 BIN parser...", "INFO")
+
+        try:
+            with profile_scope("conversion.rev6_inprocess_parse"):
+                bin_anim = module.BinAnim.from_file(str(bin_path))
+                converted_payload = bin_anim.to_dict()
+            with profile_scope("conversion.rev6_inprocess_json_write"):
+                with open(json_path, "w", encoding="utf-8") as handle:
+                    json.dump(converted_payload, handle, indent=2)
+        except Exception as exc:
+            message = f"Rev6 BIN parser failed: {exc}"
+            _log(message, "ERROR")
+            if announce:
+                _warn("Conversion Failed", message)
+            return None, None
+
+        valid, reason = self._validate_converted_animation_json_fast(json_path)
+        if not valid:
+            message = f"Rev6 BIN parser output rejected: {reason}"
+            _log(message, "WARNING")
+            if announce:
+                _warn("Conversion Failed", message)
+            return None, None
+
+        _log(f"Rev6 BIN parser output validated: {reason}", "INFO")
+        _log(f"Converted {os.path.basename(bin_path)} via Rev6 BIN parser", "SUCCESS")
+        return json_path, converted_payload
+
     def _convert_bin_file(
         self,
         bin_path: str,
@@ -8602,6 +11060,31 @@ class MSMAnimationViewer(QMainWindow):
         warning_sink: Optional[List[Tuple[str, str]]] = None,
         refresh_on_success: bool = True,
         command_runner: Optional[Callable[[List[str], Optional[str]], subprocess.CompletedProcess]] = None,
+        forced_converter_key: Optional[str] = None,
+    ) -> Optional[str]:
+        with profile_scope("conversion.bin_file"):
+            return self._convert_bin_file_impl(
+                bin_path,
+                force=force,
+                announce=announce,
+                log_sink=log_sink,
+                warning_sink=warning_sink,
+                refresh_on_success=refresh_on_success,
+                command_runner=command_runner,
+                forced_converter_key=forced_converter_key,
+            )
+
+    def _convert_bin_file_impl(
+        self,
+        bin_path: str,
+        *,
+        force: bool = False,
+        announce: bool = True,
+        log_sink: Optional[List[Tuple[str, str]]] = None,
+        warning_sink: Optional[List[Tuple[str, str]]] = None,
+        refresh_on_success: bool = True,
+        command_runner: Optional[Callable[[List[str], Optional[str]], subprocess.CompletedProcess]] = None,
+        forced_converter_key: Optional[str] = None,
     ) -> Optional[str]:
         """Convert a specific BIN file via bin2json, optionally forcing re-export."""
         run_command = command_runner or self._run_converter_command
@@ -8631,19 +11114,39 @@ class MSMAnimationViewer(QMainWindow):
             return None
 
         json_path = os.path.splitext(bin_path)[0] + '.json'
-        detection_hints = collect_bin_detection_hints(bin_path)
-        revision_hint = detection_hints.revision_hint
+        selected_converter_key = forced_converter_key
+        if selected_converter_key is None:
+            selected_converter_key = self._selected_basic_bin_converter_key()
+        selected_converter_key = (
+            self._normalize_simple_bin_revision_key(selected_converter_key)
+            if selected_converter_key
+            else None
+        )
+        if selected_converter_key == "auto":
+            selected_converter_key = None
+        detection_hints = None
+        revision_hint: Optional[int] = None
+        if selected_converter_key is None:
+            detection_hints = collect_bin_detection_hints(bin_path)
+            revision_hint = detection_hints.revision_hint
 
         relative_display = self._relative_xml_bin_display(bin_path)
         action = "Re-exporting" if force else "Converting"
         _log(f"{action} {relative_display} to JSON...", "INFO")
-        hint_parts: List[str] = []
-        if revision_hint is not None:
-            hint_parts.append(f"rev {revision_hint}")
-        if detection_hints.family_hint:
-            hint_parts.append(f"{detection_hints.family_hint} family")
-        if hint_parts:
-            _log(f"Auto-detect hints: {', '.join(hint_parts)}.", "INFO")
+        if selected_converter_key is not None:
+            _log(
+                f"Manual BIN revision selected: {converter_display_name(selected_converter_key)}. "
+                "Skipping automatic revision grabber.",
+                "INFO",
+            )
+        else:
+            hint_parts: List[str] = []
+            if revision_hint is not None:
+                hint_parts.append(f"rev {revision_hint}")
+            if detection_hints and detection_hints.family_hint:
+                hint_parts.append(f"{detection_hints.family_hint} family")
+            if hint_parts:
+                _log(f"Auto-detect hints: {', '.join(hint_parts)}.", "INFO")
 
         converter_paths: Dict[str, Optional[str]] = {
             "rev6": self.bin2json_path,
@@ -8683,7 +11186,11 @@ class MSMAnimationViewer(QMainWindow):
             "muppets": "Rev2 (My Muppets Show) BIN converter missing; cannot auto-parse muppet_* files.",
         }
 
-        preferred_order = build_auto_converter_order(detection_hints)
+        preferred_order = (
+            [selected_converter_key]
+            if selected_converter_key is not None
+            else build_auto_converter_order(detection_hints)
+        )
 
         attempts: List[Tuple[str, str, List[str], str, str, Optional[int]]] = []
         queued: Set[str] = set()
@@ -8751,7 +11258,10 @@ class MSMAnimationViewer(QMainWindow):
                         error_messages.append(error_text)
                         _log(error_text, "WARNING")
                         continue
-                valid, reason = self._validate_converted_animation_json(json_path, expected_rev)
+                if selected_converter_key is not None:
+                    valid, reason = self._validate_converted_animation_json_fast(json_path)
+                else:
+                    valid, reason = self._validate_converted_animation_json(json_path, expected_rev)
                 if not valid:
                     error_text = f"{friendly} output rejected: {reason}"
                     error_messages.append(error_text)
@@ -8788,6 +11298,16 @@ class MSMAnimationViewer(QMainWindow):
     @staticmethod
     def _infer_revision_hint(normalized_path: str) -> Optional[int]:
         return infer_revision_hint(normalized_path)
+
+    @staticmethod
+    def _validate_converted_animation_json_fast(json_path: str) -> Tuple[bool, str]:
+        try:
+            size = os.path.getsize(json_path)
+        except OSError as exc:
+            return False, f"output JSON is missing ({exc})"
+        if size <= 0:
+            return False, "output JSON is empty"
+        return True, f"generated JSON ({size / (1024 * 1024):.1f} MB)"
 
     def _validate_converted_animation_json(
         self,
@@ -8845,30 +11365,211 @@ class MSMAnimationViewer(QMainWindow):
         return [sys.executable, script_path]
 
     @staticmethod
-    def _run_converter_command_blocking(cmd: List[str], cwd: Optional[str]) -> subprocess.CompletedProcess:
+    def _script_command_payload(cmd: List[str]) -> Optional[Tuple[str, List[str]]]:
+        """Return the target script/args for app-owned Python helper commands."""
+        if not cmd:
+            return None
+
+        def _same_executable(left: str, right: str) -> bool:
+            try:
+                return os.path.samefile(left, right)
+            except (OSError, ValueError):
+                return os.path.normcase(os.path.abspath(left)) == os.path.normcase(os.path.abspath(right))
+
+        if len(cmd) >= 3 and _same_executable(cmd[0], sys.executable) and cmd[1] == "--run-script":
+            return cmd[2], list(cmd[3:])
+        if len(cmd) >= 2 and _same_executable(cmd[0], sys.executable) and cmd[1].lower().endswith(".py"):
+            return cmd[1], list(cmd[2:])
+        return None
+
+    @staticmethod
+    def _run_python_script_in_process(
+        script_path: str,
+        args: List[str],
+        working_dir: Optional[str] = None,
+        output_callback: Optional[Callable[[str, str], None]] = None,
+    ) -> subprocess.CompletedProcess:
+        """Execute a converter script without spawning a new Python/app window."""
+        if not os.path.isabs(script_path):
+            local_candidate = os.path.abspath(script_path)
+            cwd_candidate = (
+                os.path.abspath(os.path.join(working_dir, script_path))
+                if working_dir
+                else ""
+            )
+            if os.path.exists(local_candidate):
+                script_path = local_candidate
+            elif cwd_candidate and os.path.exists(cwd_candidate):
+                script_path = cwd_candidate
+            else:
+                script_path = local_candidate
+        buf_out = io.StringIO()
+        buf_err = io.StringIO()
+
+        class _CallbackWriter(io.TextIOBase):
+            def __init__(self, target: io.StringIO, level: str):
+                self._target = target
+                self._level = level
+                self._pending = ""
+
+            @property
+            def encoding(self) -> str:
+                return "utf-8"
+
+            def writable(self) -> bool:
+                return True
+
+            def write(self, text: str) -> int:
+                if text is None:
+                    return 0
+                chunk = str(text)
+                self._target.write(chunk)
+                if output_callback:
+                    self._pending += chunk.replace("\r\n", "\n").replace("\r", "\n")
+                    while "\n" in self._pending:
+                        line, self._pending = self._pending.split("\n", 1)
+                        self._emit(line)
+                return len(chunk)
+
+            def flush(self) -> None:
+                if output_callback and self._pending.strip():
+                    self._emit(self._pending)
+                self._pending = ""
+
+            def _emit(self, line: str) -> None:
+                stripped = line.strip()
+                if not stripped or not output_callback:
+                    return
+                try:
+                    output_callback(stripped, self._level)
+                except Exception:
+                    pass
+
+        out_stream = _CallbackWriter(buf_out, "INFO")
+        err_stream = _CallbackWriter(buf_err, "WARNING")
+        previous_cwd = os.getcwd()
+        previous_argv = sys.argv[:]
+        return_code = 0
+        script_dir = os.path.dirname(script_path)
+        inserted_path = False
+        try:
+            if working_dir:
+                os.chdir(working_dir)
+            sys.argv = [script_path] + list(args)
+            if script_dir and script_dir not in sys.path:
+                sys.path.insert(0, script_dir)
+                inserted_path = True
+            with contextlib.redirect_stdout(out_stream), contextlib.redirect_stderr(err_stream):
+                try:
+                    runpy.run_path(script_path, run_name="__main__")
+                except SystemExit as exc:
+                    code = exc.code
+                    if isinstance(code, int):
+                        return_code = code
+                    elif code:
+                        err_stream.write(str(code))
+                        return_code = 1
+        except Exception as exc:
+            err_stream.write(str(exc))
+            return_code = 1
+        finally:
+            out_stream.flush()
+            err_stream.flush()
+            sys.argv = previous_argv
+            os.chdir(previous_cwd)
+            if inserted_path:
+                with contextlib.suppress(ValueError):
+                    sys.path.remove(script_dir)
+        return subprocess.CompletedProcess(
+            args=[script_path] + list(args),
+            returncode=return_code,
+            stdout=buf_out.getvalue(),
+            stderr=buf_err.getvalue(),
+        )
+
+    @staticmethod
+    def _emit_converter_output(
+        stdout: str,
+        stderr: str,
+        output_callback: Optional[Callable[[str, str], None]],
+    ) -> None:
+        if not output_callback:
+            return
+        for text, level in ((stdout, "INFO"), (stderr, "WARNING")):
+            normalized = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+            for line in normalized.split("\n"):
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    output_callback(stripped, level)
+                except Exception:
+                    pass
+
+    @staticmethod
+    def _hidden_subprocess_kwargs() -> Dict[str, Any]:
+        """Hide helper process windows on Windows when a subprocess is unavoidable."""
+        if os.name != "nt":
+            return {}
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
+        return {
+            "startupinfo": startupinfo,
+            "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        }
+
+    @staticmethod
+    def _run_converter_command_blocking(
+        cmd: List[str],
+        cwd: Optional[str],
+        output_callback: Optional[Callable[[str, str], None]] = None,
+    ) -> subprocess.CompletedProcess:
         """Execute a converter command without Qt objects (safe for worker threads)."""
         if not cmd:
+            if output_callback:
+                try:
+                    output_callback("Empty converter command.", "WARNING")
+                except Exception:
+                    pass
             return subprocess.CompletedProcess(args=cmd, returncode=1, stdout="", stderr="Empty converter command.")
+        script_payload = MSMAnimationViewer._script_command_payload(cmd)
+        if script_payload is not None:
+            script_path, args = script_payload
+            return MSMAnimationViewer._run_python_script_in_process(script_path, args, cwd, output_callback)
         try:
             result = subprocess.run(
                 cmd,
                 cwd=cwd or None,
                 capture_output=True,
                 text=True,
+                **MSMAnimationViewer._hidden_subprocess_kwargs(),
             )
-            return subprocess.CompletedProcess(
+            completed = subprocess.CompletedProcess(
                 args=cmd,
                 returncode=result.returncode,
                 stdout=result.stdout or "",
                 stderr=result.stderr or "",
             )
+            MSMAnimationViewer._emit_converter_output(completed.stdout, completed.stderr, output_callback)
+            return completed
         except Exception as exc:
+            if output_callback:
+                try:
+                    output_callback(str(exc), "WARNING")
+                except Exception:
+                    pass
             return subprocess.CompletedProcess(args=cmd, returncode=1, stdout="", stderr=str(exc))
 
     def _run_converter_command(self, cmd: List[str], cwd: Optional[str]) -> subprocess.CompletedProcess:
         """Execute a converter command, supporting embedded scripts in frozen builds."""
         if not cmd:
             return subprocess.CompletedProcess(args=cmd, returncode=1, stdout="", stderr="Empty converter command.")
+
+        script_payload = self._script_command_payload(cmd)
+        if script_payload is not None:
+            script_path, args = script_payload
+            return self._run_python_script_in_process(script_path, args, cwd)
 
         process = QProcess(self)
         process.setProgram(cmd[0])
@@ -8925,49 +11626,19 @@ class MSMAnimationViewer(QMainWindow):
         working_dir: Optional[str] = None,
     ) -> subprocess.CompletedProcess:
         """Execute a helper script inside the current interpreter when frozen."""
-        buf_out = io.StringIO()
-        buf_err = io.StringIO()
-        previous_cwd = os.getcwd()
-        previous_argv = sys.argv[:]
-        return_code = 0
-        try:
-            if working_dir:
-                os.chdir(working_dir)
-            sys.argv = [script_path] + list(args)
-            script_dir = os.path.dirname(script_path)
-            inserted_path = False
-            if script_dir and script_dir not in sys.path:
-                sys.path.insert(0, script_dir)
-                inserted_path = True
-            with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
-                try:
-                    runpy.run_path(script_path, run_name="__main__")
-                except SystemExit as exc:
-                    code = exc.code
-                    if isinstance(code, int):
-                        return_code = code
-                    else:
-                        buf_err.write(str(code))
-                        return_code = 1
-        except Exception as exc:
-            buf_err.write(str(exc))
-            return_code = 1
-        finally:
-            sys.argv = previous_argv
-            os.chdir(previous_cwd)
-            if inserted_path:
-                with contextlib.suppress(ValueError):
-                    sys.path.remove(script_dir)
-        return subprocess.CompletedProcess(
-            args=[script_path] + list(args),
-            returncode=return_code,
-            stdout=buf_out.getvalue(),
-            stderr=buf_err.getvalue(),
-        )
+        return self._run_python_script_in_process(script_path, args, working_dir)
 
     def _warn_bin_conversion(self, title: str, message: str) -> None:
         """Show or suppress modal warnings triggered during BIN conversions."""
-        if not self._suppress_bin_error_popups:
+        if self._suppress_bin_error_popups:
+            self._emit_conversion_diagnostic(
+                "BIN conversion message box suppressed: "
+                f"title={self._compact_diagnostic_text(title)}; "
+                f"text={self._compact_diagnostic_text(message, limit=1200)}"
+            )
+            if hasattr(self, "log_widget"):
+                self.log_widget.log(f"{title}: {message}", "WARNING")
+        else:
             QMessageBox.warning(self, title, message)
 
     @staticmethod
@@ -8985,6 +11656,114 @@ class MSMAnimationViewer(QMainWindow):
         if lower.endswith(".json"):
             name = name[:-5]
         return name
+
+    @staticmethod
+    def _safe_rev6_package_stem(value: str) -> str:
+        cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", value or "").strip("._")
+        return cleaned or "dof_animation"
+
+    @classmethod
+    def _infer_dof_rev6_package_names(cls, asset_path: str) -> Dict[str, str]:
+        anim_name = cls._dof_anim_name_from_path(asset_path)
+        tokens = [token for token in re.split(r"[_\s-]+", anim_name) if token]
+        code = ""
+        if (
+            tokens
+            and re.fullmatch(r"[A-Za-z0-9]{1,8}", tokens[0])
+            and any(ch.isupper() for ch in tokens[0])
+        ):
+            code = tokens[0]
+
+        if code and re.search(r"[A-Za-z]", code):
+            lower_tokens = {token.lower() for token in tokens[1:]}
+            bin_suffix = ""
+            sheet_suffix = ""
+            if code.lower().startswith("t") and "adult" in lower_tokens:
+                bin_suffix = "_ADULT"
+                sheet_suffix = "_adult"
+            elif "epic" in lower_tokens:
+                bin_suffix = "_EPIC"
+                sheet_suffix = "_EPIC"
+            elif "rare" in lower_tokens:
+                bin_suffix = "_RARE"
+                sheet_suffix = "_RARE"
+            bin_stem = f"monster_{code.lower()}{bin_suffix}"
+            sheet_stem = f"monster_{code.upper()}{sheet_suffix}_sheet"
+        else:
+            fallback = cls._safe_rev6_package_stem(anim_name)
+            bin_stem = fallback
+            sheet_stem = fallback
+
+        return {
+            "source_stem": anim_name,
+            "package_stem": cls._safe_rev6_package_stem(bin_stem),
+            "bin_name": f"{cls._safe_rev6_package_stem(bin_stem)}.bin",
+            "xml_name": f"{cls._safe_rev6_package_stem(sheet_stem)}.xml",
+            "png_name": f"{cls._safe_rev6_package_stem(sheet_stem)}.png",
+        }
+
+    @classmethod
+    def _infer_dof_rev6_package_names_for_token(cls, asset_path: str, target_token: str) -> Dict[str, str]:
+        inferred = cls._infer_dof_rev6_package_names(asset_path)
+        token = cls._safe_rev6_package_stem(str(target_token or "").strip().lower())
+        if not token:
+            return inferred
+        bin_stem = f"monster_{token}"
+        sheet_stem = f"monster_{token.upper()}_sheet"
+        return {
+            "source_stem": inferred["source_stem"],
+            "package_stem": cls._safe_rev6_package_stem(bin_stem),
+            "bin_name": f"{cls._safe_rev6_package_stem(bin_stem)}.bin",
+            "xml_name": f"{cls._safe_rev6_package_stem(sheet_stem)}.xml",
+            "png_name": f"{cls._safe_rev6_package_stem(sheet_stem)}.png",
+        }
+
+    def _build_dof_rev6_package_option_args(self, *, include_control_panel_extras: bool = True) -> List[str]:
+        option_args: List[str] = [
+            "--include-mesh-xml",
+            "--premultiply-alpha",
+            "--hires-xml",
+            "--position-scale",
+            "1.0",
+        ]
+        if (
+            include_control_panel_extras
+            and getattr(self.control_panel, "dof_mesh_pivot_checkbox", None)
+            and self.control_panel.dof_mesh_pivot_checkbox.isChecked()
+        ):
+            option_args.insert(0, "--mesh-pivot-local")
+        try:
+            alpha_hardness = float(self.settings.value("dof/alpha_hardness", 0.0, type=float))
+        except (TypeError, ValueError):
+            alpha_hardness = 0.0
+        alpha_hardness = max(0.0, min(2.0, alpha_hardness))
+        if alpha_hardness > 1e-6:
+            option_args += ["--alpha-hardness", f"{alpha_hardness:.3f}"]
+
+        if include_control_panel_extras:
+            if getattr(self.control_panel, "dof_swap_anchor_report_checkbox", None) and self.control_panel.dof_swap_anchor_report_checkbox.isChecked():
+                option_args.append("--swap-anchor-report")
+            if getattr(self.control_panel, "dof_swap_anchor_edge_align_checkbox", None) and self.control_panel.dof_swap_anchor_edge_align_checkbox.isChecked():
+                option_args.append("--swap-anchor-edge-align")
+            if getattr(self.control_panel, "dof_swap_anchor_pivot_offset_checkbox", None) and self.control_panel.dof_swap_anchor_pivot_offset_checkbox.isChecked():
+                option_args.append("--swap-anchor-pivot-offset")
+            if getattr(self.control_panel, "dof_swap_anchor_report_override_checkbox", None) and self.control_panel.dof_swap_anchor_report_override_checkbox.isChecked():
+                option_args.append("--swap-anchor-report-override")
+        return option_args
+
+    @staticmethod
+    def _unique_directory_path(path: str) -> str:
+        candidate = Path(path)
+        if not candidate.exists():
+            return str(candidate)
+        parent = candidate.parent
+        stem = candidate.name
+        counter = 2
+        while True:
+            next_candidate = parent / f"{stem}_{counter}"
+            if not next_candidate.exists():
+                return str(next_candidate)
+            counter += 1
 
     def _dof_output_root(self) -> Optional[str]:
         if not self.dof_path:
@@ -9010,6 +11789,85 @@ class MSMAnimationViewer(QMainWindow):
         safe_name = anim_name.replace("/", "_").replace("\\", "_") or "bundle_anim"
         return os.path.normpath(os.path.join(output_root, "bundles", safe_name))
 
+    def _build_dof_json_conversion_command(
+        self,
+        asset_path: str,
+    ) -> Tuple[List[str], str, str, str]:
+        """Build the DOF JSON converter command for an asset or bundle entry."""
+        if not self.dof_anim_to_json_path or not os.path.exists(self.dof_anim_to_json_path):
+            raise RuntimeError("DOF converter script was not found.")
+        if not self.dof_path:
+            raise RuntimeError("Set the DOF Assets path before converting.")
+
+        source = str(asset_path or "").strip()
+        is_bundle = source.lower().startswith("bundle://")
+        if not source or (not is_bundle and not source.lower().endswith(".animbbb.asset")):
+            raise RuntimeError("Please select a DOF .ANIMBBB asset or bundle entry.")
+        if not is_bundle and not os.path.exists(source):
+            raise RuntimeError("Selected DOF asset file no longer exists.")
+
+        output_dir = (
+            self._dof_output_dir_for_bundle_anim(source)
+            if is_bundle
+            else self._dof_output_dir_for_asset(source)
+        )
+        if not output_dir:
+            raise RuntimeError("Unable to determine DOF output directory.")
+        os.makedirs(output_dir, exist_ok=True)
+
+        if is_bundle:
+            bundle_anim = source.split("bundle://", 1)[1].strip()
+            cmd = self._build_python_command(self.dof_anim_to_json_path) + [
+                f"bundle://{bundle_anim}",
+                "--output",
+                output_dir,
+                "--bundle-root",
+                self.dof_path,
+                "--assets-root",
+                self.dof_path,
+            ]
+        else:
+            cmd = self._build_python_command(self.dof_anim_to_json_path) + [
+                source,
+                "--output",
+                output_dir,
+                "--assets-root",
+                self.dof_path,
+            ]
+
+        if getattr(self.control_panel, "dof_mesh_pivot_checkbox", None) and self.control_panel.dof_mesh_pivot_checkbox.isChecked():
+            cmd.append("--mesh-pivot-local")
+        if (
+            getattr(self.control_panel, "dof_include_mesh_xml_checkbox", None)
+            and self.control_panel.dof_include_mesh_xml_checkbox.isChecked()
+        ):
+            cmd.append("--include-mesh-xml")
+        if (
+            getattr(self.control_panel, "dof_premultiply_alpha_checkbox", None)
+            and self.control_panel.dof_premultiply_alpha_checkbox.isChecked()
+        ):
+            cmd.append("--premultiply-alpha")
+        try:
+            alpha_hardness = float(self.settings.value("dof/alpha_hardness", 0.0, type=float))
+        except (TypeError, ValueError):
+            alpha_hardness = 0.0
+        alpha_hardness = max(0.0, min(2.0, alpha_hardness))
+        if alpha_hardness > 1e-6:
+            cmd += ["--alpha-hardness", f"{alpha_hardness:.3f}"]
+        if getattr(self.control_panel, "dof_swap_anchor_report_checkbox", None) and self.control_panel.dof_swap_anchor_report_checkbox.isChecked():
+            cmd.append("--swap-anchor-report")
+        if getattr(self.control_panel, "dof_swap_anchor_edge_align_checkbox", None) and self.control_panel.dof_swap_anchor_edge_align_checkbox.isChecked():
+            cmd.append("--swap-anchor-edge-align")
+        if getattr(self.control_panel, "dof_swap_anchor_pivot_offset_checkbox", None) and self.control_panel.dof_swap_anchor_pivot_offset_checkbox.isChecked():
+            cmd.append("--swap-anchor-pivot-offset")
+        if getattr(self.control_panel, "dof_swap_anchor_report_override_checkbox", None) and self.control_panel.dof_swap_anchor_report_override_checkbox.isChecked():
+            cmd.append("--swap-anchor-report-override")
+
+        anim_name = self._dof_anim_name_from_path(source)
+        output_json = os.path.join(output_dir, f"{anim_name}.json")
+        cwd = os.path.dirname(self.dof_anim_to_json_path)
+        return cmd, cwd, source, output_json
+
     @staticmethod
     def _path_is_under(path: str, root: str) -> bool:
         try:
@@ -9018,6 +11876,20 @@ class MSMAnimationViewer(QMainWindow):
             return os.path.commonpath([path_abs, root_abs]) == root_abs
         except (ValueError, OSError):
             return False
+
+    @staticmethod
+    def _normalized_path_key(path: Optional[str]) -> str:
+        if not path:
+            return ""
+        try:
+            return os.path.normcase(os.path.abspath(os.path.normpath(str(path))))
+        except (TypeError, ValueError, OSError):
+            return ""
+
+    def _is_last_dof_migration_preview_path(self, path: Optional[str]) -> bool:
+        current_key = self._normalized_path_key(path)
+        preview_key = self._normalized_path_key(self._migration_last_preview_dof_output_path)
+        return bool(current_key and preview_key and current_key == preview_key)
 
     def _is_dof_json_payload(self, json_path: Optional[str], payload: Optional[Dict[str, Any]] = None) -> bool:
         if not json_path or not self.dof_path:
@@ -9043,15 +11915,46 @@ class MSMAnimationViewer(QMainWindow):
             # DOF anchor flips are now baked into exported JSON. Keep UI flips off.
             self._set_anchor_flip_state(False, False)
 
-    def _set_dof_conversion_active(self, active: bool) -> None:
+    def _set_dof_conversion_active(self, active: bool, label: Optional[str] = None) -> None:
         """Toggle UI elements while a DOF conversion is running."""
+        self._set_conversion_diagnostic_flag(active)
+        if active:
+            self._close_active_qt_popups()
         if hasattr(self, "control_panel") and hasattr(self.control_panel, "set_dof_convert_state"):
-            self.control_panel.set_dof_convert_state(not active)
+            self.control_panel.set_dof_convert_state(not active, label)
 
     def _set_bin_conversion_active(self, active: bool) -> None:
         """Toggle BIN conversion button while conversion is running."""
+        self._set_conversion_diagnostic_flag(active)
+        if active:
+            self._close_active_qt_popups()
         if hasattr(self, "control_panel") and hasattr(self.control_panel, "set_bin_convert_state"):
             self.control_panel.set_bin_convert_state(not active)
+
+    @staticmethod
+    def _set_conversion_diagnostic_flag(active: bool) -> None:
+        if active:
+            start_conversion_window_diagnostics("main conversion")
+        else:
+            stop_conversion_window_diagnostics("main conversion")
+
+    def _close_active_qt_popups(self) -> None:
+        """Close transient Qt popup widgets before long-running conversion work."""
+        app = QApplication.instance()
+        if app is not None:
+            for _ in range(8):
+                popup = app.activePopupWidget()
+                if popup is None:
+                    break
+                try:
+                    popup.hide()
+                except Exception:
+                    break
+        try:
+            if hasattr(self, "control_panel") and hasattr(self.control_panel, "bin_combo"):
+                self.control_panel.bin_combo.hidePopup()
+        except Exception:
+            pass
 
     def _update_dof_index_for_paths(self, paths: List[str]) -> None:
         """Insert or update specific DOF assets/outputs without rescanning the full tree."""
@@ -9090,6 +11993,84 @@ class MSMAnimationViewer(QMainWindow):
                 self.log_widget.log(f"Updated DOF index (+{added})", "INFO")
             self.apply_file_filter()
 
+    def _xml_bin_root_for_path(self, path: str) -> Optional[str]:
+        roots: List[str] = []
+        if self.downloads_path:
+            if not self._downloads_xml_bin_roots:
+                self._downloads_xml_bin_roots = self._find_downloads_xml_bin_roots()
+            roots.extend(self._downloads_xml_bin_roots)
+        if self.game_path:
+            game_root = os.path.join(self.game_path, "data", "xml_bin")
+            if os.path.isdir(game_root):
+                roots.append(game_root)
+        normalized_path = os.path.normcase(os.path.abspath(os.path.normpath(path)))
+        best_root = None
+        best_len = -1
+        for root in roots:
+            if not root:
+                continue
+            normalized_root = os.path.normcase(os.path.abspath(os.path.normpath(root)))
+            try:
+                common = os.path.commonpath([normalized_path, normalized_root])
+            except ValueError:
+                continue
+            if common == normalized_root and len(normalized_root) > best_len:
+                best_root = root
+                best_len = len(normalized_root)
+        return best_root
+
+    def _update_file_index_for_paths(self, paths: List[str]) -> None:
+        """Insert/update converted BIN/JSON entries without a full xml_bin rescan."""
+        entries_by_relative = {
+            entry.relative_path.lower(): AnimationFileEntry(
+                name=entry.name,
+                relative_path=entry.relative_path,
+                full_path=entry.full_path,
+            )
+            for entry in self.file_index
+        }
+        added = 0
+        for path in paths:
+            if not path or not os.path.exists(path):
+                continue
+            lower = path.lower()
+            if not (lower.endswith(".bin") or lower.endswith(".json")):
+                continue
+            root = self._xml_bin_root_for_path(path)
+            if not root:
+                continue
+            relative_path = os.path.relpath(path, root).replace("\\", "/")
+            rel_key = relative_path.lower()
+            existing_entry = entries_by_relative.get(rel_key)
+            if existing_entry and self.game_path:
+                existing_key = os.path.normcase(os.path.abspath(os.path.normpath(existing_entry.full_path)))
+                new_key = os.path.normcase(os.path.abspath(os.path.normpath(path)))
+                if existing_key != new_key:
+                    game_root = os.path.join(self.game_path, "data", "xml_bin")
+                    existing_is_game = self._path_is_under(existing_entry.full_path, game_root)
+                    new_is_game = self._path_is_under(path, game_root)
+                    if new_is_game and not existing_is_game:
+                        continue
+            was_new = existing_entry is None
+            entry = AnimationFileEntry(
+                name=os.path.basename(path),
+                relative_path=relative_path,
+                full_path=os.path.normpath(path),
+            )
+            entries_by_relative[rel_key] = entry
+            if entry.is_bin:
+                lower_name = entry.name.lower()
+                if lower_name not in self.xml_bin_file_map:
+                    self.xml_bin_file_map[lower_name] = entry.full_path
+            if was_new:
+                added += 1
+        if not added:
+            return
+        self.file_index = sorted(entries_by_relative.values(), key=lambda entry: entry.relative_path.lower())
+        self._rebuild_monster_lookup(self.file_index)
+        self.log_widget.log(f"Updated file index (+{added})", "INFO")
+        self.apply_file_filter()
+
     def _start_dof_conversion(
         self,
         cmd: List[str],
@@ -9100,6 +12081,28 @@ class MSMAnimationViewer(QMainWindow):
         """Kick off a DOF conversion in a background process."""
         if self._dof_convert_process and self._dof_convert_process.state() != QProcess.ProcessState.NotRunning:
             QMessageBox.warning(self, "Conversion Running", "A DOF conversion is already in progress.")
+            return
+        if self._dof_convert_thread and self._dof_convert_thread.isRunning():
+            QMessageBox.warning(self, "Conversion Running", "A DOF conversion is already in progress.")
+            return
+
+        script_payload = self._script_command_payload(cmd)
+        if script_payload is not None:
+            self._dof_convert_asset_path = asset_path
+            self._dof_convert_output_json = output_json
+            self._dof_convert_stdout_buffer = ""
+            self._dof_convert_stderr_buffer = ""
+            self._set_dof_conversion_active(True)
+
+            self._dof_convert_worker = ConverterCommandWorker(cmd, cwd)
+            self._dof_convert_thread = QThread(self)
+            self._dof_convert_worker.moveToThread(self._dof_convert_thread)
+            self._dof_convert_thread.started.connect(self._dof_convert_worker.run)
+            self._dof_convert_worker.log_message.connect(self._log_dof_worker_output)
+            self._dof_convert_worker.finished.connect(self._on_dof_conversion_worker_finished)
+            self._dof_convert_worker.finished.connect(self._dof_convert_thread.quit)
+            self._dof_convert_thread.finished.connect(self._cleanup_dof_conversion_thread)
+            self._dof_convert_thread.start()
             return
 
         process = QProcess(self)
@@ -9187,6 +12190,55 @@ class MSMAnimationViewer(QMainWindow):
         self._set_dof_conversion_active(False)
         return asset_path, output_json
 
+    def _log_dof_worker_output(self, text: str, level: str) -> None:
+        normalized = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+        for line in normalized.split("\n"):
+            stripped = line.strip()
+            if stripped:
+                self.log_widget.log(f"[DOF] {stripped}", level)
+
+    def _log_dof_rev6_worker_output(self, text: str, level: str) -> None:
+        normalized = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+        for line in normalized.split("\n"):
+            stripped = line.strip()
+            if stripped:
+                self.log_widget.log(f"[DOF Rev6] {stripped}", level)
+
+    def _on_dof_conversion_worker_finished(self, payload: Dict[str, Any]) -> None:
+        stdout = str(payload.get("stdout") or "")
+        stderr = str(payload.get("stderr") or "")
+        if not payload.get("logs_streamed"):
+            self._log_dof_worker_output(stdout, "INFO")
+            self._log_dof_worker_output(stderr, "WARNING")
+
+        asset_path, output_json = self._finalize_dof_conversion_state()
+        return_code = int(payload.get("returncode", 1))
+        if return_code != 0:
+            message = stderr.strip() or stdout.strip() or f"DOF conversion exited with code {return_code}."
+            self.log_widget.log(f"DOF conversion failed: {message}", "ERROR")
+            QMessageBox.warning(self, "Conversion Failed", message)
+            return
+
+        if output_json and os.path.exists(output_json):
+            self.log_widget.log(f"DOF JSON created: {output_json}", "SUCCESS")
+        else:
+            self.log_widget.log("DOF conversion completed but JSON was not found.", "WARNING")
+
+        self._update_dof_index_for_paths([asset_path or "", output_json or ""])
+        if output_json and os.path.exists(output_json):
+            if not self.select_file_by_path(output_json):
+                if self.dof_path:
+                    self.control_panel.bin_combo.setCurrentText(os.path.relpath(output_json, self.dof_path))
+            self.load_json_file(output_json)
+
+    def _cleanup_dof_conversion_thread(self) -> None:
+        if self._dof_convert_worker:
+            self._dof_convert_worker.deleteLater()
+            self._dof_convert_worker = None
+        if self._dof_convert_thread:
+            self._dof_convert_thread.deleteLater()
+            self._dof_convert_thread = None
+
     def _on_dof_conversion_finished(self, exit_code: int, exit_status: QProcess.ExitStatus) -> None:
         process = self.sender()
         if process is not self._dof_convert_process:
@@ -9236,29 +12288,35 @@ class MSMAnimationViewer(QMainWindow):
         message = err_text or out_text or f"DOF conversion error: {error_label}"
         self.log_widget.log(f"DOF conversion failed: {message}", "ERROR")
         QMessageBox.warning(self, "Conversion Failed", message)
-    
+
     def on_bin_selected(self, index: int):
         """Handle BIN/JSON file selection"""
         if index < 0:
             return
-        
+
         selected_path = self.control_panel.bin_combo.currentData()
         display_name = self.control_panel.bin_combo.currentText()
-        
+
         if not selected_path and display_name:
             selected_path = self._resolve_xml_bin_relative_path(display_name)
-        
+
         if not selected_path:
             return
-        
+
         lower_path = selected_path.lower()
         if self.dof_search_enabled:
             if lower_path.endswith('.json'):
                 self.load_json_file(selected_path)
             elif lower_path.endswith('.animbbb.asset'):
-                self.log_widget.log("Select 'Convert DOF to JSON' to use this asset.", "INFO")
+                self.log_widget.log(
+                    "Select 'Convert DOF to JSON' or 'Convert DOF to Rev6 Package' to use this asset.",
+                    "INFO",
+                )
             elif lower_path.startswith('bundle://'):
-                self.log_widget.log("Select 'Convert DOF to JSON' to use this bundle animation.", "INFO")
+                self.log_widget.log(
+                    "Select 'Convert DOF to JSON' or 'Convert DOF to Rev6 Package' to use this bundle animation.",
+                    "INFO",
+                )
             else:
                 self.log_widget.log("Unsupported DOF selection; choose a .ANIMBBB.asset or .json.", "WARNING")
             return
@@ -9267,7 +12325,7 @@ class MSMAnimationViewer(QMainWindow):
             self.load_json_file(selected_path)
         elif lower_path.endswith('.bin'):
             self.log_widget.log("Please convert BIN to JSON first", "WARNING")
-    
+
     def convert_dof_to_json(self):
         """Convert selected DOF .ANIMBBB.asset to JSON"""
         if not self.dof_anim_to_json_path or not os.path.exists(self.dof_anim_to_json_path):
@@ -9289,84 +12347,143 @@ class MSMAnimationViewer(QMainWindow):
         else:
             asset_path = ""
 
-        is_bundle = asset_path.lower().startswith("bundle://")
-        if not asset_path or (not is_bundle and not asset_path.lower().endswith(".animbbb.asset")):
-            QMessageBox.warning(self, "Error", "Please select a DOF .ANIMBBB asset or bundle entry")
+        try:
+            cmd, cwd, source_path, output_json = self._build_dof_json_conversion_command(asset_path)
+        except RuntimeError as exc:
+            QMessageBox.warning(self, "Error", str(exc))
+            if asset_path and "no longer exists" in str(exc).lower():
+                self.log_widget.log(f"Missing DOF asset file: {asset_path}", "ERROR")
             return
 
+        if source_path.lower().startswith("bundle://"):
+            self.log_widget.log(f"Converting DOF bundle {source_path} to JSON...", "INFO")
+        else:
+            display = os.path.relpath(source_path, self.dof_path).replace("\\", "/")
+            self.log_widget.log(f"Converting DOF asset {display} to JSON...", "INFO")
+        self._start_dof_conversion(cmd, cwd, source_path, output_json)
+
+    def convert_dof_to_rev6_package(self):
+        """Create a rev6 data package from the selected DOF animation."""
+        if not self.dof_anim_to_json_path or not os.path.exists(self.dof_anim_to_json_path):
+            QMessageBox.warning(self, "Missing Tool", "DOF converter script was not found.")
+            return
+        if not self.bin2json_path or not os.path.exists(self.bin2json_path):
+            QMessageBox.warning(self, "Missing Tool", "rev6 BIN converter script was not found.")
+            return
+        if not self.dof_path:
+            QMessageBox.warning(self, "Missing Path", "Set the DOF Assets path before converting.")
+            return
+        if self._dof_convert_process and self._dof_convert_process.state() != QProcess.ProcessState.NotRunning:
+            QMessageBox.warning(self, "Conversion Running", "A DOF conversion is already in progress.")
+            return
+        if self._dof_convert_thread and self._dof_convert_thread.isRunning():
+            QMessageBox.warning(self, "Conversion Running", "A DOF conversion is already in progress.")
+            return
+
+        current_data = self.control_panel.bin_combo.currentData()
+        current_text = self.control_panel.bin_combo.currentText()
+        if current_data:
+            asset_path = current_data
+        elif current_text:
+            asset_path = os.path.join(self.dof_path, current_text)
+        else:
+            asset_path = ""
+
+        is_bundle = asset_path.lower().startswith("bundle://")
+        if not asset_path or (not is_bundle and not asset_path.lower().endswith(".animbbb.asset")):
+            QMessageBox.warning(self, "Error", "Please select a DOF .ANIMBBB asset or bundle entry.")
+            return
         if not is_bundle and not os.path.exists(asset_path):
-            QMessageBox.warning(self, "Error", "Selected DOF asset file no longer exists")
+            QMessageBox.warning(self, "Error", "Selected DOF asset file no longer exists.")
             self.log_widget.log(f"Missing DOF asset file: {asset_path}", "ERROR")
             return
 
-        output_dir = (
-            self._dof_output_dir_for_bundle_anim(asset_path)
-            if is_bundle
-            else self._dof_output_dir_for_asset(asset_path)
+        inferred = self._infer_dof_rev6_package_names(asset_path)
+        package_base = os.path.join(
+            self.dof_path,
+            "Output",
+            "Rev6 Packages",
+            inferred["package_stem"],
         )
-        if not output_dir:
-            QMessageBox.warning(self, "Error", "Unable to determine DOF output directory.")
-            return
-        os.makedirs(output_dir, exist_ok=True)
+        package_root = self._unique_directory_path(package_base)
 
-        if is_bundle:
-            display = asset_path
-            self.log_widget.log(f"Converting DOF bundle {display} to JSON...", "INFO")
-            bundle_anim = asset_path.split("bundle://", 1)[1].strip()
-            cmd = self._build_python_command(self.dof_anim_to_json_path) + [
-                f"bundle://{bundle_anim}",
-                "--output",
-                output_dir,
-                "--bundle-root",
-                self.dof_path,
-            ]
-        else:
-            display = os.path.relpath(asset_path, self.dof_path).replace("\\", "/")
-            self.log_widget.log(f"Converting DOF asset {display} to JSON...", "INFO")
-            cmd = self._build_python_command(self.dof_anim_to_json_path) + [
-                asset_path,
-                "--output",
-                output_dir,
-                "--assets-root",
-                self.dof_path,
-            ]
-        if getattr(self.control_panel, "dof_mesh_pivot_checkbox", None) and self.control_panel.dof_mesh_pivot_checkbox.isChecked():
-            cmd.append("--mesh-pivot-local")
-        if (
-            getattr(self.control_panel, "dof_include_mesh_xml_checkbox", None)
-            and self.control_panel.dof_include_mesh_xml_checkbox.isChecked()
-        ):
-            cmd.append("--include-mesh-xml")
-        if (
-            getattr(self.control_panel, "dof_premultiply_alpha_checkbox", None)
-            and self.control_panel.dof_premultiply_alpha_checkbox.isChecked()
-        ):
-            cmd.append("--premultiply-alpha")
-        try:
-            alpha_hardness = float(self.settings.value("dof/alpha_hardness", 0.0, type=float))
-        except (TypeError, ValueError):
-            alpha_hardness = 0.0
-        alpha_hardness = max(0.0, min(2.0, alpha_hardness))
-        if alpha_hardness > 1e-6:
-            cmd += ["--alpha-hardness", f"{alpha_hardness:.3f}"]
-        if getattr(self.control_panel, "dof_swap_anchor_report_checkbox", None) and self.control_panel.dof_swap_anchor_report_checkbox.isChecked():
-            cmd.append("--swap-anchor-report")
-        if getattr(self.control_panel, "dof_swap_anchor_edge_align_checkbox", None) and self.control_panel.dof_swap_anchor_edge_align_checkbox.isChecked():
-            cmd.append("--swap-anchor-edge-align")
-        if getattr(self.control_panel, "dof_swap_anchor_pivot_offset_checkbox", None) and self.control_panel.dof_swap_anchor_pivot_offset_checkbox.isChecked():
-            cmd.append("--swap-anchor-pivot-offset")
-        if getattr(self.control_panel, "dof_swap_anchor_report_override_checkbox", None) and self.control_panel.dof_swap_anchor_report_override_checkbox.isChecked():
-            cmd.append("--swap-anchor-report-override")
-        anim_name = self._dof_anim_name_from_path(asset_path)
-        output_json = os.path.join(output_dir, f"{anim_name}.json")
-        self._start_dof_conversion(cmd, os.path.dirname(self.dof_anim_to_json_path), asset_path, output_json)
+        option_args = self._build_dof_rev6_package_option_args(include_control_panel_extras=True)
+
+        self.log_widget.log(
+            f"Creating rev6 package for {inferred['source_stem']}...",
+            "INFO",
+        )
+        self.log_widget.log(
+            "Rev6 game packages use rectangle-only atlas XML; mesh-local sprite offsets are preserved.",
+            "INFO",
+        )
+        self.log_widget.log(
+            "Rev6 game packages export premultiplied atlas PNGs with hires XML scaling.",
+            "INFO",
+        )
+        self.log_widget.log(
+            "Rev6 game packages keep DOF animation positions at 1.0 scale so layer spacing matches hires atlas geometry.",
+            "INFO",
+        )
+        self._set_dof_conversion_active(True, label="Packaging...")
+        self._dof_convert_worker = DofRev6PackageWorker(
+            self.dof_anim_to_json_path,
+            self.bin2json_path,
+            asset_path,
+            self.dof_path,
+            package_root,
+            inferred["source_stem"],
+            inferred["bin_name"],
+            inferred["xml_name"],
+            inferred["png_name"],
+            option_args,
+        )
+        self._dof_convert_thread = QThread(self)
+        self._dof_convert_worker.moveToThread(self._dof_convert_thread)
+        self._dof_convert_thread.started.connect(self._dof_convert_worker.run)
+        self._dof_convert_worker.log_message.connect(self._log_dof_rev6_worker_output)
+        self._dof_convert_worker.finished.connect(self._on_dof_rev6_package_finished)
+        self._dof_convert_worker.finished.connect(self._dof_convert_thread.quit)
+        self._dof_convert_thread.finished.connect(self._cleanup_dof_conversion_thread)
+        self._dof_convert_thread.start()
+
+    def _on_dof_rev6_package_finished(self, payload: Dict[str, Any]) -> None:
+        self._set_dof_conversion_active(False)
+        if not payload.get("logs_streamed"):
+            for message, level in payload.get("logs", []):
+                self.log_widget.log(f"[DOF Rev6] {message}", level)
+
+        if not payload.get("success"):
+            message = str(payload.get("error") or "DOF rev6 package conversion failed.")
+            temp_root = payload.get("temp_root")
+            self.log_widget.log(f"DOF rev6 package failed: {message}", "ERROR")
+            if temp_root:
+                self.log_widget.log(f"Temporary conversion output kept at: {temp_root}", "INFO")
+            QMessageBox.warning(self, "Package Failed", message)
+            return
+
+        package_root = str(payload.get("package_root") or "")
+        self.settings.setValue("dof/rev6_last_package_root", package_root)
+        self.log_widget.log("DOF rev6 package created.", "SUCCESS")
+        if package_root:
+            self.log_widget.log(f"Package: {package_root}", "INFO")
+        for key, label in (("bin_path", "BIN"), ("xml_path", "XML"), ("png_path", "PNG")):
+            path = payload.get(key)
+            if path:
+                self.log_widget.log(f"{label}: {path}", "INFO")
 
     def load_json_file(self, json_path: str):
+        with profile_scope("load.json_file"):
+            return self._load_json_file_impl(json_path)
+
+    def _load_json_file_impl(self, json_path: str):
         """Load animation data from JSON file"""
         try:
-            with open(json_path, 'r') as f:
-                payload = json.load(f)
-            self._apply_json_payload(json_path, payload)
+            with profile_scope("load.json_file.read_parse"):
+                with open(json_path, 'r') as f:
+                    payload = json.load(f)
+            with profile_scope("load.json_file.apply_payload"):
+                self._apply_json_payload(json_path, payload)
         except Exception as e:
             import traceback
             tb = traceback.format_exc()
@@ -9445,7 +12562,13 @@ class MSMAnimationViewer(QMainWindow):
             overrides[shader_name.lower()] = entry
         return overrides
 
-    def _apply_json_payload(self, json_path: str, payload: Dict[str, Any], announce: bool = True) -> None:
+    def _apply_json_payload(
+        self,
+        json_path: str,
+        payload: Dict[str, Any],
+        announce: bool = True,
+        force_dof_rev6_baked_preview: Optional[bool] = None,
+    ) -> None:
         """Apply a parsed JSON payload to the UI and animation combo."""
         # Reset animation selection state early so combo updates cannot persist
         # the previously loaded animation into the new payload.
@@ -9453,7 +12576,15 @@ class MSMAnimationViewer(QMainWindow):
         self.current_animation_name = None
         self.current_json_path = json_path
         self.current_json_data = payload
-        self.original_json_data = copy.deepcopy(payload)
+        if force_dof_rev6_baked_preview is None:
+            self._migration_current_preview_force_dof_pivots = self._is_last_dof_migration_preview_path(json_path)
+        else:
+            self._migration_current_preview_force_dof_pivots = bool(force_dof_rev6_baked_preview)
+        with profile_scope("load.json_apply.deep_copy_original"):
+            if self._basic_viewer_fast_load_enabled():
+                self.original_json_data = payload
+            else:
+                self.original_json_data = copy.deepcopy(payload)
         self.legacy_animation_active = self._is_legacy_payload(payload, json_path)
         self.active_legacy_sheet_key = None
         self.legacy_sheet_overrides.clear()
@@ -9492,11 +12623,18 @@ class MSMAnimationViewer(QMainWindow):
                     "INFO"
                 )
 
-        self.control_panel.anim_combo.clear()
+        basic_fast_load = self._basic_viewer_fast_load_enabled()
+        combo = self.control_panel.anim_combo
+        signals_blocked = combo.blockSignals(True) if basic_fast_load else None
+        combo.clear()
+        first_animation_index: Optional[int] = None
         if 'anims' in payload:
             anim_names = [anim.get('name', f"Animation {idx + 1}") for idx, anim in enumerate(payload['anims'])]
             if anim_names:
-                self.control_panel.anim_combo.addItems(anim_names)
+                combo.addItems(anim_names)
+                first_animation_index = 0
+                if basic_fast_load:
+                    combo.setCurrentIndex(0)
                 if announce:
                     self.log_widget.log(f"Found {len(anim_names)} animations", "INFO")
             if self.animation_shader_runtime_overrides:
@@ -9505,6 +12643,10 @@ class MSMAnimationViewer(QMainWindow):
                     "INFO",
                 )
         self.current_animation_index = -1
+        if basic_fast_load:
+            combo.blockSignals(bool(signals_blocked))
+            if first_animation_index is not None:
+                self.on_animation_selected(first_animation_index)
 
     @staticmethod
     def _is_legacy_payload(payload: Dict[str, Any], json_path: Optional[str]) -> bool:
@@ -10061,7 +13203,8 @@ class MSMAnimationViewer(QMainWindow):
         self._default_layer_order = [layer.layer_id for layer in layers]
         self._default_layer_visibility = {layer.layer_id: layer.visible for layer in layers}
         self._default_hidden_layer_ids = {layer.layer_id for layer in layers if not layer.visible}
-        self.layer_panel.set_default_hidden_layers(self._default_hidden_layer_ids)
+        if not self._basic_viewer_fast_load_enabled():
+            self.layer_panel.set_default_hidden_layers(self._default_hidden_layer_ids)
 
     def _capture_pose_baseline(self):
         """Snapshot the current animation layers for pose reset/undo reference."""
@@ -10642,7 +13785,7 @@ class MSMAnimationViewer(QMainWindow):
                     else:
                         idx += 2
         return None
-    
+
     def on_animation_selected(self, index: int):
         """Handle animation selection"""
         if index < 0 or not self.current_json_data:
@@ -10696,151 +13839,223 @@ class MSMAnimationViewer(QMainWindow):
         self._apply_costume_to_animation(entry)
 
     def load_animation(self, anim_index: int):
+        with profile_scope("load.animation"):
+            return self._load_animation_impl(anim_index)
+
+    def _load_animation_impl(self, anim_index: int):
         """Load and display an animation"""
         if not self.current_json_data or 'anims' not in self.current_json_data:
             return
+        basic_fast_load = self._basic_viewer_fast_load_enabled()
+        batch_fast_switch = bool(getattr(self, "_batch_export_fast_switch", False))
 
         preserved_costume_entry: Optional[CostumeEntry] = None
         previous_costume_key = self.active_costume_key
         self.layer_source_lookup = {}
 
-        self.control_panel.set_pose_controls_enabled(False)
-        self.gl_widget.reset_layer_offsets()
-        self.update_offset_display()
+        with profile_scope("load.animation.reset_ui_state"):
+            if not batch_fast_switch:
+                self.control_panel.set_pose_controls_enabled(False)
+            self.gl_widget.reset_layer_offsets()
+            if not batch_fast_switch:
+                self.update_offset_display()
         self._start_hang_watchdog("load_animation")
         try:
-            self.current_animation_embedded_clones = None
-            anim_data = self.current_json_data['anims'][anim_index]
-            self.current_animation_embedded_clones = self._extract_embedded_clone_defs(anim_data)
-            sources = self.current_json_data.get('sources', [])
-            raw_layers = anim_data.get('layers', [])
-            self.layer_source_lookup = {
-                layer.get('id', idx): layer for idx, layer in enumerate(raw_layers)
-            }
-            
-            self.log_widget.log(f"Loading animation: {anim_data['name']}", "INFO")
-            self.current_animation_name = anim_data.get('name')
-            
+            with profile_scope("load.animation.prepare_payload"):
+                self.current_animation_embedded_clones = None
+                anim_data = self.current_json_data['anims'][anim_index]
+                self.current_animation_embedded_clones = self._extract_embedded_clone_defs(anim_data)
+                sources = self.current_json_data.get('sources', [])
+                raw_layers = anim_data.get('layers', [])
+                self.layer_source_lookup = {
+                    layer.get('id', idx): layer for idx, layer in enumerate(raw_layers)
+                }
+
+                self.log_widget.log(f"Loading animation: {anim_data['name']}", "INFO")
+                self.current_animation_name = anim_data.get('name')
+
             json_dir = os.path.dirname(self.current_json_path) if self.current_json_path else None
-            self.gl_widget.texture_atlases = self._load_texture_atlases_for_sources(
-                sources,
-                json_dir=json_dir,
-                use_cache=False
-            )
-            self._rebuild_source_atlas_lookup(sources, self.gl_widget.texture_atlases)
-            loaded_atlas_count = len(self.gl_widget.texture_atlases)
-            source_count = len(sources)
-            if source_count:
-                if loaded_atlas_count == 0:
-                    self.log_widget.log(
-                        (
-                            "No texture atlases were loaded for this animation. "
-                            "Set the game/downloads path or load JSON from an extracted data folder."
-                        ),
-                        "ERROR",
-                    )
-                elif loaded_atlas_count < source_count:
-                    self.log_widget.log(
-                        (
-                            f"Loaded {loaded_atlas_count}/{source_count} texture atlases. "
-                            "Missing atlases can make sprites invisible."
-                        ),
-                        "WARNING",
-                    )
-                else:
-                    self.log_widget.log(
-                        f"Loaded {loaded_atlas_count} texture atlas source(s)",
-                        "INFO",
-                    )
-            
+            with profile_scope("load.animation.atlas_parse"):
+                self.gl_widget.texture_atlases = self._load_texture_atlases_for_sources(
+                    sources,
+                    json_dir=json_dir,
+                    use_cache=True,
+                    cache_kind="base",
+                )
+                self._rebuild_source_atlas_lookup(sources, self.gl_widget.texture_atlases)
+                loaded_atlas_count = len(self.gl_widget.texture_atlases)
+                source_count = len(sources)
+                if source_count:
+                    if batch_fast_switch:
+                        pass
+                    elif loaded_atlas_count == 0:
+                        self.log_widget.log(
+                            (
+                                "No texture atlases were loaded for this animation. "
+                                "Set the game/downloads path or load JSON from an extracted data folder."
+                            ),
+                            "ERROR",
+                        )
+                    elif loaded_atlas_count < source_count:
+                        self.log_widget.log(
+                            (
+                                f"Loaded {loaded_atlas_count}/{source_count} texture atlases. "
+                                "Missing atlases can make sprites invisible."
+                            ),
+                            "WARNING",
+                        )
+                    else:
+                        self.log_widget.log(
+                            f"Loaded {loaded_atlas_count} texture atlas source(s)",
+                            "INFO",
+                        )
+
             # Parse animation data
             blend_version = self.current_blend_version or 1
-            animation = self._build_animation_struct(
-                anim_data,
-                blend_version,
-                self.current_json_path,
-                resource_dict=self.current_json_data
-            )
-            layers = animation.layers
-            self._dump_mask_debug_raw_layers(raw_layers, animation)
-            self._load_keyframe_layers_sidecar(self.current_json_path, animation)
+            with profile_scope("load.animation.build_struct"):
+                animation = self._build_animation_struct(
+                    anim_data,
+                    blend_version,
+                    self.current_json_path,
+                    resource_dict=self.current_json_data
+                )
+                layers = animation.layers
+                if not basic_fast_load:
+                    if not batch_fast_switch:
+                        self._dump_mask_debug_raw_layers(raw_layers, animation)
+                    self._load_keyframe_layers_sidecar(self.current_json_path, animation)
 
-            self.canonical_layer_names = set()
-            # Ensure costume metadata (and any inferred clone aliases) are cached
-            # before we attempt to seed canonical clones.
-            self._refresh_costume_list()
-            if previous_costume_key:
-                preserved_costume_entry = self.costume_entry_map.get(previous_costume_key)
-            self._apply_canonical_clones_to_base(layers)
-            self._apply_cached_layer_visibility(layers)
-            self.base_layer_cache = self._clone_layers(layers)
-            self._configure_costume_shaders(None, None)
+            with profile_scope("load.animation.costume_scan"):
+                self.canonical_layer_names = set()
+                if batch_fast_switch:
+                    if previous_costume_key:
+                        preserved_costume_entry = self.costume_entry_map.get(previous_costume_key)
+                elif not basic_fast_load:
+                    # Ensure costume metadata (and any inferred clone aliases) are cached
+                    # before we attempt to seed canonical clones.
+                    self._refresh_costume_list()
+                    if previous_costume_key:
+                        preserved_costume_entry = self.costume_entry_map.get(previous_costume_key)
+                else:
+                    self.costume_entries = []
+                    self.costume_entry_map = {}
 
-            self.gl_widget.player.load_animation(animation)
-            sync_timer = getattr(self.gl_widget, "sync_playback_timer", None)
-            if callable(sync_timer):
-                sync_timer()
-            self._log_renderability_snapshot(animation, stage="pre_gl")
-            self._dump_mask_debug_layer_layout(animation)
-            self.gl_widget.invalidate_animation_cache()
-            self._record_layer_defaults(animation.layers)
-            base_overrides = self._build_base_source_layer_atlas_overrides(animation.layers)
-            self.gl_widget.set_layer_atlas_overrides(base_overrides)
-            self.gl_widget.set_layer_pivot_context({})
-            self._reset_costume_runtime_state(animation.layers)
-            self.base_texture_atlases = list(self.gl_widget.texture_atlases)
-            self.costume_atlas_cache.clear()
+            with profile_scope("load.animation.layer_setup"):
+                if not basic_fast_load:
+                    self._apply_canonical_clones_to_base(layers)
+                self._apply_cached_layer_visibility(layers)
+                self.base_layer_cache = self._clone_layers(layers)
+                if not basic_fast_load:
+                    self._configure_costume_shaders(None, None)
+
+            with profile_scope("load.animation.player_install"):
+                self.gl_widget.player.load_animation(animation)
+                sync_timer = getattr(self.gl_widget, "sync_playback_timer", None)
+                if callable(sync_timer):
+                    sync_timer()
+            with profile_scope("load.animation.render_diag_pre"):
+                if not basic_fast_load and not batch_fast_switch:
+                    self._log_renderability_snapshot(animation, stage="pre_gl")
+                    self._dump_mask_debug_layer_layout(animation)
+            with profile_scope("load.animation.runtime_setup"):
+                self.gl_widget.invalidate_animation_cache()
+                self._record_layer_defaults(animation.layers)
+                base_overrides = self._build_base_source_layer_atlas_overrides(animation.layers)
+                self.gl_widget.set_layer_atlas_overrides(base_overrides)
+                self.gl_widget.set_layer_pivot_context({})
+                self._reset_costume_runtime_state(animation.layers)
+                self.base_texture_atlases = list(self.gl_widget.texture_atlases)
+                self.costume_atlas_cache.clear()
             if len(sources) > 1:
                 self.log_widget.log(
                     f"Source-bound atlas overrides active for {len(base_overrides)}/{len(animation.layers)} layers",
                     "INFO",
                 )
-            self.update_layer_panel()
-            self.selected_layer_ids.clear()
-            self.primary_selected_layer_id = None
-            self.selection_lock_enabled = False
-            self.layer_panel.set_selection_state(self.selected_layer_ids)
-            self.apply_selection_state()
-            self.control_panel.set_pose_controls_enabled(True)
-            self.control_panel.set_sprite_tools_enabled(bool(layers))
-            self._reset_edit_history()
-            self.update_timeline()
-            if self.current_animation_name:
-                self.load_audio_for_animation(self.current_animation_name)
-            self._configure_animation_bpm()
-            tile_batches, terrain_composite = self._build_island_tile_batches(anim_data, animation)
-            self.gl_widget.set_terrain_composite(terrain_composite)
-            self.gl_widget.set_tile_batches(tile_batches)
-            self._update_terrain_tile_index_range()
+            with profile_scope("load.animation.ui_refresh"):
+                self.selected_layer_ids.clear()
+                self.primary_selected_layer_id = None
+                self.selection_lock_enabled = False
+                if batch_fast_switch:
+                    pass
+                elif not basic_fast_load:
+                    self.update_layer_panel()
+                    self.layer_panel.set_selection_state(self.selected_layer_ids)
+                    self.apply_selection_state()
+                    self.control_panel.set_pose_controls_enabled(True)
+                    self.control_panel.set_sprite_tools_enabled(bool(layers))
+                    self._reset_edit_history()
+                if not batch_fast_switch:
+                    self.update_timeline()
+                if basic_fast_load:
+                    self._schedule_basic_costume_list_refresh(previous_costume_key)
+            with profile_scope("load.animation.audio_setup"):
+                if batch_fast_switch:
+                    if self._batch_export_needs_audio and self.current_animation_name:
+                        self.load_audio_for_animation(
+                            self.current_animation_name,
+                            allow_dof_bundle_scan=False,
+                        )
+                elif basic_fast_load:
+                    self._schedule_basic_audio_load(self.current_animation_name)
+                elif self.current_animation_name:
+                    self.load_audio_for_animation(
+                        self.current_animation_name,
+                        allow_dof_bundle_scan=False,
+                    )
+                if not basic_fast_load:
+                    self._configure_animation_bpm()
+            with profile_scope("load.animation.terrain_setup"):
+                if basic_fast_load:
+                    self.gl_widget.set_terrain_composite(None)
+                    self.gl_widget.set_tile_batches([])
+                else:
+                    tile_batches, terrain_composite = self._build_island_tile_batches(anim_data, animation)
+                    self.gl_widget.set_terrain_composite(terrain_composite)
+                    self.gl_widget.set_tile_batches(tile_batches)
+                    self._update_terrain_tile_index_range()
 
-            # Reinitialize GL to load textures
-            self.gl_widget.makeCurrent()
-            self.gl_widget.initializeGL()
-            gl_summary = str(getattr(self.gl_widget, "_gl_context_summary", "") or "").strip()
-            if gl_summary:
-                self.log_widget.log(gl_summary, "INFO")
-            failed_texture_uploads = list(getattr(self.gl_widget, "_last_texture_upload_failures", []) or [])
-            if failed_texture_uploads:
-                preview = ", ".join(failed_texture_uploads[:5])
-                if len(failed_texture_uploads) > 5:
-                    preview += ", ..."
-                self.log_widget.log(
-                    f"Failed to upload {len(failed_texture_uploads)} atlas texture(s): {preview}",
-                    "ERROR",
+            with profile_scope("load.animation.gl_initialize_upload"):
+                # Reinitialize GL to load textures.
+                self.gl_widget.makeCurrent()
+                if (basic_fast_load or batch_fast_switch) and hasattr(self.gl_widget, "ensure_scene_gl_resources"):
+                    self.gl_widget.ensure_scene_gl_resources(
+                        force_reload=False,
+                        reset_postfx=False,
+                        log_context=False,
+                    )
+                else:
+                    self.gl_widget.initializeGL()
+                gl_summary = str(getattr(self.gl_widget, "_gl_context_summary", "") or "").strip()
+                if gl_summary and not basic_fast_load:
+                    self.log_widget.log(gl_summary, "INFO")
+                failed_texture_uploads = list(getattr(self.gl_widget, "_last_texture_upload_failures", []) or [])
+                if failed_texture_uploads:
+                    preview = ", ".join(failed_texture_uploads[:5])
+                    if len(failed_texture_uploads) > 5:
+                        preview += ", ..."
+                    self.log_widget.log(
+                        f"Failed to upload {len(failed_texture_uploads)} atlas texture(s): {preview}",
+                        "ERROR",
+                    )
+                bound_texture_count = sum(
+                    1 for atlas in self.gl_widget.texture_atlases if getattr(atlas, "texture_id", None)
                 )
-            bound_texture_count = sum(
-                1 for atlas in self.gl_widget.texture_atlases if getattr(atlas, "texture_id", None)
-            )
-            if self.gl_widget.texture_atlases and bound_texture_count == 0:
-                self.log_widget.log(
-                    "OpenGL initialized but atlas textures were not bound; rendering will appear blank.",
-                    "ERROR",
-                )
-            self._log_renderability_snapshot(animation, stage="post_gl")
-            self._restore_sprite_workshop_edits()
+                if self.gl_widget.texture_atlases and bound_texture_count == 0:
+                    self.log_widget.log(
+                        "OpenGL initialized but atlas textures were not bound; rendering will appear blank.",
+                        "ERROR",
+                    )
+            with profile_scope("load.animation.render_diag_post"):
+                if not basic_fast_load and not batch_fast_switch:
+                    self._log_renderability_snapshot(animation, stage="post_gl")
+            with profile_scope("load.animation.sprite_workshop_restore"):
+                if not basic_fast_load:
+                    self._restore_sprite_workshop_edits()
             self.gl_widget.doneCurrent()
 
-            self._refresh_dof_particle_entries(animation)
+            with profile_scope("load.animation.dof_particles"):
+                if not basic_fast_load:
+                    self._refresh_dof_particle_entries(animation)
 
             self.log_widget.log(f"Animation loaded successfully with {len(layers)} layers", "SUCCESS")
             self.gl_widget.set_anchor_logging_enabled(self.anchor_debug_enabled)
@@ -10848,17 +14063,32 @@ class MSMAnimationViewer(QMainWindow):
                 # Schedule an anchor debug dump after the first frame to capture pivot math
                 QTimer.singleShot(500, lambda: self._dump_anchor_debug())
 
-            if preserved_costume_entry:
+            if preserved_costume_entry and not basic_fast_load:
                 self.log_widget.log(
                     f"Reapplying costume '{preserved_costume_entry.display_name}' to animation '{self.current_animation_name}'",
                     "INFO"
                 )
-                self._restore_costume_selection(preserved_costume_entry.key)
-                self._apply_costume_to_animation(preserved_costume_entry)
-            else:
+                with profile_scope("load.animation.costume_reapply"):
+                    self._restore_costume_selection(preserved_costume_entry.key)
+                    self._apply_costume_to_animation(preserved_costume_entry)
+            elif not basic_fast_load and not batch_fast_switch:
                 self._restore_costume_selection(None)
-            self._refresh_timeline_keyframes()
-            self._capture_pose_baseline()
+            with profile_scope("load.animation.final_timeline_refresh"):
+                if not basic_fast_load and not batch_fast_switch:
+                    self._refresh_timeline_keyframes()
+            with profile_scope("load.animation.pose_baseline"):
+                if basic_fast_load or batch_fast_switch:
+                    self._pose_baseline_player = None
+                    self._pose_baseline_lookup = {}
+                else:
+                    self._capture_pose_baseline()
+            with profile_scope("load.animation.simple_viewer_bake"):
+                if batch_fast_switch:
+                    pass
+                elif basic_fast_load:
+                    QTimer.singleShot(750, self._start_simple_viewer_bake_for_current_animation)
+                else:
+                    self._start_simple_viewer_bake_for_current_animation()
 
         except Exception as e:
             import traceback
@@ -11176,7 +14406,7 @@ class MSMAnimationViewer(QMainWindow):
             "INFO",
         )
 
-    def load_audio_for_animation(self, animation_name: str):
+    def load_audio_for_animation(self, animation_name: str, *, allow_dof_bundle_scan: bool = True):
         """Load and sync the audio clip that matches the selected animation."""
         if not animation_name:
             self._set_audio_track_controls(None, [])
@@ -11196,7 +14426,10 @@ class MSMAnimationViewer(QMainWindow):
             return
         self._start_hang_watchdog("load_audio")
         try:
-            audio_path, from_manifest, audio_scope, audio_tracks = self._find_audio_for_animation(animation_name)
+            audio_path, from_manifest, audio_scope, audio_tracks = self._find_audio_for_animation(
+                animation_name,
+                allow_dof_bundle_scan=allow_dof_bundle_scan,
+            )
             self._set_audio_track_controls(audio_scope, audio_tracks)
             intentionally_muted = self._all_tracks_muted_for_scope(audio_scope, audio_tracks)
 
@@ -11252,6 +14485,7 @@ class MSMAnimationViewer(QMainWindow):
         animation_name: str,
         *,
         force_dof: Optional[bool] = None,
+        allow_dof_bundle_scan: bool = True,
     ) -> Tuple[Optional[str], bool, Optional[str], List[Tuple[str, str]]]:
         """
         Return an absolute path to the audio clip for a given animation name along with
@@ -11328,12 +14562,17 @@ class MSMAnimationViewer(QMainWindow):
 
         if is_dof:
             bundle_lookup_name = dof_asset_name or animation_name
+            resolved_bundle = self._resolve_dof_bundle_for_current_animation(
+                bundle_lookup_name,
+                allow_scan=allow_dof_bundle_scan,
+            )
             bundle_audio = self._find_dof_bundle_audio_for_animation(
                 animation_name,
                 normalized_keys=normalized_keys,
                 monster_token=monster_token,
                 anim_source_name=dof_asset_name,
-                bundle_path=self._resolve_dof_bundle_for_current_animation(bundle_lookup_name),
+                bundle_path=resolved_bundle,
+                allow_bundle_scan=allow_dof_bundle_scan,
             )
             if bundle_audio:
                 return bundle_audio, False, None, []
@@ -12028,7 +15267,11 @@ class MSMAnimationViewer(QMainWindow):
     def _is_active_dof_audio_context(self) -> bool:
         if self.dof_search_enabled:
             return True
-        return self._is_dof_json_payload(self.current_json_path, self.current_json_data)
+        if self._is_dof_json_payload(self.current_json_path, self.current_json_data):
+            return True
+        if isinstance(self.current_json_data, dict):
+            return isinstance(self.current_json_data.get("dof_meta"), dict)
+        return False
 
     def _should_skip_dof_audio(
         self,
@@ -12087,9 +15330,13 @@ class MSMAnimationViewer(QMainWindow):
         monster_token: Optional[str],
         anim_source_name: Optional[str] = None,
         bundle_path: Optional[str] = None,
+        allow_bundle_scan: bool = True,
     ) -> Optional[str]:
         audio_key_name = anim_source_name or animation_name
-        resolved_bundle = bundle_path or self._resolve_dof_bundle_for_current_animation(audio_key_name)
+        resolved_bundle = bundle_path or self._resolve_dof_bundle_for_current_animation(
+            audio_key_name,
+            allow_scan=allow_bundle_scan,
+        )
         if not resolved_bundle or not os.path.exists(resolved_bundle):
             self.log_widget.log(
                 f"DOF audio: no bundle found for '{audio_key_name}'",
@@ -12109,6 +15356,12 @@ class MSMAnimationViewer(QMainWindow):
                 "INFO",
             )
             return cached
+        if not allow_bundle_scan:
+            self.log_widget.log(
+                f"DOF audio: skipped Unity bundle audio scan for '{audio_key_name}' during animation load.",
+                "INFO",
+            )
+            return None
         unitypy_mod = self._ensure_unitypy_available()
         if unitypy_mod is None:
             self.log_widget.log(
@@ -12323,7 +15576,12 @@ class MSMAnimationViewer(QMainWindow):
             return ".mp3"
         return ""
 
-    def _resolve_dof_bundle_for_current_animation(self, animation_name: str) -> Optional[str]:
+    def _resolve_dof_bundle_for_current_animation(
+        self,
+        animation_name: str,
+        *,
+        allow_scan: bool = True,
+    ) -> Optional[str]:
         if not self.dof_path:
             return None
         anim_stem = Path(animation_name).stem
@@ -12342,9 +15600,9 @@ class MSMAnimationViewer(QMainWindow):
                     bundle_map = {}
             except Exception:
                 bundle_map = {}
-        else:
+        elif allow_scan:
             self.log_widget.log(
-                "DOF audio: bundle index not found; will scan bundles on demand.",
+                "DOF bundle: index not found; will scan bundles on demand.",
                 "INFO",
             )
         for candidate in (anim_key, anim_key.lower(), anim_key.upper()):
@@ -12353,7 +15611,7 @@ class MSMAnimationViewer(QMainWindow):
                 normalized = os.path.normpath(bundle_path)
                 self._dof_anim_bundle_cache[anim_key.lower()] = normalized
                 self.log_widget.log(
-                    f"DOF audio: resolved bundle for '{animation_name}' via index -> {os.path.basename(normalized)}",
+                    f"DOF bundle: resolved '{animation_name}' via index -> {os.path.basename(normalized)}",
                     "INFO",
                 )
                 return normalized
@@ -12366,15 +15624,21 @@ class MSMAnimationViewer(QMainWindow):
                     normalized = os.path.normpath(bundle_path)
                     self._dof_anim_bundle_cache[anim_key.lower()] = normalized
                     self.log_widget.log(
-                        f"DOF audio: resolved bundle for '{animation_name}' via json stem -> {os.path.basename(normalized)}",
+                        f"DOF bundle: resolved '{animation_name}' via json stem -> {os.path.basename(normalized)}",
                         "INFO",
                     )
                     return normalized
+        if not allow_scan:
+            self.log_widget.log(
+                f"DOF bundle: index/cache miss for '{animation_name}'; skipped on-demand Unity bundle scan.",
+                "INFO",
+            )
+            return None
         scanned = self._scan_bundle_for_anim_name(anim_key)
         if scanned:
             self._dof_anim_bundle_cache[anim_key.lower()] = scanned
             self.log_widget.log(
-                f"DOF audio: resolved bundle for '{animation_name}' via scan -> {os.path.basename(scanned)}",
+                f"DOF bundle: resolved '{animation_name}' via scan -> {os.path.basename(scanned)}",
                 "INFO",
             )
             if output_index_path:
@@ -12401,15 +15665,96 @@ class MSMAnimationViewer(QMainWindow):
                 "WARNING",
             )
             return None
-        particles_root = os.path.join(self.dof_path, "particles")
-        if not os.path.isdir(particles_root):
+        particles_root = self._resolve_dof_particle_root()
+        if not particles_root:
             return None
         if self._dof_particle_library and self._dof_particle_library_root == particles_root:
             return self._dof_particle_library
         library = build_particle_library(particles_root)
+        if not library.prefabs:
+            self.log_widget.log(
+                f"DOF particles: no particle prefabs found in {particles_root}.",
+                "WARNING",
+            )
+            return None
         self._dof_particle_library_root = particles_root
         self._dof_particle_library = library
+        self.log_widget.log(
+            f"DOF particles: using particle library {particles_root}",
+            "INFO",
+        )
         return library
+
+    def _resolve_dof_particle_root(self) -> Optional[str]:
+        """Find the shared particle bundle folder across common DOF layouts."""
+        if not self.dof_path:
+            return None
+        candidates: List[Path] = []
+        seen: Set[str] = set()
+
+        def add_candidate(path: Optional[Path]) -> None:
+            if path is None:
+                return
+            try:
+                normalized = path.resolve()
+            except Exception:
+                normalized = path
+            key = os.path.normcase(str(normalized))
+            if key in seen:
+                return
+            seen.add(key)
+            candidates.append(normalized)
+
+        def add_layouts(root: Path) -> None:
+            add_candidate(root / "particles")
+            add_candidate(root / "Shared" / "particles")
+            add_candidate(root / "data" / "particles")
+            if root.name.lower() == "particles":
+                add_candidate(root)
+            elif root.name.lower() == "shared":
+                add_candidate(root / "particles")
+
+        configured_particle_root = self.settings.value(
+            "dof/particle_assets_root",
+            "",
+            type=str,
+        )
+        if configured_particle_root:
+            add_layouts(Path(configured_particle_root))
+
+        base = Path(self.dof_path)
+        add_layouts(base)
+
+        for parent in list(base.parents)[:3]:
+            add_candidate(parent / "particles")
+            add_candidate(parent / "Shared" / "particles")
+            add_candidate(parent / "data" / "particles")
+
+        # Remote DLC roots often contain animation bundles only. If an extracted
+        # DOF root sits next to it, prefer its Shared/particles library.
+        try:
+            sibling_parent = base.parent
+            for sibling in sibling_parent.iterdir():
+                if not sibling.is_dir() or sibling == base:
+                    continue
+                lowered = sibling.name.lower()
+                if not any(token in lowered for token in ("dof", "fire", "export")):
+                    continue
+                add_candidate(sibling / "Shared" / "particles")
+                add_candidate(sibling / "particles")
+                add_candidate(sibling / "data" / "particles")
+        except Exception:
+            pass
+
+        for candidate in candidates:
+            try:
+                if not candidate.is_dir():
+                    continue
+                if any(candidate.rglob("__data")):
+                    return str(candidate)
+            except Exception:
+                continue
+        return None
 
     def _material_color_from_info(self, material) -> Tuple[float, float, float, float]:
         if not material:
@@ -12477,9 +15822,24 @@ class MSMAnimationViewer(QMainWindow):
         return ((mean_x, mean_y), (std_x, std_y))
 
     @staticmethod
+    def _is_stable_particle_control_socket(
+        control_offset: Optional[Tuple[float, float]],
+        control_offset_std: Optional[Tuple[float, float]],
+    ) -> bool:
+        if control_offset is None or control_offset_std is None:
+            return False
+        try:
+            max_std = max(abs(float(control_offset_std[0])), abs(float(control_offset_std[1])))
+        except Exception:
+            return False
+        return max_std <= 0.5
+
+    @staticmethod
     def _select_particle_source_control_point(
         node_channels: Dict[int, List[Tuple[float, float, int]]],
         control_points: Dict[str, DofControlPoint],
+        node_offset: Tuple[float, float, float] = (0.0, 0.0, 0.0),
+        prefab_pos: Tuple[float, float, float] = (0.0, 0.0, 0.0),
     ) -> Tuple[Optional[DofControlPoint], Optional[Tuple[float, float]], Optional[Tuple[float, float]]]:
         def _sorted_channel(channel: List[Tuple[float, float, int]]) -> List[Tuple[float, float]]:
             return sorted((float(t), float(v)) for t, v, _ in channel)
@@ -12543,11 +15903,19 @@ class MSMAnimationViewer(QMainWindow):
             local_ys: List[float] = []
             source_heights: List[float] = []
             for time_value in expanded_times:
-                px = _eval_channel(node_x, time_value, 0.0)
-                py = _eval_channel(node_y, time_value, 0.0)
-                cx = _eval_channel(control_x, time_value, 0.0)
-                cy = _eval_channel(control_y, time_value, 0.0)
-                cz = _eval_channel(control_z, time_value, 0.0)
+                px = (
+                    _eval_channel(node_x, time_value, 0.0)
+                    + float(node_offset[0])
+                    + float(prefab_pos[0])
+                )
+                py = (
+                    _eval_channel(node_y, time_value, 0.0)
+                    + float(node_offset[1])
+                    + float(prefab_pos[1])
+                )
+                cx = _eval_channel(control_x, time_value, 0.0) + float(control_point.offset[0])
+                cy = _eval_channel(control_y, time_value, 0.0) + float(control_point.offset[1])
+                cz = _eval_channel(control_z, time_value, 0.0) + float(control_point.offset[2])
                 rot = _eval_channel(control_rot, time_value, 0.0)
                 dx = px - cx
                 dy = py - cy
@@ -12928,6 +16296,7 @@ class MSMAnimationViewer(QMainWindow):
         source_nodes: Optional[Dict[str, DofAnimNode]] = None,
     ) -> List[ParticleRenderEntry]:
         entries: List[ParticleRenderEntry] = []
+        baseline_control = control_points.get("controlpoint_cameracenter") if control_points else None
         for node in nodes:
             prefab = library.prefabs.get(node.prefab_path_id)
             if not prefab:
@@ -12953,11 +16322,17 @@ class MSMAnimationViewer(QMainWindow):
             source_surface_direction = None
             if control_points:
                 source_control, control_offset, control_offset_std = (
-                    self._select_particle_source_control_point(node.channels, control_points)
+                    self._select_particle_source_control_point(
+                        node.channels,
+                        control_points,
+                        node_offset=node.offset,
+                        prefab_pos=prefab.transform_pos,
+                    )
                 )
-            source_layer, source_layer_offset, source_layer_offset_std, source_surface_direction = (
-                self._match_particle_source_layer(node, prefab, animation, source_nodes=source_nodes)
-            )
+            if not self._is_stable_particle_control_socket(control_offset, control_offset_std):
+                source_layer, source_layer_offset, source_layer_offset_std, source_surface_direction = (
+                    self._match_particle_source_layer(node, prefab, animation, source_nodes=source_nodes)
+                )
             entries.append(
                 ParticleRenderEntry(
                     name=node.name,
@@ -13015,6 +16390,9 @@ class MSMAnimationViewer(QMainWindow):
                     control_channels=source_control.channels if source_control else None,
                     control_local_offset=control_offset,
                     control_local_offset_std=control_offset_std,
+                    baseline_name=baseline_control.name if baseline_control else None,
+                    baseline_offset=baseline_control.offset if baseline_control else (0.0, 0.0, 0.0),
+                    baseline_channels=baseline_control.channels if baseline_control else None,
                     source_layer_id=source_layer.layer_id if source_layer else None,
                     source_layer_name=source_layer.name if source_layer else None,
                     source_layer_offset_local=source_layer_offset,
@@ -13040,7 +16418,7 @@ class MSMAnimationViewer(QMainWindow):
             self.gl_widget.set_particle_entries([])
             return
         anim_name = animation.name or self.current_animation_name or ""
-        bundle_path = self._resolve_dof_bundle_for_current_animation(anim_name)
+        bundle_path = self._resolve_dof_bundle_for_current_animation(anim_name, allow_scan=False)
         if not bundle_path:
             self.gl_widget.set_particle_entries([])
             return
@@ -13065,6 +16443,7 @@ class MSMAnimationViewer(QMainWindow):
                                 "controlpoint_fx",
                                 "controlpoint_accessory",
                                 "controlpoint_effectcenter",
+                                "controlpoint_cameracenter",
                             ],
                         )
                         self._dof_control_point_cache[control_cache_key] = control_points
@@ -13103,7 +16482,7 @@ class MSMAnimationViewer(QMainWindow):
             library = self._get_dof_particle_library()
             if not library:
                 self.log_widget.log(
-                    "DOF particles: particle library missing (check DOF/particles folder).",
+                    "DOF particles: particle library missing (checked particles, Shared/particles, and data/particles layouts).",
                     "WARNING",
                 )
                 self._dof_particle_entry_cache[cache_key] = []
@@ -13120,6 +16499,7 @@ class MSMAnimationViewer(QMainWindow):
                         "controlpoint_fx",
                         "controlpoint_accessory",
                         "controlpoint_effectcenter",
+                        "controlpoint_cameracenter",
                     ],
                 )
                 self._dof_control_point_cache[control_cache_key] = control_points
@@ -13138,10 +16518,11 @@ class MSMAnimationViewer(QMainWindow):
                 f"DOF particles: loaded {len(cached)} emitters for {anim_name}.",
                 "INFO",
             )
-        # Particle nodes are authored in Unity Y-up space; respect the DOF animation's
-        # flip flag so gravity/velocity behave correctly in the viewer's Y-down space.
-        particle_flip_y = bool(getattr(animation, "dof_anim_flip_y", False))
-        self.gl_widget.set_particle_entries(cached, flip_y=particle_flip_y)
+        # Particle nodes are sampled directly from the Unity bundle at runtime.
+        # DOF layer JSON is pre-flipped/scaled by the converter and then handled by
+        # the sprite renderer, but raw particle channels never pass through that
+        # conversion path. Keep their Y/rotation in authored bundle space.
+        self.gl_widget.set_particle_entries(cached, flip_y=False)
 
     def _scan_bundle_for_anim_name(self, anim_name: str) -> Optional[str]:
         unitypy_mod = self._ensure_unitypy_available()
@@ -13816,8 +17197,12 @@ class MSMAnimationViewer(QMainWindow):
             options.append(("__unassigned__", "Unassigned / Shared"))
 
         return options, layer_source_keys
-    
+
     def update_layer_panel(self):
+        with profile_scope("ui.layer_panel_update"):
+            return self._update_layer_panel_impl()
+
+    def _update_layer_panel_impl(self):
         """Update the layer visibility panel"""
         animation = self.gl_widget.player.animation
         self._reset_layer_thumbnail_cache()
@@ -14186,6 +17571,17 @@ class MSMAnimationViewer(QMainWindow):
             self.gl_widget.update()
         return True
 
+    @staticmethod
+    def _normalize_imported_rgba_for_editing(image: Image.Image, image_path: str) -> Image.Image:
+        """Keep imported premultiplied PNGs editable as straight-alpha RGBA."""
+        rgba = image.convert("RGBA")
+        try:
+            if TextureAtlas._should_preserve_premultiplied_source(rgba, image_path):
+                return TextureAtlas._ensure_straight_alpha(rgba)
+        except Exception:
+            pass
+        return rgba
+
     def replace_sprite_from_file(
         self,
         atlas: TextureAtlas,
@@ -14194,7 +17590,8 @@ class MSMAnimationViewer(QMainWindow):
     ) -> Tuple[bool, str]:
         """Replace a sprite region with pixels loaded from disk."""
         try:
-            edited = Image.open(file_path).convert("RGBA")
+            with Image.open(file_path) as raw_image:
+                edited = self._normalize_imported_rgba_for_editing(raw_image, file_path)
         except Exception as exc:
             return False, f"Failed to load image: {exc}"
         patch, error = self._prepare_patch_for_sprite(sprite, edited)
@@ -14309,7 +17706,8 @@ class MSMAnimationViewer(QMainWindow):
         Replace a sprite using its native image size by expanding/repacking atlas space.
         """
         try:
-            edited = Image.open(file_path).convert("RGBA")
+            with Image.open(file_path) as raw_image:
+                edited = self._normalize_imported_rgba_for_editing(raw_image, file_path)
         except Exception as exc:
             return False, f"Failed to load image: {exc}"
 
@@ -14837,7 +18235,7 @@ class MSMAnimationViewer(QMainWindow):
 
         try:
             with Image.open(import_atlas.image_path) as raw_sheet:
-                sheet_image = raw_sheet.convert("RGBA")
+                sheet_image = self._normalize_imported_rgba_for_editing(raw_sheet, import_atlas.image_path)
         except Exception as exc:
             return False, f"Failed to open spritesheet image: {exc}"
 
@@ -15048,15 +18446,156 @@ class MSMAnimationViewer(QMainWindow):
     def _to_posix(path_text: str) -> str:
         return Path(path_text).as_posix()
 
+    def _dof_output_json_for_root_input(self, dof_root: str, input_path: str) -> Optional[str]:
+        root = self._sanitize_path_setting_value(dof_root)
+        source = self._sanitize_path_setting_value(input_path)
+        if not root or not source:
+            return None
+        anim_name = self._dof_anim_name_from_path(source)
+        if not anim_name:
+            return None
+        output_root = os.path.join(root, "Output")
+        if source.lower().startswith("bundle://"):
+            safe_name = anim_name.replace("/", "_").replace("\\", "_") or "bundle_anim"
+            return os.path.normpath(os.path.join(output_root, "bundles", safe_name, f"{anim_name}.json"))
+
+        asset_dir = os.path.dirname(source)
+        try:
+            relative_dir = os.path.relpath(asset_dir, root)
+        except ValueError:
+            relative_dir = ""
+        return os.path.normpath(os.path.join(output_root, relative_dir, f"{anim_name}.json"))
+
+    def _dof_migration_token_for_input(self, input_path: str) -> str:
+        inferred = self._infer_dof_rev6_package_names(input_path)
+        bin_stem = Path(inferred.get("bin_name", "")).stem.lower()
+        if bin_stem.startswith("monster_"):
+            return self._normalize_migration_token(bin_stem[len("monster_"):])
+        return self._normalize_migration_token(bin_stem)
+
+    def _build_dof_monster_migration_sources(
+        self,
+        profile: Dict[str, Any],
+        profile_index: int,
+        profile_name: str,
+    ) -> List[MigrationSourceOption]:
+        dof_root = self._sanitize_path_setting_value(profile.get("dof_path"))
+        if not dof_root or not os.path.isdir(dof_root):
+            return []
+
+        sources: List[MigrationSourceOption] = []
+        seen_inputs: Set[str] = set()
+
+        def add_dof_source(input_path: str, *, source_label: str) -> None:
+            normalized_input = input_path if input_path.lower().startswith("bundle://") else os.path.normpath(input_path)
+            key = normalized_input.lower()
+            if key in seen_inputs:
+                return
+            seen_inputs.add(key)
+            token = self._dof_migration_token_for_input(normalized_input)
+            if not token:
+                return
+            stem = self._dof_anim_name_from_path(normalized_input)
+            display_name = stem or token
+            json_path = self._dof_output_json_for_root_input(dof_root, normalized_input)
+            if json_path and not os.path.exists(json_path):
+                json_path = None
+            label = f"{display_name} [{token}] - {profile_name} (DOF {source_label})"
+            sources.append(
+                MigrationSourceOption(
+                    label=label,
+                    token=token,
+                    stem=stem or token,
+                    profile_index=profile_index,
+                    profile_name=profile_name,
+                    json_path=json_path,
+                    bin_path=None,
+                    revision_hint=6,
+                    source_kind="dof",
+                    dof_root=dof_root,
+                    dof_input_path=normalized_input,
+                )
+            )
+
+        bundle_mode = self._is_dof_bundle_root(dof_root)
+        if bundle_mode:
+            for anim_name in self._get_dof_bundle_anim_names(dof_root):
+                add_dof_source(f"bundle://{anim_name}", source_label="bundle")
+        else:
+            output_root = os.path.normcase(os.path.normpath(os.path.join(dof_root, "Output")))
+            for root, dirs, files in os.walk(dof_root):
+                norm_root = os.path.normcase(os.path.normpath(root))
+                if norm_root == output_root or norm_root.startswith(output_root + os.sep):
+                    dirs[:] = []
+                    continue
+                dirs[:] = [name for name in dirs if name.lower() not in {"output", "__pycache__"}]
+                for file_name in files:
+                    if not file_name.lower().endswith(".animbbb.asset"):
+                        continue
+                    add_dof_source(os.path.join(root, file_name), source_label="asset")
+            for anim_name in self._get_dof_bundle_anim_names(dof_root):
+                add_dof_source(f"bundle://{anim_name}", source_label="bundle")
+
+        return sources
+
     def _build_monster_migration_source_pool(
         self,
     ) -> Tuple[List[MigrationSourceOption], List[Dict[str, str]], int]:
         """Aggregate monster BIN/JSON records from every configured path profile."""
         profiles, active_index = self._load_path_profiles_store()
         options: List[MigrationSourceOption] = []
+        source_scope = dict(getattr(self, "_migration_source_scope", {}) or {})
+        source_mode = str(source_scope.get("mode") or "all").strip().lower()
 
-        for profile_index, profile in enumerate(profiles):
+        source_profiles: List[Tuple[int, Dict[str, Any], str]] = []
+
+        def add_profile_scope(profile_index: int, profile: Dict[str, Any], label_suffix: str = "") -> None:
             profile_name = self._sanitize_path_setting_value(profile.get("name")) or f"Profile {profile_index + 1}"
+            if label_suffix:
+                profile_name = f"{profile_name} - {label_suffix}"
+            source_profiles.append((profile_index, profile, profile_name))
+
+        if source_mode == "profile":
+            try:
+                profile_index = int(source_scope.get("profile_index", -1))
+            except (TypeError, ValueError):
+                profile_index = -1
+            if 0 <= profile_index < len(profiles):
+                add_profile_scope(profile_index, profiles[profile_index], "all source paths")
+        elif source_mode == "path":
+            try:
+                profile_index = int(source_scope.get("profile_index", -1))
+            except (TypeError, ValueError):
+                profile_index = -1
+            field = str(source_scope.get("field") or "").strip()
+            if field in {"game_path", "downloads_path", "dof_path"} and 0 <= profile_index < len(profiles):
+                source_profile = {
+                    "name": profiles[profile_index].get("name", f"Profile {profile_index + 1}"),
+                    "game_path": "",
+                    "downloads_path": "",
+                    "dof_path": "",
+                }
+                source_profile[field] = self._sanitize_path_setting_value(profiles[profile_index].get(field))
+                label_map = {
+                    "game_path": "Game",
+                    "downloads_path": "Downloads",
+                    "dof_path": "DOF",
+                }
+                add_profile_scope(profile_index, source_profile, label_map.get(field, field))
+
+        if not source_profiles:
+            for profile_index, profile in enumerate(profiles):
+                add_profile_scope(profile_index, profile)
+
+        for profile_index, profile, profile_name in source_profiles:
+            options.extend(
+                self._build_dof_monster_migration_sources(
+                    profile,
+                    profile_index,
+                    profile_name,
+                )
+            )
+
             roots = self._profile_xml_bin_roots(profile)
             if not roots:
                 continue
@@ -15162,6 +18701,52 @@ class MSMAnimationViewer(QMainWindow):
                 if record.bin_path and record.json_path:
                     break
             if record.bin_path and record.json_path:
+                break
+
+        return record if record.has_source() else None
+
+    def _find_main_game_monster_record(self, profile: Dict[str, Any], stem: str) -> Optional[MonsterFileRecord]:
+        """Locate a monster BIN/JSON only in the profile's main game xml_bin root."""
+        normalized_stem = (stem or "").strip().lower()
+        if not normalized_stem:
+            return None
+
+        game_path = self._sanitize_path_setting_value(profile.get("game_path") if isinstance(profile, dict) else "")
+        if not game_path:
+            game_path = self._sanitize_path_setting_value(getattr(self, "game_path", ""))
+        base_root = os.path.join(game_path, "data", "xml_bin") if game_path else ""
+        if not base_root or not os.path.isdir(base_root):
+            return None
+
+        record = MonsterFileRecord(stem=normalized_stem, relative_path=f"{normalized_stem}.bin")
+
+        def add_candidate(full_path: str) -> None:
+            if not full_path or not os.path.isfile(full_path):
+                return
+            suffix = full_path.lower()
+            relative_path = self._to_posix(os.path.relpath(full_path, base_root))
+            record.relative_path = relative_path
+            if suffix.endswith(".json") and not record.json_path:
+                record.json_path = os.path.normpath(full_path)
+            elif suffix.endswith(".bin") and not record.bin_path:
+                record.bin_path = os.path.normpath(full_path)
+
+        add_candidate(os.path.join(base_root, f"{normalized_stem}.bin"))
+        add_candidate(os.path.join(base_root, f"{normalized_stem}.json"))
+        if record.has_source():
+            return record
+
+        for root, _, files in os.walk(base_root):
+            for file_name in files:
+                suffix = file_name.lower()
+                if not (suffix.endswith(".bin") or suffix.endswith(".json")):
+                    continue
+                if Path(file_name).stem.lower() != normalized_stem:
+                    continue
+                add_candidate(os.path.join(root, file_name))
+                if record.has_source():
+                    break
+            if record.has_source():
                 break
 
         return record if record.has_source() else None
@@ -15303,6 +18888,129 @@ class MSMAnimationViewer(QMainWindow):
 
         return merged
 
+    def _merge_migration_payloads_preserving_existing(
+        self,
+        target_payload: Dict[str, Any],
+        incoming_payload: Dict[str, Any],
+    ) -> Tuple[Dict[str, Any], int, int]:
+        """Append incoming animations without replacing existing names."""
+        merged = copy.deepcopy(target_payload if isinstance(target_payload, dict) else {})
+        target_anims = merged.get("anims")
+        incoming_anims = incoming_payload.get("anims")
+        if not isinstance(target_anims, list):
+            target_anims = []
+        if not isinstance(incoming_anims, list):
+            incoming_anims = []
+
+        result_anims = [
+            copy.deepcopy(anim)
+            for anim in target_anims
+            if isinstance(anim, dict)
+        ]
+        existing_names = {
+            str(anim.get("name", "") or "").strip().lower()
+            for anim in result_anims
+            if str(anim.get("name", "") or "").strip()
+        }
+
+        appended = 0
+        skipped = 0
+        for anim in incoming_anims:
+            if not isinstance(anim, dict):
+                continue
+            key = str(anim.get("name", "") or "").strip().lower()
+            if key and key in existing_names:
+                skipped += 1
+                continue
+            result_anims.append(copy.deepcopy(anim))
+            if key:
+                existing_names.add(key)
+            appended += 1
+
+        merged["anims"] = result_anims
+        merged["sources"] = self._merge_migration_sources(
+            merged.get("sources"),
+            incoming_payload.get("sources"),
+        )
+
+        incoming_blend = incoming_payload.get("blend_version")
+        if incoming_blend is not None:
+            merged["blend_version"] = incoming_blend
+
+        incoming_rev = incoming_payload.get("rev")
+        if incoming_rev is not None:
+            merged["rev"] = incoming_rev
+
+        for key in ("source_format", "source_revision"):
+            if key in incoming_payload:
+                merged[key] = incoming_payload[key]
+
+        return merged, appended, skipped
+
+    @staticmethod
+    def _migration_sprite_lookup_keys(sprite_name: str) -> Set[str]:
+        raw = str(sprite_name or "").strip().replace("\\", "/")
+        if not raw:
+            return set()
+        base = raw.rsplit("/", 1)[-1]
+        return {base.lower()}
+
+    @classmethod
+    def _migration_atlas_lookup_keys(cls, atlas_xml: Path) -> Set[str]:
+        try:
+            root = ET.parse(atlas_xml).getroot()
+        except Exception:
+            return set()
+        lookup: Set[str] = set()
+        for sprite in root.findall(".//sprite"):
+            lookup.update(cls._migration_sprite_lookup_keys(sprite.attrib.get("n") or ""))
+        return lookup
+
+    @classmethod
+    def _migration_payload_atlas_mismatches(
+        cls,
+        payload: Dict[str, Any],
+        atlas_xml: Path,
+    ) -> Tuple[int, int, List[str]]:
+        lookup = cls._migration_atlas_lookup_keys(atlas_xml)
+        anims = payload.get("anims") if isinstance(payload, dict) else None
+        if not isinstance(anims, list) or not lookup:
+            return 0, 0, []
+        mismatched = 0
+        total = 0
+        examples: List[str] = []
+        for anim in anims:
+            if not isinstance(anim, dict):
+                continue
+            total += 1
+            missing_refs: Set[str] = set()
+            layers = anim.get("layers")
+            if not isinstance(layers, list):
+                continue
+            for layer in layers:
+                if not isinstance(layer, dict):
+                    continue
+                frames = layer.get("frames")
+                if not isinstance(frames, list):
+                    continue
+                for frame in frames:
+                    if not isinstance(frame, dict):
+                        continue
+                    sprite = frame.get("sprite")
+                    if not isinstance(sprite, dict):
+                        continue
+                    sprite_name = str(sprite.get("string") or "").strip()
+                    if not sprite_name:
+                        continue
+                    if not cls._migration_sprite_lookup_keys(sprite_name).intersection(lookup):
+                        missing_refs.add(sprite_name)
+            if missing_refs:
+                mismatched += 1
+                if len(examples) < 3:
+                    anim_name = str(anim.get("name") or "<unnamed>")
+                    examples.append(f"{anim_name}: {', '.join(sorted(missing_refs)[:4])}")
+        return mismatched, total, examples
+
     @staticmethod
     def _rewrite_animation_island_prefixes(payload: Dict[str, Any], target_island: int) -> int:
         """Rewrite leading NN- prefixes in animation names to a target island id."""
@@ -15383,6 +19091,661 @@ class MSMAnimationViewer(QMainWindow):
             return "rev6"
         return None
 
+    @staticmethod
+    def _animation_names_from_payload(payload: Dict[str, Any]) -> List[str]:
+        anims = payload.get("anims") if isinstance(payload, dict) else None
+        if not isinstance(anims, list):
+            return []
+        names: List[str] = []
+        seen: Set[str] = set()
+        for index, anim in enumerate(anims):
+            if not isinstance(anim, dict):
+                continue
+            name = str(anim.get("name", "") or "").strip()
+            if not name:
+                name = f"Animation {index + 1}"
+            key = name.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            names.append(name)
+        return names
+
+    @staticmethod
+    def _animation_name_island_prefix(name: str) -> Optional[int]:
+        match = re.match(r"^([0-9]{1,3})[-_]", str(name or "").strip())
+        if not match:
+            return None
+        try:
+            return int(match.group(1))
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _animation_name_is_island_zero_track(name: str) -> bool:
+        text = str(name or "").strip().lower()
+        return re.search(r"(^|[^a-z0-9])(idle|sleep|sleeping)([^a-z0-9]|$)", text) is not None
+
+    @classmethod
+    def _filter_animation_names_for_island(
+        cls,
+        names: List[str],
+        target_island: Optional[int],
+    ) -> List[str]:
+        if target_island is None:
+            return list(names or [])
+        try:
+            island = int(target_island)
+        except (TypeError, ValueError):
+            return list(names or [])
+        if island == 0:
+            return [
+                name
+                for name in (names or [])
+                if cls._animation_name_is_island_zero_track(name)
+            ]
+        filtered = [
+            name
+            for name in (names or [])
+            if cls._animation_name_island_prefix(name) == island
+        ]
+        if filtered:
+            return filtered
+        if not any(cls._animation_name_island_prefix(name) is not None for name in (names or [])):
+            return list(names or [])
+        return []
+
+    def _read_main_game_target_payload(self, source_path: str) -> Optional[Dict[str, Any]]:
+        if not source_path:
+            return None
+        if source_path.lower().endswith(".bin"):
+            try:
+                module = self._load_rev6_animation_module()
+                if module is not None:
+                    return module.BinAnim.from_file(str(source_path)).to_dict()
+            except Exception as exc:
+                if hasattr(self, "log_widget"):
+                    self.log_widget.log(
+                        f"Failed to read main-game target BIN directly; falling back to converter: {exc}",
+                        "WARNING",
+                    )
+        return self._read_migration_payload(source_path)
+
+    def _migration_track_names_for_source(self, source: MigrationSourceOption) -> List[str]:
+        if source.is_dof_source:
+            json_path = source.json_path
+            if not json_path and source.dof_root and source.dof_input_path:
+                json_path = self._dof_output_json_for_root_input(source.dof_root, source.dof_input_path)
+            if json_path and os.path.exists(json_path):
+                payload = self._read_migration_payload(json_path)
+                if payload is not None:
+                    names = self._animation_names_from_payload(payload)
+                    if names:
+                        return names
+            input_name = self._dof_anim_name_from_path(source.dof_input_path or source.stem)
+            return [input_name] if input_name else []
+
+        source_path = source.preferred_source_path
+        if not source_path or not os.path.exists(source_path):
+            return []
+        payload = self._read_migration_payload(source_path)
+        if payload is None:
+            return []
+        return self._animation_names_from_payload(payload)
+
+    def _migration_track_names_for_target(
+        self,
+        profile_index: int,
+        target_token: str,
+        target_island: Optional[int] = None,
+    ) -> List[str]:
+        profiles = list(self._migration_panel_profiles or [])
+        if profile_index < 0 or profile_index >= len(profiles):
+            return []
+        token = self._normalize_migration_token(target_token)
+        if not token:
+            return []
+        record = self._find_main_game_monster_record(profiles[profile_index], f"monster_{token}")
+        if not record or not record.has_source():
+            return []
+        source_path = record.bin_path or record.json_path
+        if not source_path:
+            return []
+        payload = self._read_main_game_target_payload(source_path)
+        if payload is None:
+            return []
+        names = self._animation_names_from_payload(payload)
+        return self._filter_animation_names_for_island(names, target_island)
+
+    @staticmethod
+    def _filter_migration_payload_animations(
+        payload: Dict[str, Any],
+        selected_animation_names: Optional[List[str]],
+    ) -> Tuple[int, int]:
+        if selected_animation_names is None:
+            anims = payload.get("anims") if isinstance(payload, dict) else None
+            return (len(anims) if isinstance(anims, list) else 0, 0)
+        selected = {
+            str(name or "").strip().lower()
+            for name in selected_animation_names
+            if str(name or "").strip()
+        }
+        anims = payload.get("anims") if isinstance(payload, dict) else None
+        if not isinstance(anims, list):
+            payload["anims"] = []
+            return 0, 0
+        if not selected:
+            payload["anims"] = []
+            return 0, len(anims)
+        kept: List[Dict[str, Any]] = []
+        removed = 0
+        for index, anim in enumerate(anims):
+            if not isinstance(anim, dict):
+                removed += 1
+                continue
+            name = str(anim.get("name", "") or "").strip()
+            if not name:
+                name = f"Animation {index + 1}"
+            if name.lower() in selected:
+                kept.append(anim)
+            else:
+                removed += 1
+        payload["anims"] = kept
+        return len(kept), removed
+
+    @staticmethod
+    def _apply_target_track_overwrite_mapping(
+        payload: Dict[str, Any],
+        target_animation_names: Optional[List[str]],
+    ) -> int:
+        targets = [
+            str(name or "").strip()
+            for name in (target_animation_names or [])
+            if str(name or "").strip()
+        ]
+        if not targets:
+            return 0
+        anims = payload.get("anims") if isinstance(payload, dict) else None
+        if not isinstance(anims, list):
+            return 0
+        anim_dicts = [anim for anim in anims if isinstance(anim, dict)]
+        if len(anim_dicts) != len(targets):
+            raise RuntimeError(
+                f"Target overwrite requires {len(anim_dicts)} selected source track(s) "
+                f"and {len(targets)} selected target track(s)."
+            )
+        renamed = 0
+        for anim, target_name in zip(anim_dicts, targets):
+            current_name = str(anim.get("name", "") or "")
+            if current_name != target_name:
+                anim["name"] = target_name
+                renamed += 1
+        return renamed
+
+    def _decode_rev6_bin_payload_for_migration(self, bin_path: Path, temp_dir: Path) -> Dict[str, Any]:
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        work_bin = temp_dir / f"{bin_path.stem}_decode.bin"
+        shutil.copy2(bin_path, work_bin)
+        cmd = self._build_python_command(self.bin2json_path) + ["d", str(work_bin)]
+        result = self._run_converter_command_blocking(
+            cmd,
+            os.path.dirname(self.bin2json_path),
+            output_callback=lambda message, level: self.log_widget.log(f"[Migration] {message}", level),
+        )
+        if result.returncode != 0:
+            message = (result.stderr or result.stdout or "").strip() or f"Could not decode {bin_path.name}."
+            raise RuntimeError(message)
+        json_path = work_bin.with_suffix(".json")
+        if not json_path.exists():
+            raise RuntimeError(f"Rev6 decoder did not create JSON for {bin_path.name}.")
+        with open(json_path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"Decoded payload for {bin_path.name} is not a JSON object.")
+        return payload
+
+    def _write_rev6_payload_for_migration(
+        self,
+        payload: Dict[str, Any],
+        target_bin_path: Path,
+        temp_dir: Path,
+    ) -> None:
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        work_json = temp_dir / f"{target_bin_path.stem}_final.json"
+        payload = copy.deepcopy(payload)
+        payload["rev"] = 6
+        if "blend_version" not in payload:
+            payload["blend_version"] = 2
+        with open(work_json, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+        cmd = self._build_python_command(self.bin2json_path) + ["b", str(work_json)]
+        result = self._run_converter_command_blocking(
+            cmd,
+            os.path.dirname(self.bin2json_path),
+            output_callback=lambda message, level: self.log_widget.log(f"[Migration] {message}", level),
+        )
+        if result.returncode != 0:
+            message = (result.stderr or result.stdout or "").strip() or "rev6 BIN export failed."
+            raise RuntimeError(message)
+        produced_bin = work_json.with_suffix(".bin")
+        if not produced_bin.exists():
+            raise RuntimeError("rev6 converter completed but no BIN was created.")
+        target_bin_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(produced_bin, target_bin_path)
+
+    @staticmethod
+    def _infer_dof_regular_monster_code(anim_name: str, target_token: str) -> Optional[str]:
+        for candidate in (anim_name, target_token):
+            text = str(candidate or "").strip()
+            if not text:
+                continue
+            token = next((part for part in re.split(r"[_\s-]+", text) if part), "")
+            if re.fullmatch(r"[A-Za-z][A-Za-z0-9]{0,7}", token or ""):
+                return token.upper()
+        return None
+
+    @staticmethod
+    def _infer_dof_regular_animation_variant(anim_name: str) -> int:
+        numbers = [
+            int(match.group(1))
+            for match in re.finditer(r"(?:^|[_\s-])(\d{1,3})(?=$|[_\s-])", str(anim_name or ""))
+        ]
+        if numbers:
+            return max(1, min(99, numbers[-1]))
+        return 1
+
+    def _rewrite_dof_migration_animation_names(
+        self,
+        payload: Dict[str, Any],
+        target_island: int,
+        target_token: str,
+    ) -> int:
+        anims = payload.get("anims") if isinstance(payload, dict) else None
+        if not isinstance(anims, list):
+            return 0
+
+        try:
+            island_value = max(0, int(target_island))
+        except (TypeError, ValueError):
+            island_value = 1
+        island_prefix = f"{island_value:02d}" if island_value < 100 else str(island_value)
+        rewritten = 0
+        used_names = {
+            str(anim.get("name", "") or "").strip().lower()
+            for anim in anims
+            if isinstance(anim, dict)
+        }
+
+        for anim in anims:
+            if not isinstance(anim, dict):
+                continue
+            name = str(anim.get("name", "") or "").strip()
+            if not name or re.match(r"^[0-9]{1,3}[-_]", name):
+                continue
+            lowered = name.lower()
+            if lowered in {"idle", "sleep", "store"}:
+                continue
+            code = self._infer_dof_regular_monster_code(name, target_token)
+            if not code:
+                continue
+            variant = self._infer_dof_regular_animation_variant(name)
+            role = "Dance" if "dance" in lowered else "Monster"
+            used_names.discard(name.lower())
+            candidate_variant = variant
+            new_name = f"{island_prefix}-{code}_{role}_{candidate_variant:02d}"
+            while new_name.lower() in used_names and candidate_variant < 99:
+                candidate_variant += 1
+                new_name = f"{island_prefix}-{code}_{role}_{candidate_variant:02d}"
+            if new_name != name:
+                anim["name"] = new_name
+                rewritten += 1
+            used_names.add(str(anim.get("name", "") or "").strip().lower())
+        return rewritten
+
+    def _install_migration_spritesheet(self, source_png: Path, target_png: Path) -> List[Path]:
+        """Install a migrated spritesheet in the formats the game already uses."""
+        target_png.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_png, target_png)
+        installed = [target_png]
+
+        target_avif = target_png.with_suffix(".avif")
+        try:
+            with Image.open(source_png) as image:
+                image.save(target_avif, format="AVIF", lossless=True)
+            installed.append(target_avif)
+        except Exception as exc:
+            self.log_widget.log(
+                f"Failed to write migrated AVIF spritesheet '{target_avif}': {exc}",
+                "WARNING",
+            )
+        return installed
+
+    def _install_migration_xml_resource(self, source_xml: Path, target_xml: Path, target_png: Path) -> None:
+        """Copy a migrated atlas XML while matching its imagePath to the installed sheet name."""
+        target_xml.parent.mkdir(parents=True, exist_ok=True)
+        tree = ET.parse(source_xml)
+        root = tree.getroot()
+        root.set("imagePath", f"gfx/monsters/{target_png.name}")
+        DofRev6PackageWorker._normalize_atlas_root_sprite_names(root)
+        DofRev6PackageWorker._write_texturepacker_style_xml(root, target_xml)
+
+    def _start_dof_monster_migration(
+        self,
+        request: MonsterMigrationRequest,
+        profiles: List[Dict[str, Any]],
+    ) -> None:
+        self._migration_last_output_path = ""
+        self._migration_last_preview_animation_names = []
+        self._migration_last_preview_dof_output_path = ""
+        self._migration_current_preview_force_dof_pivots = False
+        if request.target_profile_index < 0 or request.target_profile_index >= len(profiles):
+            QMessageBox.warning(self, "Invalid Target", "Target profile selection is invalid.")
+            return
+        if int(request.target_revision) != 6:
+            QMessageBox.warning(self, "Unsupported Target", "DOF monster migration currently exports Rev6 packages only.")
+            return
+        if request.target_animation_names and not request.merge_with_existing:
+            QMessageBox.warning(
+                self,
+                "Merge Required",
+                "Target track overwrite requires Merge Animations Into Existing Target.",
+            )
+            return
+        if not self.dof_anim_to_json_path or not os.path.exists(self.dof_anim_to_json_path):
+            QMessageBox.warning(self, "Missing Tool", "DOF converter script was not found.")
+            return
+        if not self.bin2json_path or not os.path.exists(self.bin2json_path):
+            QMessageBox.warning(self, "Missing Tool", "rev6 BIN converter script was not found.")
+            return
+        if self._dof_convert_process and self._dof_convert_process.state() != QProcess.ProcessState.NotRunning:
+            QMessageBox.warning(self, "Conversion Running", "A DOF conversion is already in progress.")
+            return
+        if self._dof_convert_thread and self._dof_convert_thread.isRunning():
+            QMessageBox.warning(self, "Conversion Running", "A DOF conversion is already in progress.")
+            return
+
+        source = request.source
+        dof_root = self._sanitize_path_setting_value(source.dof_root)
+        input_path = self._sanitize_path_setting_value(source.dof_input_path or source.preferred_source_path)
+        if not dof_root or not os.path.isdir(dof_root):
+            QMessageBox.warning(self, "Missing DOF Path", "Selected DOF source profile has no valid DOF asset path.")
+            return
+        is_bundle = input_path.lower().startswith("bundle://")
+        if not input_path or (not is_bundle and not os.path.exists(input_path)):
+            QMessageBox.warning(self, "Missing Source", "Selected DOF source no longer exists.")
+            return
+
+        target_token = self._normalize_migration_token(request.target_token)
+        if not target_token:
+            QMessageBox.warning(self, "Invalid Target", "Target monster token is invalid.")
+            return
+
+        target_profile = profiles[request.target_profile_index]
+        target_root = self._choose_profile_migration_output_root(target_profile)
+        if not target_root:
+            QMessageBox.warning(
+                self,
+                "Missing Target Path",
+                "Target profile has no writable game/downloads path for xml_bin output.",
+            )
+            return
+
+        inferred = self._infer_dof_rev6_package_names_for_token(input_path, target_token)
+        target_bin_root = Path(target_root)
+        data_root = target_bin_root.parent if target_bin_root.name.lower() == "xml_bin" else target_bin_root
+        target_bin_path = target_bin_root / inferred["bin_name"]
+        target_xml_path = data_root / "xml_resources" / inferred["xml_name"]
+        target_png_path = data_root / "gfx" / "monsters" / inferred["png_name"]
+
+        temp_package_parent = Path(tempfile.mkdtemp(prefix="dof_migration_package_"))
+        package_root = temp_package_parent / inferred["package_stem"]
+        option_args = self._build_dof_rev6_package_option_args(include_control_panel_extras=False)
+
+        self._dof_migration_context = {
+            "request": request,
+            "profiles": list(profiles),
+            "target_bin_path": str(target_bin_path),
+            "target_xml_path": str(target_xml_path),
+            "target_png_path": str(target_png_path),
+            "temp_package_parent": str(temp_package_parent),
+            "target_profile_index": int(request.target_profile_index),
+            "target_token": target_token,
+            "merge_with_existing": bool(request.merge_with_existing),
+            "remap_island_prefix": bool(request.remap_island_prefix),
+            "target_island": int(request.target_island),
+            "selected_animation_names": list(request.selected_animation_names)
+            if request.selected_animation_names is not None
+            else None,
+            "target_animation_names": list(request.target_animation_names)
+            if request.target_animation_names is not None
+            else None,
+            "write_json_output": bool(request.write_json_output),
+        }
+
+        self.log_widget.log(
+            f"Migrating DOF source {source.stem} -> monster_{target_token} (rev 6)...",
+            "INFO",
+        )
+        self.log_widget.log(
+            "DOF migration uses the default Rev6 package path: premultiplied atlas, hires XML, mesh-offset preservation, and corrected sprite-anchor timing.",
+            "INFO",
+        )
+        self._set_dof_conversion_active(True, label="Migrating DOF...")
+        self._dof_convert_worker = DofRev6PackageWorker(
+            self.dof_anim_to_json_path,
+            self.bin2json_path,
+            input_path,
+            dof_root,
+            str(package_root),
+            inferred["source_stem"],
+            inferred["bin_name"],
+            inferred["xml_name"],
+            inferred["png_name"],
+            option_args,
+        )
+        self._dof_convert_thread = QThread(self)
+        self._dof_convert_worker.moveToThread(self._dof_convert_thread)
+        self._dof_convert_thread.started.connect(self._dof_convert_worker.run)
+        self._dof_convert_worker.log_message.connect(self._log_dof_rev6_worker_output)
+        self._dof_convert_worker.finished.connect(self._on_dof_migration_package_finished)
+        self._dof_convert_worker.finished.connect(self._dof_convert_thread.quit)
+        self._dof_convert_thread.finished.connect(self._cleanup_dof_conversion_thread)
+        self._dof_convert_thread.start()
+
+    def _on_dof_migration_package_finished(self, payload: Dict[str, Any]) -> None:
+        self._set_dof_conversion_active(False)
+        context = self._dof_migration_context or {}
+        self._dof_migration_context = None
+
+        if not payload.get("logs_streamed"):
+            for message, level in payload.get("logs", []):
+                self.log_widget.log(f"[DOF Rev6] {message}", level)
+
+        temp_package_parent = context.get("temp_package_parent")
+        if not payload.get("success"):
+            message = str(payload.get("error") or "DOF rev6 package conversion failed.")
+            self.log_widget.log(f"DOF monster migration failed: {message}", "ERROR")
+            worker_temp_root = payload.get("temp_root")
+            if worker_temp_root:
+                self.log_widget.log(f"Temporary conversion output kept at: {worker_temp_root}", "INFO")
+            if temp_package_parent:
+                shutil.rmtree(str(temp_package_parent), ignore_errors=True)
+            QMessageBox.warning(self, "Migration Failed", message)
+            return
+
+        try:
+            source_bin = Path(str(payload.get("bin_path") or ""))
+            source_xml = Path(str(payload.get("xml_path") or ""))
+            source_png = Path(str(payload.get("png_path") or ""))
+            target_bin = Path(str(context.get("target_bin_path") or ""))
+            target_xml = Path(str(context.get("target_xml_path") or ""))
+            target_png = Path(str(context.get("target_png_path") or ""))
+            if not source_bin.exists() or not source_xml.exists() or not source_png.exists():
+                raise RuntimeError("Generated DOF package is missing BIN, XML, or PNG output.")
+            if not temp_package_parent:
+                raise RuntimeError("Temporary migration workspace was not available.")
+            work_root = Path(str(temp_package_parent)) / "finalize"
+            final_payload = self._decode_rev6_bin_payload_for_migration(source_bin, work_root / "incoming")
+            incoming_sources = copy.deepcopy(final_payload.get("sources"))
+            explicit_target_overwrite = bool(context.get("target_animation_names"))
+
+            kept_tracks, removed_tracks = self._filter_migration_payload_animations(
+                final_payload,
+                context.get("selected_animation_names"),
+            )
+            if context.get("selected_animation_names") is not None:
+                if kept_tracks <= 0:
+                    raise RuntimeError("No selected DOF tracks matched the converted payload.")
+                self.log_widget.log(
+                    f"Selected {kept_tracks} DOF track(s) for migration; skipped {removed_tracks}.",
+                    "INFO",
+                )
+
+            if context.get("remap_island_prefix"):
+                rewritten = self._rewrite_animation_island_prefixes(
+                    final_payload,
+                    int(context.get("target_island", 1)),
+                )
+                rewritten += self._rewrite_dof_migration_animation_names(
+                    final_payload,
+                    int(context.get("target_island", 1)),
+                    str(context.get("target_token") or ""),
+                )
+                if rewritten:
+                    self.log_widget.log(
+                        f"Mapped {rewritten} DOF animation name(s) to island {int(context.get('target_island', 1))}.",
+                        "INFO",
+                    )
+
+            target_renamed = self._apply_target_track_overwrite_mapping(
+                final_payload,
+                context.get("target_animation_names"),
+            )
+            if target_renamed:
+                self.log_widget.log(
+                    f"Mapped {target_renamed} incoming DOF track(s) onto selected target track name(s).",
+                    "INFO",
+                )
+
+            source_mismatched, source_total, source_examples = self._migration_payload_atlas_mismatches(
+                final_payload,
+                source_xml,
+            )
+            if source_mismatched:
+                detail = f" Examples: {'; '.join(source_examples)}." if source_examples else ""
+                raise RuntimeError(
+                    (
+                        f"{source_mismatched} of {source_total} converted source track(s) reference sprite names "
+                        f"that are not in the generated source atlas.{detail}"
+                    )
+                )
+            preview_animation_names = self._animation_names_from_payload(final_payload)
+
+            if context.get("merge_with_existing") and target_bin.exists():
+                existing_payload = self._decode_rev6_bin_payload_for_migration(target_bin, work_root / "existing")
+                if explicit_target_overwrite:
+                    final_payload = self._merge_migration_payloads(existing_payload, final_payload)
+                    self.log_widget.log(
+                        "Overwrote selected target track(s) with incoming DOF animation(s).",
+                        "INFO",
+                    )
+                else:
+                    final_payload, appended, skipped = self._merge_migration_payloads_preserving_existing(
+                        existing_payload,
+                        final_payload,
+                    )
+                    self.log_widget.log(
+                        f"Added {appended} incoming DOF track(s) while preserving existing target tracks.",
+                        "INFO",
+                    )
+                    if skipped:
+                        self.log_widget.log(
+                            (
+                                f"Skipped {skipped} incoming DOF track(s) because the target already has "
+                                "the same name; select target tracks to overwrite them."
+                            ),
+                            "INFO",
+                        )
+            elif context.get("merge_with_existing"):
+                existing_json = target_bin.with_suffix(".json")
+                if existing_json.exists():
+                    with open(existing_json, "r", encoding="utf-8") as handle:
+                        existing_payload = json.load(handle)
+                    if isinstance(existing_payload, dict):
+                        if explicit_target_overwrite:
+                            final_payload = self._merge_migration_payloads(existing_payload, final_payload)
+                            self.log_widget.log(
+                                "Overwrote selected target JSON track(s) with incoming DOF animation(s).",
+                                "INFO",
+                            )
+                        else:
+                            final_payload, appended, skipped = self._merge_migration_payloads_preserving_existing(
+                                existing_payload,
+                                final_payload,
+                            )
+                            self.log_widget.log(
+                                f"Added {appended} incoming DOF track(s) while preserving existing target JSON tracks.",
+                                "INFO",
+                            )
+                            if skipped:
+                                self.log_widget.log(
+                                    (
+                                        f"Skipped {skipped} incoming DOF track(s) because the target JSON already has "
+                                        "the same name; select target tracks to overwrite them."
+                                    ),
+                                    "INFO",
+                                )
+                else:
+                    self.log_widget.log(
+                        "Merge mode requested but target monster was not found; creating new target.",
+                        "INFO",
+                    )
+
+            for target in (target_bin, target_xml, target_png):
+                target.parent.mkdir(parents=True, exist_ok=True)
+            if isinstance(incoming_sources, list):
+                final_payload["sources"] = copy.deepcopy(incoming_sources)
+            self._install_migration_xml_resource(source_xml, target_xml, target_png)
+            installed_sheets = self._install_migration_spritesheet(source_png, target_png)
+            self.log_widget.log(
+                "Installed incoming DOF XML atlas and spritesheet over the target assets.",
+                "INFO",
+            )
+
+            self._write_rev6_payload_for_migration(final_payload, target_bin, work_root / "export")
+
+            if context.get("write_json_output"):
+                output_json = target_bin.with_suffix(".json")
+                with open(output_json, "w", encoding="utf-8") as handle:
+                    json.dump(final_payload, handle, indent=2)
+                self.log_widget.log(
+                    f"Wrote migration JSON: {output_json}",
+                    "INFO",
+                )
+
+            self._migration_last_output_path = str(target_bin)
+            self._migration_last_preview_animation_names = list(preview_animation_names)
+            self._migration_last_preview_dof_output_path = str(target_bin)
+            self.log_widget.log(f"DOF monster migration complete: {target_bin}", "SUCCESS")
+            self.log_widget.log(f"XML: {target_xml}", "INFO")
+            for sheet_path in installed_sheets:
+                self.log_widget.log(f"Spritesheet: {sheet_path}", "INFO")
+        except Exception as exc:
+            self.log_widget.log(f"DOF migration install failed: {exc}", "ERROR")
+            QMessageBox.warning(self, "Migration Failed", f"Could not install DOF package into target profile:\n{exc}")
+            return
+        finally:
+            if temp_package_parent:
+                shutil.rmtree(str(temp_package_parent), ignore_errors=True)
+
+        _, active_profile_index = self._load_path_profiles_store()
+        if int(active_profile_index) == int(context.get("target_profile_index", -1)):
+            self.refresh_file_list()
+        if self.monster_migration_panel is not None:
+            self.monster_migration_panel.set_last_output_path(self._migration_last_output_path)
+        if self._migration_last_output_path:
+            self._on_migration_panel_preview_output_requested(self._migration_last_output_path)
+
     def _run_monster_migration(
         self,
         request: MonsterMigrationRequest,
@@ -15390,6 +19753,8 @@ class MSMAnimationViewer(QMainWindow):
     ) -> bool:
         """Execute a full source->target migration request from the dialog."""
         self._migration_last_output_path = ""
+        self._migration_last_preview_dof_output_path = ""
+        self._migration_current_preview_force_dof_pivots = False
         if request.target_profile_index < 0 or request.target_profile_index >= len(profiles):
             QMessageBox.warning(self, "Invalid Target", "Target profile selection is invalid.")
             return False
@@ -15403,6 +19768,13 @@ class MSMAnimationViewer(QMainWindow):
         if not target_token:
             QMessageBox.warning(self, "Invalid Target", "Target monster token is invalid.")
             return False
+        if request.target_animation_names and not request.merge_with_existing:
+            QMessageBox.warning(
+                self,
+                "Merge Required",
+                "Target track overwrite requires Merge Animations Into Existing Target.",
+            )
+            return False
 
         source_profile = profiles[request.source.profile_index] if 0 <= request.source.profile_index < len(profiles) else {}
         target_profile = profiles[request.target_profile_index]
@@ -15412,6 +19784,23 @@ class MSMAnimationViewer(QMainWindow):
             QMessageBox.warning(self, "Migration Failed", "Could not parse source monster payload.")
             return False
 
+        kept_tracks, removed_tracks = self._filter_migration_payload_animations(
+            payload,
+            request.selected_animation_names,
+        )
+        if request.selected_animation_names is not None:
+            if kept_tracks <= 0:
+                QMessageBox.warning(
+                    self,
+                    "Migration Failed",
+                    "No selected source tracks matched the migration payload.",
+                )
+                return False
+            self.log_widget.log(
+                f"Selected {kept_tracks} track(s) for migration; skipped {removed_tracks}.",
+                "INFO",
+            )
+
         if request.remap_island_prefix:
             rewritten = self._rewrite_animation_island_prefixes(payload, request.target_island)
             if rewritten:
@@ -15419,6 +19808,16 @@ class MSMAnimationViewer(QMainWindow):
                     f"Rewrote island prefixes on {rewritten} animation(s).",
                     "INFO",
                 )
+
+        target_renamed = self._apply_target_track_overwrite_mapping(
+            payload,
+            request.target_animation_names,
+        )
+        if target_renamed:
+            self.log_widget.log(
+                f"Mapped {target_renamed} incoming track(s) onto selected target track name(s).",
+                "INFO",
+            )
 
         target_stem = f"monster_{target_token}"
 
@@ -15526,6 +19925,12 @@ class MSMAnimationViewer(QMainWindow):
 
     def show_monster_migration(self) -> None:
         """Open the migration workspace inside the right-side panel."""
+        if self._basic_viewer_fast_load_enabled():
+            self.log_widget.log("Monster Migration workspace is disabled in Basic mode.", "INFO")
+            if hasattr(self, "control_panel") and self.control_panel:
+                self.control_panel.set_active_section("export")
+            self._set_right_panel_mode("layers")
+            return
         if hasattr(self, "control_panel") and self.control_panel:
             self.control_panel.set_active_section("export")
         if not self._right_panel_visible:
@@ -15891,7 +20296,15 @@ class MSMAnimationViewer(QMainWindow):
             source = atlas._load_texture_image(path)
             atlas_image = source.convert("RGBA")
             atlas_image.load()
-            if getattr(atlas, "force_unpremultiply", False):
+            should_unpremultiply = bool(getattr(atlas, "force_unpremultiply", False))
+            if not should_unpremultiply:
+                try:
+                    should_unpremultiply = bool(
+                        atlas._should_preserve_premultiplied_source(atlas_image, path)
+                    )
+                except Exception:
+                    should_unpremultiply = False
+            if should_unpremultiply:
                 looks_premultiplied = False
                 try:
                     looks_premultiplied = bool(atlas._image_looks_premultiplied(atlas_image))
@@ -16292,8 +20705,12 @@ class MSMAnimationViewer(QMainWindow):
         self._reset_layer_thumbnail_cache()
         self._refresh_layer_thumbnails()
         self.gl_widget.update()
-    
+
     def update_timeline(self):
+        with profile_scope("ui.timeline_update"):
+            return self._update_timeline_impl()
+
+    def _update_timeline_impl(self):
         """Update timeline slider range"""
         if self.gl_widget.player.animation:
             duration = float(self.gl_widget.player.duration or 0.0)
@@ -16316,6 +20733,13 @@ class MSMAnimationViewer(QMainWindow):
             if not math.isfinite(current_time):
                 current_time = 0.0
             self.timeline.set_current_time(min(max(0.0, current_time), duration))
+            if self._basic_viewer_fast_load_enabled():
+                self.timeline.set_lane_groups([])
+                self._timeline_lane_preview_state.clear()
+                self._selected_marker_refs = set()
+                self.timeline.set_beat_markers([], 0.0)
+                self.timeline.set_beat_bpm_display(None, False)
+                return
             self._refresh_timeline_keyframes()
             self._update_timeline_beat_display()
             self._refresh_timeline_beats()
@@ -16324,6 +20748,7 @@ class MSMAnimationViewer(QMainWindow):
             self.timeline.set_time_label("0.00 / 0.00s")
             self.timeline.set_current_time(0.0)
             self.timeline.set_lane_groups([])
+            self._timeline_lane_preview_state.clear()
             self._selected_marker_refs = set()
             self.timeline.set_beat_markers([], 0.0)
             self._tempo_segments = []
@@ -16331,10 +20756,15 @@ class MSMAnimationViewer(QMainWindow):
             self.timeline.set_beat_markers([], 0.0)
 
     def _refresh_timeline_keyframes(self):
+        with profile_scope("ui.timeline_keyframes_refresh"):
+            return self._refresh_timeline_keyframes_impl()
+
+    def _refresh_timeline_keyframes_impl(self):
         """Update timeline markers to reflect current keyframes."""
         animation = getattr(self.gl_widget.player, "animation", None)
         if not animation:
             self.timeline.set_lane_groups([])
+            self._timeline_lane_preview_state.clear()
             return
         duration = float(max(0.0, self.gl_widget.player.duration))
         if not math.isfinite(duration):
@@ -16422,6 +20852,7 @@ class MSMAnimationViewer(QMainWindow):
 
         self.timeline.set_timeline_duration(duration)
         self.timeline.set_lane_groups(groups)
+        self._timeline_lane_preview_state.clear()
         self._refresh_timeline_lane_thumbnails()
 
         available_markers: List[Tuple[TimelineLaneKey, float]] = []
@@ -16509,6 +20940,7 @@ class MSMAnimationViewer(QMainWindow):
         ]
         self.timeline.set_timeline_duration(duration)
         self.timeline.set_lane_groups(groups)
+        self._timeline_lane_preview_state.clear()
         self.timeline.set_active_lane(lane_key)
         available_markers = [(lane_key, time_value) for time_value in sorted(markers)]
         self._sync_marker_selection(available_markers)
@@ -16727,13 +21159,42 @@ class MSMAnimationViewer(QMainWindow):
         self._selected_marker_refs = set(remaining)
         if hasattr(self, "timeline"):
             self.timeline.set_marker_selection(remaining)
-    
-    def _set_player_playing(self, playing: bool, *, sync_audio: bool = False) -> None:
+
+    def _player_is_at_animation_end(self) -> bool:
+        """Return True when the active player is parked at the end of a non-empty animation."""
+        player = getattr(self.gl_widget, "player", None)
+        if not player or not getattr(player, "animation", None):
+            return False
+        duration = float(getattr(player, "duration", 0.0) or 0.0)
+        if duration <= 1e-6:
+            return False
+        current_time = float(getattr(player, "current_time", 0.0) or 0.0)
+        tolerance = max(1e-4, min(0.05, duration * 1e-4))
+        return current_time >= duration - tolerance
+
+    def _set_player_playing(
+        self,
+        playing: bool,
+        *,
+        sync_audio: bool = False,
+        restart_from_end: bool = False,
+    ) -> None:
         """Centralize updates to AnimationPlayer.playing."""
         player = getattr(self.gl_widget, "player", None)
         if not player:
             return
         new_state = bool(playing)
+        if (
+            new_state
+            and restart_from_end
+            and not bool(getattr(player, "playing", False))
+            and not bool(getattr(player, "loop", True))
+            and self._player_is_at_animation_end()
+        ):
+            player.current_time = 0.0
+            self._audio_loop_index = 0
+            if getattr(player, "animation", None):
+                self.gl_widget.set_time(0.0)
         previous = bool(player.playing)
         player.playing = new_state
         sync_timer = getattr(self.gl_widget, "sync_playback_timer", None)
@@ -16747,14 +21208,18 @@ class MSMAnimationViewer(QMainWindow):
     def toggle_playback(self):
         """Toggle animation playback"""
         new_state = not self.gl_widget.player.playing
-        self._set_player_playing(new_state, sync_audio=True)
+        self._set_player_playing(new_state, sync_audio=True, restart_from_end=True)
         self.timeline.set_play_button_text("Pause" if new_state else "Play")
-    
+
     def toggle_loop(self, state: int):
         """Toggle animation looping"""
         self.gl_widget.player.loop = (state == Qt.CheckState.Checked.value)
-    
+
     def on_timeline_changed(self, value: int):
+        with profile_scope("ui.timeline_scrub"):
+            return self._on_timeline_changed_impl(value)
+
+    def _on_timeline_changed_impl(self, value: int):
         """Handle timeline slider change"""
         if not self.gl_widget.player.animation:
             return
@@ -20482,17 +24947,19 @@ class MSMAnimationViewer(QMainWindow):
                     return
         anims.append(exported)
         payload["anims"] = anims
-    
+
     def on_scale_changed(self, value: float):
         """Handle render scale change"""
         self.gl_widget.render_scale = value
         self.gl_widget.update()
-    
+
     def on_fps_changed(self, value: int):
         """Handle FPS change"""
         interval = int(1000 / value)
         self.gl_widget.timer.setInterval(interval)
-    
+        if self._simple_viewer_mode_enabled:
+            self._start_simple_viewer_bake_for_current_animation()
+
     def on_position_scale_changed(self, value: float):
         """Handle position scale spinbox change"""
         self.gl_widget.position_scale = value
@@ -20501,7 +24968,7 @@ class MSMAnimationViewer(QMainWindow):
         self.control_panel.pos_scale_slider.setValue(int(value * 100))
         self.control_panel.pos_scale_slider.blockSignals(False)
         self.gl_widget.update()
-    
+
     def on_position_scale_slider_changed(self, value: int):
         """Handle position scale slider change"""
         scale_value = value / 100.0
@@ -20511,7 +24978,7 @@ class MSMAnimationViewer(QMainWindow):
         self.control_panel.pos_scale_spin.blockSignals(False)
         self.gl_widget.position_scale = scale_value
         self.gl_widget.update()
-    
+
     def on_base_world_scale_changed(self, value: float):
         """Handle base world scale spinbox change"""
         self.gl_widget.renderer.base_world_scale = value
@@ -20520,7 +24987,7 @@ class MSMAnimationViewer(QMainWindow):
         self.control_panel.base_scale_slider.setValue(int(value * 100))
         self.control_panel.base_scale_slider.blockSignals(False)
         self.gl_widget.update()
-    
+
     def on_base_world_scale_slider_changed(self, value: int):
         """Handle base world scale slider change"""
         scale_value = value / 100.0
@@ -20530,20 +24997,20 @@ class MSMAnimationViewer(QMainWindow):
         self.control_panel.base_scale_spin.blockSignals(False)
         self.gl_widget.renderer.base_world_scale = scale_value
         self.gl_widget.update()
-    
+
     def on_translation_sensitivity_changed(self, value: float):
         """Adjust sprite drag translation speed multiplier."""
         self.gl_widget.drag_translation_multiplier = max(0.01, value)
-    
+
     def on_rotation_sensitivity_changed(self, value: float):
         """Adjust sprite rotation sensitivity multiplier."""
         self.gl_widget.drag_rotation_multiplier = max(0.1, value)
-    
+
     def on_rotation_overlay_size_changed(self, value: float):
         """Adjust the visual radius of the rotation gizmo."""
         self.gl_widget.rotation_overlay_radius = max(5.0, value)
         self.gl_widget.update()
-    
+
     def toggle_rotation_gizmo(self, enabled: bool):
         """Toggle visibility of the rotation gizmo overlay."""
         self.gl_widget.rotation_gizmo_enabled = enabled
@@ -21003,11 +25470,11 @@ class MSMAnimationViewer(QMainWindow):
             self.audio_manager.play(self._get_audio_sync_time(self.gl_widget.player.current_time))
         else:
             self.audio_manager.pause()
-    
+
     def on_anchor_bias_x_changed(self, value: float):
         self.gl_widget.renderer.anchor_bias_x = value
         self.gl_widget.update()
-    
+
     def on_anchor_bias_y_changed(self, value: float):
         self.gl_widget.renderer.anchor_bias_y = value
         self.gl_widget.update()
@@ -21027,31 +25494,31 @@ class MSMAnimationViewer(QMainWindow):
     def on_anchor_scale_y_changed(self, value: float):
         self.gl_widget.renderer.anchor_scale_y = max(0.0, float(value))
         self.gl_widget.update()
-    
+
     def on_local_position_multiplier_changed(self, value: float):
         self.gl_widget.renderer.local_position_multiplier = max(0.0, value)
         self.gl_widget.update()
-    
+
     def on_parent_mix_changed(self, value: float):
         self.gl_widget.renderer.parent_mix = max(0.0, min(1.0, value))
         self.gl_widget.update()
-    
+
     def on_rotation_bias_changed(self, value: float):
         self.gl_widget.renderer.rotation_bias = value
         self.gl_widget.update()
-    
+
     def on_scale_bias_x_changed(self, value: float):
         self.gl_widget.renderer.scale_bias_x = max(0.0, value)
         self.gl_widget.update()
-    
+
     def on_scale_bias_y_changed(self, value: float):
         self.gl_widget.renderer.scale_bias_y = max(0.0, value)
         self.gl_widget.update()
-    
+
     def on_world_offset_x_changed(self, value: float):
         self.gl_widget.renderer.world_offset_x = value
         self.gl_widget.update()
-    
+
     def on_world_offset_y_changed(self, value: float):
         self.gl_widget.renderer.world_offset_y = value
         self.gl_widget.update()
@@ -21063,16 +25530,16 @@ class MSMAnimationViewer(QMainWindow):
     def on_particle_origin_offset_y_changed(self, value: float):
         self.gl_widget.particle_origin_offset_y = float(value)
         self.gl_widget.update()
-    
+
     def on_trim_shift_multiplier_changed(self, value: float):
         self.gl_widget.renderer.trim_shift_multiplier = max(0.0, value)
         self.gl_widget.update()
-    
+
     def reset_camera(self):
         """Reset camera to default position"""
         self.gl_widget.reset_camera()
         self.control_panel.scale_spin.setValue(1.0)
-    
+
     def fit_to_view(self):
         """Fit the animation to the viewport"""
         if self.gl_widget.fit_to_view():
@@ -21083,12 +25550,12 @@ class MSMAnimationViewer(QMainWindow):
             self.log_widget.log("Fitted animation to view", "SUCCESS")
         else:
             self.log_widget.log("No animation to fit", "WARNING")
-    
+
     def toggle_bone_overlay(self, enabled: bool):
         """Toggle the bone/skeleton overlay"""
         self.gl_widget.show_bones = enabled
         self.gl_widget.update()
-    
+
     def toggle_anchor_overlay(self, enabled: bool):
         """Toggle the anchor overlay/editor."""
         self.gl_widget.set_anchor_overlay_enabled(enabled)
@@ -21187,6 +25654,161 @@ class MSMAnimationViewer(QMainWindow):
         self.metronome.set_time_signature(self.time_signature_num, self.time_signature_denom)
         self.metronome.set_audible(self.metronome_audible)
         self.metronome.set_enabled(should_run)
+
+    def _read_clamped_float_setting(
+        self,
+        key: str,
+        default: float,
+        minimum: float,
+        maximum: float,
+    ) -> float:
+        try:
+            value = float(self.settings.value(key, default, type=float))
+        except (TypeError, ValueError):
+            value = float(default)
+        return max(float(minimum), min(float(maximum), value))
+
+    def _read_performance_profiler_settings(self) -> None:
+        self.performance_profiler_enabled = bool(
+            self.settings.value("performance/profiler_enabled", False, type=bool)
+        )
+        self.performance_profiler_slow_threshold_ms = self._read_clamped_float_setting(
+            "performance/profiler_slow_threshold_ms",
+            50.0,
+            1.0,
+            5000.0,
+        )
+        self.performance_profiler_report_interval_sec = self._read_clamped_float_setting(
+            "performance/profiler_report_interval_sec",
+            8.0,
+            2.0,
+            120.0,
+        )
+
+    def _configure_performance_profiler(self, *, reset: bool = False) -> None:
+        self._read_performance_profiler_settings()
+        log_widget = getattr(self, "log_widget", None)
+        log_fn = log_widget.log if log_widget is not None else None
+        get_profiler().configure(
+            enabled=self.performance_profiler_enabled,
+            slow_threshold_ms=self.performance_profiler_slow_threshold_ms,
+            report_interval_sec=self.performance_profiler_report_interval_sec,
+            log_fn=log_fn,
+            reset=reset,
+        )
+
+    def _read_spatial3d_settings(self) -> None:
+        self.spatial3d_support_enabled = bool(
+            self.settings.value("spatial3d/support_enabled", False, type=bool)
+        )
+        mode = str(self.settings.value("spatial3d/mode", "spatiallabs", type=str) or "spatiallabs").strip().lower()
+        if mode in {"spatial", "spatial_labs", "acer_spatiallabs"}:
+            mode = "spatiallabs"
+        elif mode in {"sbs", "side-by-side", "side_by_side"}:
+            mode = "side_by_side"
+        elif mode != "anaglyph":
+            mode = "spatiallabs"
+        self.spatial3d_mode = mode
+        self.spatial3d_view_enabled = bool(
+            self.settings.value("spatial3d/view_enabled", False, type=bool)
+        )
+        self.spatial3d_swap_eyes = bool(
+            self.settings.value("spatial3d/swap_eyes", False, type=bool)
+        )
+        self.spatial3d_depth_strength = self._read_clamped_float_setting(
+            "spatial3d/depth_strength",
+            0.5,
+            0.0,
+            1.0,
+        )
+        self.spatial3d_screen_plane = self._read_clamped_float_setting(
+            "spatial3d/screen_plane",
+            0.0,
+            -1.0,
+            1.0,
+        )
+        self.spatial3d_view_x = self._read_clamped_float_setting(
+            "spatial3d/view_x",
+            0.0,
+            -1.0,
+            1.0,
+        )
+        self.spatial3d_view_y = self._read_clamped_float_setting(
+            "spatial3d/view_y",
+            0.0,
+            -1.0,
+            1.0,
+        )
+
+    def _sync_spatial3d_controls(self) -> None:
+        if not hasattr(self, "control_panel") or self.control_panel is None:
+            return
+        self.control_panel.set_spatial3d_available(self.spatial3d_support_enabled)
+        self.control_panel.set_spatial3d_enabled(self.spatial3d_view_enabled)
+        if hasattr(self, "gl_widget") and self.gl_widget:
+            self.control_panel.set_spatial3d_status(self.gl_widget.spatial3d_status())
+        elif self.spatial3d_support_enabled:
+            if self.spatial3d_mode == "side_by_side":
+                self.control_panel.set_spatial3d_status("Side-by-Side 3D ready")
+            elif self.spatial3d_mode == "anaglyph":
+                self.control_panel.set_spatial3d_status("Anaglyph 3D ready")
+            else:
+                self.control_panel.set_spatial3d_status("SpatialLabs SDK pending")
+        else:
+            self.control_panel.set_spatial3d_status("Stereoscopic 3D disabled")
+        self.control_panel.set_spatial3d_depth_strength(self.spatial3d_depth_strength)
+        self.control_panel.set_spatial3d_screen_plane(self.spatial3d_screen_plane)
+        self.control_panel.set_spatial3d_view_offset(self.spatial3d_view_x, self.spatial3d_view_y)
+        self.control_panel.set_spatial3d_swap_eyes(self.spatial3d_swap_eyes)
+
+    def _apply_spatial3d_settings_to_widget(self, widget: OpenGLAnimationWidget) -> None:
+        if widget is None:
+            return
+        widget.set_spatial3d_support_enabled(self.spatial3d_support_enabled)
+        widget.set_spatial3d_mode(self.spatial3d_mode)
+        widget.set_spatial3d_enabled(self.spatial3d_view_enabled)
+        widget.set_spatial3d_swap_eyes(self.spatial3d_swap_eyes)
+        widget.set_spatial3d_depth_strength(self.spatial3d_depth_strength)
+        widget.set_spatial3d_screen_plane(self.spatial3d_screen_plane)
+        widget.set_spatial3d_view_offset(self.spatial3d_view_x, self.spatial3d_view_y)
+        if hasattr(self, "control_panel") and self.control_panel:
+            self.control_panel.set_spatial3d_status(widget.spatial3d_status())
+
+    def on_spatial3d_enabled_changed(self, enabled: bool) -> None:
+        self.spatial3d_view_enabled = bool(enabled)
+        self.settings.setValue("spatial3d/view_enabled", self.spatial3d_view_enabled)
+        if hasattr(self, "gl_widget") and self.gl_widget:
+            self._apply_spatial3d_settings_to_widget(self.gl_widget)
+
+    def on_spatial3d_depth_changed(self, value: float) -> None:
+        self.spatial3d_depth_strength = max(0.0, min(1.0, float(value)))
+        self.settings.setValue("spatial3d/depth_strength", self.spatial3d_depth_strength)
+        if hasattr(self, "gl_widget") and self.gl_widget:
+            self.gl_widget.set_spatial3d_depth_strength(self.spatial3d_depth_strength)
+
+    def on_spatial3d_screen_plane_changed(self, value: float) -> None:
+        self.spatial3d_screen_plane = max(-1.0, min(1.0, float(value)))
+        self.settings.setValue("spatial3d/screen_plane", self.spatial3d_screen_plane)
+        if hasattr(self, "gl_widget") and self.gl_widget:
+            self.gl_widget.set_spatial3d_screen_plane(self.spatial3d_screen_plane)
+
+    def on_spatial3d_view_changed(self, x_value: float, y_value: float) -> None:
+        self.spatial3d_view_x = max(-1.0, min(1.0, float(x_value)))
+        self.spatial3d_view_y = max(-1.0, min(1.0, float(y_value)))
+        self.settings.setValue("spatial3d/view_x", self.spatial3d_view_x)
+        self.settings.setValue("spatial3d/view_y", self.spatial3d_view_y)
+        if hasattr(self, "gl_widget") and self.gl_widget:
+            self.gl_widget.set_spatial3d_view_offset(self.spatial3d_view_x, self.spatial3d_view_y)
+
+    def on_spatial3d_swap_eyes_changed(self, enabled: bool) -> None:
+        self.spatial3d_swap_eyes = bool(enabled)
+        self.settings.setValue("spatial3d/swap_eyes", self.spatial3d_swap_eyes)
+        if hasattr(self, "gl_widget") and self.gl_widget:
+            self.gl_widget.set_spatial3d_swap_eyes(self.spatial3d_swap_eyes)
+
+    def on_spatial3d_status_changed(self, status: str) -> None:
+        if hasattr(self, "control_panel") and self.control_panel:
+            self.control_panel.set_spatial3d_status(status)
 
     def on_solid_bg_enabled_changed(self, enabled: bool):
         """Handle background fill checkbox toggles."""
@@ -21323,6 +25945,14 @@ class MSMAnimationViewer(QMainWindow):
         self.settings.setValue(
             'export/include_viewport_background',
             self.export_include_viewport_background,
+        )
+
+    def on_export_all_loaded_animations_changed(self, enabled: bool):
+        """Toggle batch exports from the control-panel Export tab."""
+        self.export_all_loaded_animations = bool(enabled)
+        self.settings.setValue(
+            'export/all_loaded_animations',
+            self.export_all_loaded_animations,
         )
 
     def _default_viewport_background_asset_path(self) -> str:
@@ -22376,88 +27006,449 @@ class MSMAnimationViewer(QMainWindow):
             if atlas.is_hires:
                 scale = max(scale, 2.0)
         return scale
-    
-    def export_current_frame(self):
-        """Export current frame as transparent PNG"""
+
+    def _export_all_animations_requested(self) -> bool:
+        checkbox = getattr(self.control_panel, "export_all_animations_checkbox", None)
+        if checkbox is not None:
+            return bool(checkbox.isChecked())
+        return bool(getattr(self, "export_all_loaded_animations", False))
+
+    @staticmethod
+    def _safe_export_basename(value: str, fallback: str = "animation") -> str:
+        cleaned = re.sub(r"[^0-9A-Za-z._-]+", "_", str(value or "")).strip("._")
+        return cleaned or fallback
+
+    @classmethod
+    def _dof_animation_export_group_key(cls, anim_name: str) -> Tuple[Tuple[str, ...], Tuple[str, ...], str]:
+        stem = cls._dof_anim_name_from_path(anim_name).lower()
+        tokens = [token for token in re.split(r"[_\s-]+", stem) if token]
+        if not tokens:
+            return ((), (), "default")
+        stage = "adult" if "adult" in tokens else ("baby" if "baby" in tokens else "default")
+        track_index = -1
+        for idx, token in enumerate(tokens[1:], start=1):
+            if token.isdigit():
+                track_index = idx
+                break
+        if track_index >= 0:
+            return (tuple(tokens[:track_index]), tuple(tokens[track_index + 1:]), stage)
+        prefix_count = min(len(tokens), 4 if stage in {"adult", "baby"} else 3)
+        return (tuple(tokens[:prefix_count]), tuple(tokens[prefix_count:]), stage)
+
+    @staticmethod
+    def _dof_animation_sort_key(input_path: str) -> Tuple[Any, ...]:
+        stem = MSMAnimationViewer._dof_anim_name_from_path(input_path).lower()
+        parts: List[Any] = []
+        for token in re.split(r"([0-9]+)", stem):
+            if not token:
+                continue
+            parts.append(int(token) if token.isdigit() else token)
+        return tuple(parts)
+
+    def _current_dof_export_stem(self) -> str:
+        for candidate in (
+            self.current_animation_name,
+            Path(self.current_json_path).stem if self.current_json_path else "",
+        ):
+            stem = self._dof_anim_name_from_path(str(candidate or ""))
+            if stem:
+                return stem
+        return ""
+
+    def _collect_dof_export_all_targets(self) -> List[Dict[str, Any]]:
+        if not self._is_dof_json_payload(self.current_json_path, self.current_json_data):
+            return []
+        current_stem = self._current_dof_export_stem()
+        if not current_stem or not self.dof_path:
+            return []
+        group_key = self._dof_animation_export_group_key(current_stem)
+
+        candidates: Dict[str, str] = {}
+
+        def add_candidate(input_path: str) -> None:
+            source = str(input_path or "").strip()
+            if not source:
+                return
+            lower = source.lower()
+            if not (lower.startswith("bundle://") or lower.endswith(".animbbb.asset")):
+                return
+            stem = self._dof_anim_name_from_path(source)
+            if self._dof_animation_export_group_key(stem) != group_key:
+                return
+            candidates.setdefault(stem.lower(), source)
+
+        for entry in list(getattr(self, "dof_file_index", []) or []):
+            add_candidate(entry.full_path)
+
+        if not candidates:
+            try:
+                self.refresh_dof_file_list()
+            except Exception:
+                pass
+            for entry in list(getattr(self, "dof_file_index", []) or []):
+                add_candidate(entry.full_path)
+
+        if not candidates and self._is_dof_bundle_root(self.dof_path):
+            for anim_name in self._get_dof_bundle_anim_names(self.dof_path):
+                add_candidate(f"bundle://{anim_name}")
+
+        targets: List[Dict[str, Any]] = []
+        for source in sorted(candidates.values(), key=self._dof_animation_sort_key):
+            json_path = self._dof_output_json_for_root_input(self.dof_path, source)
+            stem = self._dof_anim_name_from_path(source)
+            targets.append(
+                {
+                    "name": stem,
+                    "json_path": json_path,
+                    "anim_index": None,
+                    "dof_input": source,
+                }
+            )
+        return targets
+
+    def _collect_current_json_export_all_targets(self) -> List[Dict[str, Any]]:
+        payload = self.current_json_data if isinstance(self.current_json_data, dict) else {}
+        anims = payload.get("anims") if isinstance(payload, dict) else None
+        if not isinstance(anims, list) or not anims:
+            return []
+        targets: List[Dict[str, Any]] = []
+        for index, anim in enumerate(anims):
+            if not isinstance(anim, dict):
+                continue
+            name = str(anim.get("name") or f"Animation {index + 1}")
+            targets.append(
+                {
+                    "name": name,
+                    "json_path": self.current_json_path,
+                    "anim_index": index,
+                    "dof_input": None,
+                }
+            )
+        return targets
+
+    def _collect_export_all_targets(self) -> List[Dict[str, Any]]:
+        dof_targets = self._collect_dof_export_all_targets()
+        if dof_targets:
+            return dof_targets
+        return self._collect_current_json_export_all_targets()
+
+    def _stream_batch_dof_output(self, text: str, level: str) -> None:
+        normalized = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+        for line in normalized.split("\n"):
+            stripped = line.strip()
+            if stripped:
+                self.log_widget.log(f"[DOF] {stripped}", level)
+
+    def _ensure_export_all_target_loaded(self, target: Dict[str, Any]) -> bool:
+        json_path = str(target.get("json_path") or "")
+        dof_input = str(target.get("dof_input") or "")
+        if dof_input and (not json_path or not os.path.exists(json_path)):
+            try:
+                cmd, cwd, source_path, output_json = self._build_dof_json_conversion_command(dof_input)
+            except RuntimeError as exc:
+                self.log_widget.log(f"Skipping DOF export target: {exc}", "ERROR")
+                return False
+            self.log_widget.log(
+                f"Converting DOF animation for batch export: {self._dof_anim_name_from_path(source_path)}",
+                "INFO",
+            )
+            result = self._run_converter_command_blocking(
+                cmd,
+                cwd,
+                output_callback=self._stream_batch_dof_output,
+            )
+            if result.returncode != 0 or not os.path.exists(output_json):
+                message = (result.stderr or result.stdout or "").strip() or "DOF conversion failed."
+                self.log_widget.log(f"DOF batch conversion failed: {message}", "ERROR")
+                return False
+            self._update_dof_index_for_paths([source_path, output_json])
+            target["json_path"] = output_json
+            json_path = output_json
+
+        if not json_path or not os.path.exists(json_path):
+            self.log_widget.log(f"Skipping missing animation JSON: {json_path}", "WARNING")
+            return False
+
+        current_key = self._normalized_path_key(self.current_json_path)
+        target_key = self._normalized_path_key(json_path)
+        if current_key != target_key:
+            self.load_json_file(json_path)
+            QApplication.processEvents()
+
+        payload = self.current_json_data if isinstance(self.current_json_data, dict) else {}
+        anims = payload.get("anims") if isinstance(payload, dict) else None
+        if not isinstance(anims, list) or not anims:
+            return False
+
+        anim_index = target.get("anim_index")
+        if isinstance(anim_index, int) and 0 <= anim_index < len(anims):
+            self.on_animation_selected(anim_index)
+            QApplication.processEvents()
+            return True
+
+        target_name = str(target.get("name") or "").strip()
+        for index, anim in enumerate(anims):
+            if isinstance(anim, dict) and str(anim.get("name") or "").strip() == target_name:
+                target["anim_index"] = index
+                self.on_animation_selected(index)
+                QApplication.processEvents()
+                return True
+
+        self.on_animation_selected(0)
+        QApplication.processEvents()
+        return True
+
+    def _restore_export_all_source_state(
+        self,
+        json_path: Optional[str],
+        anim_index: int,
+        current_time: float,
+        playing: bool,
+    ) -> None:
+        try:
+            if json_path and os.path.exists(json_path):
+                if self._normalized_path_key(self.current_json_path) != self._normalized_path_key(json_path):
+                    self.load_json_file(json_path)
+                if anim_index >= 0:
+                    self.on_animation_selected(anim_index)
+            if self.gl_widget.player.animation:
+                self.gl_widget.player.current_time = current_time
+                self._set_player_playing(playing, sync_audio=True)
+                self.gl_widget.update()
+        except Exception as exc:
+            self.log_widget.log(f"Failed to restore pre-export animation state: {exc}", "WARNING")
+
+    def _export_all_loaded_animations(self, export_kind: str) -> bool:
         if not self.gl_widget.player.animation:
             QMessageBox.warning(self, "Error", "No animation loaded")
-            return
-        
+            return False
+
+        self._persist_current_animation_edits()
+        targets = self._collect_export_all_targets()
+        if not targets:
+            QMessageBox.warning(self, "Export All Animations", "No animations were found for the loaded monster.")
+            return False
+
+        labels = {
+            "png_frame": "PNG Frames",
+            "png_sequence": "PNG Animation Frames",
+            "psd": "PSD",
+            "ae": "AE Rig",
+            "mov": "MOV",
+            "mp4": "MP4",
+            "webm": "WEBM",
+            "gif": "GIF",
+        }
+        label = labels.get(export_kind, "Animation")
+        target_dir = QFileDialog.getExistingDirectory(
+            self,
+            f"Select {label} Batch Export Folder",
+            "",
+        )
+        if not target_dir:
+            return False
+
+        original_json_path = self.current_json_path
+        original_index = int(self.current_animation_index)
+        original_time = float(getattr(self.gl_widget.player, "current_time", 0.0))
+        original_playing = bool(getattr(self.gl_widget.player, "playing", False))
+        previous_batch_fast_switch = bool(getattr(self, "_batch_export_fast_switch", False))
+        previous_batch_needs_audio = bool(getattr(self, "_batch_export_needs_audio", False))
+
+        if export_kind == "mov":
+            batch_needs_audio = bool(getattr(self.export_settings, "mov_include_audio", False))
+        elif export_kind == "mp4":
+            batch_needs_audio = bool(getattr(self.export_settings, "mp4_include_audio", True))
+        elif export_kind == "webm":
+            batch_needs_audio = bool(getattr(self.export_settings, "webm_include_audio", False))
+        else:
+            batch_needs_audio = False
+
+        progress = QProgressDialog(
+            f"Exporting {label}...",
+            "Cancel",
+            0,
+            len(targets),
+            self,
+        )
+        progress.setWindowTitle("Batch Export")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.show()
+
+        exported = 0
+        skipped = 0
+        self._batch_export_fast_switch = True
+        self._batch_export_needs_audio = batch_needs_audio
+        try:
+            self.log_widget.log(
+                f"Batch export started: {len(targets)} animation(s), format={label}",
+                "INFO",
+            )
+            for index, target in enumerate(targets, start=1):
+                if progress.wasCanceled():
+                    self.log_widget.log("Batch export cancelled by user.", "WARNING")
+                    break
+                name = str(target.get("name") or f"animation_{index}")
+                safe_name = self._safe_export_basename(name, f"animation_{index:03d}")
+                progress.setLabelText(f"Exporting {index}/{len(targets)}: {name}")
+                progress.setValue(index - 1)
+                QApplication.processEvents()
+
+                if not self._ensure_export_all_target_loaded(target):
+                    skipped += 1
+                    continue
+
+                output_base = os.path.join(target_dir, safe_name)
+                success = False
+                if export_kind == "png_frame":
+                    success = bool(self.export_current_frame(f"{output_base}.png", batch_mode=True))
+                elif export_kind == "png_sequence":
+                    success = bool(self.export_animation_frames_as_png(target_dir, batch_mode=True))
+                elif export_kind == "psd":
+                    success = bool(self.export_as_psd(f"{output_base}.psd", batch_mode=True))
+                elif export_kind == "ae":
+                    ae_dir = self._create_unique_export_folder(target_dir, f"{safe_name}_ae_rig")
+                    success = bool(self.export_as_ae_rig(ae_dir, batch_mode=True))
+                elif export_kind == "mov":
+                    success = bool(self.export_as_mov(f"{output_base}.mov", batch_mode=True))
+                elif export_kind == "mp4":
+                    success = bool(self.export_as_mp4(f"{output_base}.mp4", batch_mode=True))
+                elif export_kind == "webm":
+                    success = bool(self.export_as_webm(f"{output_base}.webm", batch_mode=True))
+                elif export_kind == "gif":
+                    success = bool(self.export_as_gif(f"{output_base}.gif", batch_mode=True))
+                else:
+                    self.log_widget.log(f"Unknown batch export format: {export_kind}", "ERROR")
+
+                if success:
+                    exported += 1
+                else:
+                    skipped += 1
+                progress.setValue(index)
+                QApplication.processEvents()
+        finally:
+            progress.close()
+            self._batch_export_fast_switch = previous_batch_fast_switch
+            self._batch_export_needs_audio = previous_batch_needs_audio
+            self._restore_export_all_source_state(
+                original_json_path,
+                original_index,
+                original_time,
+                original_playing,
+            )
+
+        self.log_widget.log(
+            f"Batch export finished: exported={exported}, skipped={skipped}, folder={target_dir}",
+            "SUCCESS" if exported else "WARNING",
+        )
+        if exported:
+            QMessageBox.information(
+                self,
+                "Batch Export Complete",
+                f"Exported {exported} animation(s) to:\n{target_dir}",
+            )
+            return True
+        QMessageBox.warning(self, "Batch Export", "No animations were exported.")
+        return False
+
+    def export_current_frame(self, filename: Optional[str] = None, *, batch_mode: bool = False):
+        """Export current frame as transparent PNG"""
+        if filename is None and not batch_mode and self._export_all_animations_requested():
+            return self._export_all_loaded_animations("png_frame")
+        if not self.gl_widget.player.animation:
+            QMessageBox.warning(self, "Error", "No animation loaded")
+            return False
+
         export_params = self._compute_png_export_params()
         if not export_params:
             QMessageBox.warning(self, "Error", "No animation loaded")
-            return
+            return False
         export_width, export_height, camera_override, render_scale_override, apply_centering = export_params
         if camera_override:
             self.log_widget.log(
                 f"PNG full-resolution bounds: {export_width}x{export_height}", "INFO"
             )
-        
-        filename, _ = QFileDialog.getSaveFileName(
-            self, "Export Frame", "", "PNG Image (*.png)"
-        )
-        
-        if filename:
-            try:
-                background_color = self._active_background_color()
-                include_viewport_bg = bool(self.export_include_viewport_background)
-                pass_specs = self._collect_export_pass_specs()
-                exported_files: List[str] = []
-                total_passes = len(pass_specs)
-                for pass_number, included_layer_ids in pass_specs:
-                    output_path = self._with_export_pass_suffix(filename, pass_number, total_passes)
-                    image = self.render_frame_to_image(
-                        export_width,
-                        export_height,
-                        camera_override=camera_override,
-                        render_scale_override=render_scale_override,
-                        apply_centering=apply_centering,
-                        background_color=background_color,
-                        include_viewport_background=include_viewport_bg,
-                        motion_blur_frame_dt=1.0 / max(
-                            1.0, float(self.control_panel.fps_spin.value())
-                        ),
-                        included_layer_ids=included_layer_ids,
-                    )
-                    if image is None:
-                        self.log_widget.log(
-                            f"Failed to render frame for pass {pass_number}",
-                            "ERROR",
-                        )
-                        continue
-                    image.save(output_path, 'PNG')
-                    exported_files.append(output_path)
-                    self.log_widget.log(f"Frame exported to: {output_path}", "SUCCESS")
 
-                if not exported_files:
-                    self.log_widget.log("Failed to render frame", "ERROR")
-                elif total_passes > 1:
+        if filename is None:
+            filename, _ = QFileDialog.getSaveFileName(
+                self, "Export Frame", "", "PNG Image (*.png)"
+            )
+
+        if not filename:
+            return False
+
+        if not filename.lower().endswith(".png"):
+            filename += ".png"
+
+        try:
+            background_color = self._active_background_color()
+            include_viewport_bg = bool(self.export_include_viewport_background)
+            pass_specs = self._collect_export_pass_specs()
+            exported_files: List[str] = []
+            total_passes = len(pass_specs)
+            for pass_number, included_layer_ids in pass_specs:
+                output_path = self._with_export_pass_suffix(filename, pass_number, total_passes)
+                image = self.render_frame_to_image(
+                    export_width,
+                    export_height,
+                    camera_override=camera_override,
+                    render_scale_override=render_scale_override,
+                    apply_centering=apply_centering,
+                    background_color=background_color,
+                    include_viewport_background=include_viewport_bg,
+                    motion_blur_frame_dt=1.0 / max(
+                        1.0, float(self.control_panel.fps_spin.value())
+                    ),
+                    included_layer_ids=included_layer_ids,
+                )
+                if image is None:
                     self.log_widget.log(
-                        f"Exported {len(exported_files)} frame pass files.",
-                        "SUCCESS",
+                        f"Failed to render frame for pass {pass_number}",
+                        "ERROR",
                     )
-            
-            except Exception as e:
-                self.log_widget.log(f"Error exporting frame: {e}", "ERROR")
-                import traceback
-                traceback.print_exc()
+                    continue
+                image.save(output_path, 'PNG')
+                exported_files.append(output_path)
+                self.log_widget.log(f"Frame exported to: {output_path}", "SUCCESS")
 
-    def export_animation_frames_as_png(self):
+            if not exported_files:
+                self.log_widget.log("Failed to render frame", "ERROR")
+                return False
+            if total_passes > 1:
+                self.log_widget.log(
+                    f"Exported {len(exported_files)} frame pass files.",
+                    "SUCCESS",
+                )
+            return True
+        except Exception as e:
+            self.log_widget.log(f"Error exporting frame: {e}", "ERROR")
+            import traceback
+            traceback.print_exc()
+            if not batch_mode:
+                QMessageBox.warning(self, "Export Error", f"Failed to export frame: {e}")
+            return False
+
+    def export_animation_frames_as_png(self, target_dir: Optional[str] = None, *, batch_mode: bool = False):
         """Export every frame of the current animation as PNG files."""
+        if target_dir is None and not batch_mode and self._export_all_animations_requested():
+            return self._export_all_loaded_animations("png_sequence")
         if not self.gl_widget.player.animation:
             QMessageBox.warning(self, "Error", "No animation loaded")
-            return
+            return False
 
-        target_dir = QFileDialog.getExistingDirectory(
-            self, "Select Destination Folder", ""
-        )
+        if target_dir is None:
+            target_dir = QFileDialog.getExistingDirectory(
+                self, "Select Destination Folder", ""
+            )
         if not target_dir:
-            return
+            return False
 
         export_params = self._compute_png_export_params()
         if not export_params:
             QMessageBox.warning(self, "Error", "Unable to prepare export settings")
-            return
+            return False
         width, height, camera_override, render_scale_override, apply_centering = export_params
 
         animation_name = self.gl_widget.player.animation.name or "animation"
@@ -22547,17 +27538,18 @@ class MSMAnimationViewer(QMainWindow):
             self.gl_widget.update()
 
         if exported > 0:
-            QMessageBox.information(
-                self,
-                "Frames Exported",
-                (
-                    f"Saved {exported} frames to:\n{export_root}"
-                    if total_passes <= 1
-                    else (
-                        f"Saved {exported} frames across {total_passes} passes to:\n{export_root}"
+            if not batch_mode:
+                QMessageBox.information(
+                    self,
+                    "Frames Exported",
+                    (
+                        f"Saved {exported} frames to:\n{export_root}"
+                        if total_passes <= 1
+                        else (
+                            f"Saved {exported} frames across {total_passes} passes to:\n{export_root}"
+                        )
                     )
                 )
-            )
             self.log_widget.log(
                 (
                     f"PNG frames exported to {export_root} ({exported} files)"
@@ -22569,21 +27561,27 @@ class MSMAnimationViewer(QMainWindow):
                 ),
                 "SUCCESS",
             )
+            return True
         else:
             shutil.rmtree(export_root, ignore_errors=True)
-            QMessageBox.warning(self, "Export Aborted", "No frames were exported.")
+            if not batch_mode:
+                QMessageBox.warning(self, "Export Aborted", "No frames were exported.")
+            return False
 
-    def export_as_ae_rig(self):
+    def export_as_ae_rig(self, target_dir: Optional[str] = None, *, batch_mode: bool = False):
         """Export an After Effects rig package matching the current viewport."""
+        if target_dir is None and not batch_mode and self._export_all_animations_requested():
+            return self._export_all_loaded_animations("ae")
         if not self.gl_widget.player.animation:
             QMessageBox.warning(self, "Error", "No animation loaded")
-            return
+            return False
 
-        target_dir = QFileDialog.getExistingDirectory(
-            self, "Select AE Export Folder", ""
-        )
+        if target_dir is None:
+            target_dir = QFileDialog.getExistingDirectory(
+                self, "Select AE Export Folder", ""
+            )
         if not target_dir:
-            return
+            return False
 
         self._start_hang_watchdog("export_ae_rig", timeout=20.0)
         try:
@@ -22591,48 +27589,55 @@ class MSMAnimationViewer(QMainWindow):
             success, message = exporter.export(target_dir)
         except Exception as exc:
             self.log_widget.log(f"AE rig export failed: {exc}", "ERROR")
-            QMessageBox.warning(self, "Export Error", f"Failed to export AE rig: {exc}")
-            return
+            if not batch_mode:
+                QMessageBox.warning(self, "Export Error", f"Failed to export AE rig: {exc}")
+            return False
         finally:
             self._stop_hang_watchdog()
 
         if success:
             self.log_widget.log(message, "SUCCESS")
-            QMessageBox.information(self, "AE Rig Exported", message)
+            if not batch_mode:
+                QMessageBox.information(self, "AE Rig Exported", message)
         else:
             self.log_widget.log(message, "ERROR")
-            QMessageBox.warning(self, "Export Error", message)
-    
-    def export_as_psd(self):
+            if not batch_mode:
+                QMessageBox.warning(self, "Export Error", message)
+        return bool(success)
+
+    def export_as_psd(self, filename: Optional[str] = None, *, batch_mode: bool = False):
         """Export current frame as PSD with individual sprite layers"""
+        if filename is None and not batch_mode and self._export_all_animations_requested():
+            return self._export_all_loaded_animations("psd")
         if not self.gl_widget.player.animation:
             QMessageBox.warning(self, "Error", "No animation loaded")
-            return
-        
+            return False
+
         # Check for pytoshop
         pytoshop_module = self._ensure_pytoshop_available()
         if pytoshop_module is None:
-            return
+            return False
         psd_layers = pytoshop_module.layers
         ColorMode = pytoshop_module.enums.ColorMode
         GenericTaggedBlock = pytoshop_module.tagged_block.GenericTaggedBlock
         PsdFile = pytoshop_module.PsdFile
         packbits_ready = self._ensure_packbits_available()
-        
-        filename, _ = QFileDialog.getSaveFileName(
-            self, "Export PSD", "", "Photoshop Document (*.psd)"
-        )
-        
+
+        if filename is None:
+            filename, _ = QFileDialog.getSaveFileName(
+                self, "Export PSD", "", "Photoshop Document (*.psd)"
+            )
+
         if not filename:
-            return
-        
+            return False
+
         # Ensure .psd extension
         if not filename.lower().endswith('.psd'):
             filename += '.psd'
-        
+
         self._start_hang_watchdog("export_psd", timeout=15.0)
         try:
-            
+
             animation = self.gl_widget.player.animation
             current_time = self.gl_widget.player.current_time
             include_hidden = self.export_settings.psd_include_hidden
@@ -22662,7 +27667,7 @@ class MSMAnimationViewer(QMainWindow):
             camera_x_for_export = self.gl_widget.camera_x if match_viewport else 0.0
             camera_y_for_export = self.gl_widget.camera_y if match_viewport else 0.0
             scale_factor = render_scale_for_export * export_scale
-            
+
             viewport_width = self.gl_widget.width()
             viewport_height = self.gl_widget.height()
             # Scaled canvas dimensions default to viewport; they may be overridden later when
@@ -22673,7 +27678,7 @@ class MSMAnimationViewer(QMainWindow):
             else:
                 scaled_canvas_width = 0
                 scaled_canvas_height = 0
-            
+
             native_info = ""
             if preserve_full_res:
                 native_info = f", native_scale={native_scale_factor:.2f}x"
@@ -22688,7 +27693,7 @@ class MSMAnimationViewer(QMainWindow):
                 f"match viewer zoom: {'Yes' if match_viewport else 'No'}",
                 "INFO"
             )
-            
+
             # Utility helpers for coordinate conversions/metadata
             def _world_to_canvas(wx: float, wy: float) -> Tuple[float, float]:
                 """Map world coordinates to PSD canvas space before cropping."""
@@ -22729,7 +27734,7 @@ class MSMAnimationViewer(QMainWindow):
                 segments = polygon_meta.get('segments') or []
                 for segment in segments:
                     _shift_points(segment.get('canvas'))
-            
+
             def _render_polygon_sprite_layer(
                 local_vertices: List[Tuple[float, float]],
                 texcoords: List[Tuple[float, float]],
@@ -22751,14 +27756,14 @@ class MSMAnimationViewer(QMainWindow):
                     or atlas_pixels is None
                 ):
                     return None
-                
+
                 m00, m01, m10, m11, tx, ty = world_matrix
                 atlas_height, atlas_width = atlas_pixels.shape[:2]
                 texcoords_px = [
                     (u * atlas_width, v * atlas_height)
                     for u, v in texcoords
                 ]
-                
+
                 world_vertices = []
                 canvas_vertices = []
                 for lvx, lvy in local_vertices:
@@ -22767,32 +27772,32 @@ class MSMAnimationViewer(QMainWindow):
                     world_vertices.append({'x': wx, 'y': wy})
                     cx, cy = _world_to_canvas(wx, wy)
                     canvas_vertices.append({'x': cx, 'y': cy})
-                
+
                 if not canvas_vertices:
                     return None
-                
+
                 canvas_xs = [pt['x'] for pt in canvas_vertices]
                 canvas_ys = [pt['y'] for pt in canvas_vertices]
                 min_canvas_x = min(canvas_xs)
                 max_canvas_x = max(canvas_xs)
                 min_canvas_y = min(canvas_ys)
                 max_canvas_y = max(canvas_ys)
-                
+
                 width = max(1, int(math.ceil(max_canvas_x - min_canvas_x)))
                 height = max(1, int(math.ceil(max_canvas_y - min_canvas_y)))
                 if width <= 0 or height <= 0:
                     return None
-                
+
                 layer_buffer = np.zeros((height, width, 4), dtype=np.float32)
                 vertex_layer_coords = [
                     (pt['x'] - min_canvas_x, pt['y'] - min_canvas_y)
                     for pt in canvas_vertices
                 ]
                 epsilon = 1e-5
-                
+
                 texcoords_count = len(texcoords_px)
                 vertex_count = len(vertex_layer_coords)
-                
+
                 for tri_start in range(0, len(triangles), 3):
                     idx0 = triangles[tri_start]
                     idx1 = triangles[tri_start + 1] if tri_start + 1 < len(triangles) else None
@@ -22804,71 +27809,71 @@ class MSMAnimationViewer(QMainWindow):
                         or idx0 < 0 or idx1 < 0 or idx2 < 0
                     ):
                         continue
-                    
+
                     (dx0, dy0) = vertex_layer_coords[idx0]
                     (dx1, dy1) = vertex_layer_coords[idx1]
                     (dx2, dy2) = vertex_layer_coords[idx2]
                     (sx0, sy0) = texcoords_px[idx0]
                     (sx1, sy1) = texcoords_px[idx1]
                     (sx2, sy2) = texcoords_px[idx2]
-                    
+
                     tri_min_x = max(0, int(math.floor(min(dx0, dx1, dx2))))
                     tri_max_x = min(width, int(math.ceil(max(dx0, dx1, dx2))))
                     tri_min_y = max(0, int(math.floor(min(dy0, dy1, dy2))))
                     tri_max_y = min(height, int(math.ceil(max(dy0, dy1, dy2))))
-                    
+
                     if tri_max_x <= tri_min_x or tri_max_y <= tri_min_y:
                         continue
-                    
+
                     xs = np.arange(tri_min_x, tri_max_x)
                     ys = np.arange(tri_min_y, tri_max_y)
                     if xs.size == 0 or ys.size == 0:
                         continue
-                    
+
                     grid_x_int, grid_y_int = np.meshgrid(xs, ys)
                     grid_x = grid_x_int.astype(np.float32)
                     grid_y = grid_y_int.astype(np.float32)
                     sample_x = grid_x + 0.5
                     sample_y = grid_y + 0.5
-                    
+
                     denom = (dy1 - dy2) * (dx0 - dx2) + (dx2 - dx1) * (dy0 - dy2)
                     if abs(denom) < epsilon:
                         continue
-                    
+
                     w0 = ((dy1 - dy2) * (sample_x - dx2) + (dx2 - dx1) * (sample_y - dy2)) / denom
                     w1 = ((dy2 - dy0) * (sample_x - dx2) + (dx0 - dx2) * (sample_y - dy2)) / denom
                     w2 = 1.0 - w0 - w1
                     mask = (w0 >= -epsilon) & (w1 >= -epsilon) & (w2 >= -epsilon)
                     if not np.any(mask):
                         continue
-                    
+
                     mask_idx = np.nonzero(mask)
                     dest_x_vals = grid_x_int[mask_idx]
                     dest_y_vals = grid_y_int[mask_idx]
                     w0_vals = w0[mask_idx]
                     w1_vals = w1[mask_idx]
                     w2_vals = w2[mask_idx]
-                    
+
                     src_x_vals = w0_vals * sx0 + w1_vals * sx1 + w2_vals * sx2
                     src_y_vals = w0_vals * sy0 + w1_vals * sy1 + w2_vals * sy2
-                    
+
                     src_x_vals = np.clip(src_x_vals, 0.0, atlas_width - 1.0)
                     src_y_vals = np.clip(src_y_vals, 0.0, atlas_height - 1.0)
-                    
+
                     x0_idx = np.floor(src_x_vals).astype(np.int32)
                     y0_idx = np.floor(src_y_vals).astype(np.int32)
                     x1_idx = np.clip(x0_idx + 1, 0, atlas_width - 1)
                     y1_idx = np.clip(y0_idx + 1, 0, atlas_height - 1)
-                    
+
                     wx = (src_x_vals - x0_idx).astype(np.float32)
                     wy = (src_y_vals - y0_idx).astype(np.float32)
-                    
+
                     top = atlas_pixels[y0_idx, x0_idx] * (1.0 - wx)[:, None] + atlas_pixels[y0_idx, x1_idx] * wx[:, None]
                     bottom = atlas_pixels[y1_idx, x0_idx] * (1.0 - wx)[:, None] + atlas_pixels[y1_idx, x1_idx] * wx[:, None]
                     samples = top * (1.0 - wy)[:, None] + bottom * wy[:, None]
-                    
+
                     layer_buffer[dest_y_vals, dest_x_vals] = samples
-                
+
                 if color_tint:
                     tint_r, tint_g, tint_b = color_tint
                     if tint_r != 1.0:
@@ -22879,7 +27884,7 @@ class MSMAnimationViewer(QMainWindow):
                         layer_buffer[:, :, 2] *= tint_b
                 if opacity_value < 1.0:
                     layer_buffer[:, :, 3] *= opacity_value
-                
+
                 layer_bytes = np.clip(layer_buffer, 0.0, 1.0)
                 layer_bytes = (layer_bytes * 255.0 + 0.5).astype(np.uint8)
                 layer_image = Image.fromarray(layer_bytes, 'RGBA')
@@ -22894,47 +27899,32 @@ class MSMAnimationViewer(QMainWindow):
             # Build layer map and calculate world states
             layer_map = {layer.layer_id: layer for layer in animation.layers}
             layer_world_states = {}
-            
+
             for layer in animation.layers:
                 state = self.gl_widget.renderer.calculate_world_state(
-                    layer, current_time, self.gl_widget.player, layer_map, 
+                    layer, current_time, self.gl_widget.player, layer_map,
                     layer_world_states, self.gl_widget.texture_atlases
                 )
                 layer_world_states[layer.layer_id] = self.gl_widget.apply_user_transforms(
                     layer.layer_id, state
                 )
-            
+
             # Cache loaded atlas images and pixel arrays
             atlas_images = {}
             atlas_pixel_arrays = {}
-            
-            # Collect layer data for PSD
-            psd_layer_data = []
-            
-            # Process layers in reverse order (back to front, like rendering)
-            for layer in reversed(animation.layers):
-                if not include_hidden and not layer.visible:
-                    continue
-                
-                world_state = layer_world_states[layer.layer_id]
-                sprite_name = world_state['sprite_name']
-                
+
+            def _find_sprite_for_name(sprite_name: str) -> Tuple[Optional[SpriteInfo], Optional[TextureAtlas]]:
+                """Return the sprite and atlas for a sprite name using normal atlas lookup."""
                 if not sprite_name:
-                    continue
-                
-                # Find sprite in atlases
-                sprite = None
-                atlas = None
+                    return None, None
                 for atl in self.gl_widget.texture_atlases:
                     sprite = atl.get_sprite(sprite_name)
                     if sprite:
-                        atlas = atl
-                        break
-                
-                if not sprite or not atlas:
-                    continue
-                
-                # Load atlas image if not cached
+                        return sprite, atl
+                return None, None
+
+            def _load_atlas_for_psd(atlas: TextureAtlas) -> Tuple[Optional[Image.Image], Optional[np.ndarray]]:
+                """Load and cache an atlas image plus float pixel array for PSD rasterization."""
                 if atlas.image_path not in atlas_images:
                     try:
                         atlas_img = Image.open(atlas.image_path)
@@ -22943,13 +27933,124 @@ class MSMAnimationViewer(QMainWindow):
                         atlas_pixel_arrays[atlas.image_path] = np.asarray(atlas_img, dtype=np.float32) / 255.0
                     except Exception as e:
                         self.log_widget.log(f"Failed to load atlas: {e}", "WARNING")
-                        continue
+                        return None, None
                 elif atlas.image_path not in atlas_pixel_arrays:
                     atlas_pixel_arrays[atlas.image_path] = np.asarray(atlas_images[atlas.image_path], dtype=np.float32) / 255.0
-                
-                atlas_img = atlas_images[atlas.image_path]
-                atlas_pixels = atlas_pixel_arrays.get(atlas.image_path)
-                
+                return atlas_images.get(atlas.image_path), atlas_pixel_arrays.get(atlas.image_path)
+
+            def _fit_psd_layer_name(name: str) -> str:
+                """PSD layer records use Pascal strings; keep names inside the old 31-char limit."""
+                safe_name = str(name or "Layer")
+                if len(safe_name) <= 31:
+                    return safe_name
+                return safe_name[:31]
+
+            def _hidden_variant_layer_name(layer_name: str, sprite_name: str) -> str:
+                """Keep hidden layer names readable after the 31-character PSD truncation."""
+                variant_suffix = f"[{sprite_name}]"
+                if len(variant_suffix) >= 31:
+                    return variant_suffix[:31]
+                base_space = max(1, 31 - len(variant_suffix) - 1)
+                base_name = str(layer_name or "Layer")
+                return f"{base_name[:base_space]} {variant_suffix}"
+
+            def _ordered_sprite_names_from_keyframes(keyframes: List[KeyframeData]) -> List[str]:
+                """Collect explicit and interpolated sprite names used by a keyframe lane."""
+                ordered: List[str] = []
+                seen: Set[str] = set()
+
+                def _add_name(sprite_name: str) -> None:
+                    if not sprite_name:
+                        return
+                    normalized = sprite_name.lower()
+                    if normalized in seen:
+                        return
+                    seen.add(normalized)
+                    ordered.append(sprite_name)
+
+                sprite_keyframes = [
+                    kf for kf in sorted(keyframes or [], key=lambda frame: frame.time)
+                    if kf.immediate_sprite != -1 and kf.sprite_name
+                ]
+                for index, keyframe in enumerate(sprite_keyframes):
+                    _add_name(keyframe.sprite_name)
+                    if keyframe.immediate_sprite != 0 or index + 1 >= len(sprite_keyframes):
+                        continue
+                    next_keyframe = sprite_keyframes[index + 1]
+                    prev_match = AnimationPlayer._sprite_suffix_pattern.match(keyframe.sprite_name)
+                    next_match = AnimationPlayer._sprite_suffix_pattern.match(next_keyframe.sprite_name)
+                    if not prev_match or not next_match:
+                        continue
+                    if prev_match.group(1) != next_match.group(1):
+                        continue
+                    start_idx = int(prev_match.group(2))
+                    end_idx = int(next_match.group(2))
+                    if start_idx == end_idx:
+                        continue
+                    step = 1 if end_idx > start_idx else -1
+                    span = abs(end_idx - start_idx)
+                    if span > 128:
+                        self.log_widget.log(
+                            f"Skipping oversized PSD sprite variant range on {keyframe.sprite_name}: {span} frames",
+                            "WARNING"
+                        )
+                        continue
+                    suffix_width = len(prev_match.group(2))
+                    prefix = prev_match.group(1)
+                    for sprite_index in range(start_idx + step, end_idx + step, step):
+                        _add_name(f"{prefix}{str(sprite_index).zfill(suffix_width)}")
+                return ordered
+
+            def _sprite_variants_for_layer(layer: LayerData, current_sprite_name: str) -> List[str]:
+                """Return alternate sprite frames for this layer, excluding the current sprite."""
+                ordered: List[str] = []
+                seen: Set[str] = set()
+
+                def _add_names(names: List[str]) -> None:
+                    for name in names:
+                        if not name:
+                            continue
+                        normalized = name.lower()
+                        if normalized in seen:
+                            continue
+                        seen.add(normalized)
+                        ordered.append(name)
+
+                _add_names(_ordered_sprite_names_from_keyframes(layer.keyframes))
+                for lane in getattr(layer, "extra_keyframe_lanes", []) or []:
+                    _add_names(_ordered_sprite_names_from_keyframes(getattr(lane, "keyframes", []) or []))
+
+                current_normalized = (current_sprite_name or "").lower()
+                variants = [name for name in ordered if name.lower() != current_normalized]
+                if len(variants) > 64:
+                    self.log_widget.log(
+                        f"PSD hidden sprite variants for {layer.name} capped at 64 of {len(variants)} frames",
+                        "WARNING"
+                    )
+                    variants = variants[:64]
+                return variants
+
+            def _render_psd_sprite_entry(
+                layer: LayerData,
+                world_state: Dict[str, Any],
+                sprite_name: str,
+                *,
+                layer_name: Optional[str] = None,
+                visible: bool = True,
+                variant_of: Optional[str] = None
+            ) -> Optional[Dict[str, Any]]:
+                """Render one PSD layer entry, optionally overriding the world's sprite name."""
+                if not sprite_name:
+                    return None
+
+                sprite, atlas = _find_sprite_for_name(sprite_name)
+                if not sprite or not atlas:
+                    return None
+
+                atlas_img, atlas_pixels = _load_atlas_for_psd(atlas)
+                if atlas_img is None:
+                    return None
+
                 # Extract sprite from atlas for quad-based fallback rendering
                 sprite_img = atlas_img.crop((
                     sprite.x, sprite.y,
@@ -22959,7 +28060,7 @@ class MSMAnimationViewer(QMainWindow):
                     sprite_img = sprite_img.rotate(90, expand=True)
                 orig_sprite_w, orig_sprite_h = sprite_img.size
                 hires_scale = 0.5 if atlas.is_hires else 1.0
-                
+
                 # Transformation matrix and color information
                 m00 = world_state['m00']
                 m01 = world_state['m01']
@@ -22971,12 +28072,12 @@ class MSMAnimationViewer(QMainWindow):
                 r = world_state['r'] / 255.0
                 g = world_state['g'] / 255.0
                 b = world_state['b'] / 255.0
-                
+
                 # Apply user offsets
                 user_offset_x, user_offset_y = self.gl_widget.layer_offsets.get(layer.layer_id, (0, 0))
                 tx += user_offset_x
                 ty += user_offset_y
-                
+
                 # Attempt polygon-aware rasterization if geometry is available
                 polygon_local_vertices: List[Tuple[float, float]] = []
                 polygon_texcoords: List[Tuple[float, float]] = []
@@ -22984,7 +28085,7 @@ class MSMAnimationViewer(QMainWindow):
                 polygon_world_vertices: List[Dict[str, float]] = []
                 polygon_canvas_vertices: List[Dict[str, float]] = []
                 polygon_render_result: Optional[Dict[str, Any]] = None
-                
+
                 if sprite.has_polygon_mesh:
                     try:
                         geometry = self.gl_widget.renderer._build_polygon_geometry(sprite, atlas)
@@ -23016,12 +28117,12 @@ class MSMAnimationViewer(QMainWindow):
                         if polygon_render_result:
                             polygon_world_vertices = polygon_render_result['world_vertices']
                             polygon_canvas_vertices = polygon_render_result['canvas_vertices']
-                
+
                 transformed_img = None
                 final_x = 0.0
                 final_y = 0.0
                 polygon_layer_used = polygon_render_result is not None
-                
+
                 if polygon_layer_used:
                     transformed_img = polygon_render_result['image']
                     final_x = polygon_render_result['origin_x']
@@ -23053,10 +28154,10 @@ class MSMAnimationViewer(QMainWindow):
                     bbox_w = int(math.ceil(world_max_x - world_min_x))
                     bbox_h = int(math.ceil(world_max_y - world_min_y))
                     if bbox_w <= 0 or bbox_h <= 0:
-                        continue
+                        return None
                     det = m00 * m11 - m01 * m10
                     if abs(det) < 1e-10:
-                        continue
+                        return None
                     inv_m00 = m11 / det
                     inv_m01 = -m01 / det
                     inv_m10 = -m10 / det
@@ -23117,10 +28218,10 @@ class MSMAnimationViewer(QMainWindow):
                     if preserve_full_res and native_scale_factor != 1.0:
                         final_x *= native_scale_factor
                         final_y *= native_scale_factor
-                
+
                 if transformed_img is None:
-                    continue
-                
+                    return None
+
                 # Store layer data
                 psd_blend_mode = self._map_psd_blend_mode(layer.blend_mode)
                 atlas_rel = atlas.image_path
@@ -23145,6 +28246,13 @@ class MSMAnimationViewer(QMainWindow):
                         'has_polygon_mesh': sprite.has_polygon_mesh
                     }
                 }
+                if variant_of:
+                    metadata['hidden_sprite_variant'] = True
+                    metadata['variant_of_sprite'] = variant_of
+                    metadata['source_layer'] = {
+                        'id': layer.layer_id,
+                        'name': layer.name
+                    }
                 if sprite.has_polygon_mesh:
                     atlas_w = atlas.image_width or (atlas_img.width if atlas_img else 0)
                     atlas_h = atlas.image_height or (atlas_img.height if atlas_img else 0)
@@ -23223,8 +28331,8 @@ class MSMAnimationViewer(QMainWindow):
                         if segments:
                             polygon_meta['segments'] = segments
                     metadata['sprite']['polygon'] = polygon_meta
-                psd_layer_data.append({
-                    'name': layer.name,
+                return {
+                    'name': layer_name or layer.name,
                     'image': transformed_img,
                     'x': int(round(final_x)),
                     'y': int(round(final_y)),
@@ -23233,11 +28341,61 @@ class MSMAnimationViewer(QMainWindow):
                     'height': transformed_img.height,
                     'blend_mode': layer.blend_mode,
                     'psd_blend_mode': psd_blend_mode,
-                    'metadata': metadata
-                })
-            
-            self.log_widget.log(f"Processed {len(psd_layer_data)} visible layers", "INFO")
-            
+                    'metadata': metadata,
+                    'visible': visible,
+                }
+
+            # Collect layer data for PSD
+            psd_layer_data = []
+            hidden_variant_count = 0
+            visible_layer_count = 0
+
+            # Process layers in reverse order (back to front, like rendering)
+            for layer in reversed(animation.layers):
+                if not include_hidden and not layer.visible:
+                    continue
+
+                world_state = layer_world_states[layer.layer_id]
+                sprite_name = world_state['sprite_name']
+
+                if not sprite_name:
+                    continue
+
+                primary_entry = _render_psd_sprite_entry(layer, world_state, sprite_name)
+                if primary_entry is None:
+                    continue
+                psd_layer_data.append(primary_entry)
+                visible_layer_count += 1
+
+                rendered_variant_names = {
+                    str(primary_entry.get('metadata', {}).get('sprite', {}).get('name', sprite_name)).lower()
+                }
+                for variant_sprite_name in _sprite_variants_for_layer(layer, sprite_name):
+                    variant_entry = _render_psd_sprite_entry(
+                        layer,
+                        world_state,
+                        variant_sprite_name,
+                        layer_name=_hidden_variant_layer_name(layer.name, variant_sprite_name),
+                        visible=False,
+                        variant_of=sprite_name
+                    )
+                    if variant_entry is None:
+                        continue
+                    rendered_name = str(
+                        variant_entry.get('metadata', {}).get('sprite', {}).get('name', variant_sprite_name)
+                    ).lower()
+                    if rendered_name in rendered_variant_names:
+                        continue
+                    rendered_variant_names.add(rendered_name)
+                    psd_layer_data.append(variant_entry)
+                    hidden_variant_count += 1
+
+            self.log_widget.log(
+                f"Processed {visible_layer_count} visible layers"
+                + (f" and {hidden_variant_count} hidden sprite-frame layers" if hidden_variant_count else ""),
+                "INFO"
+            )
+
             # Adjust canvas bounds
             crop_left = 0
             crop_top = 0
@@ -23246,19 +28404,19 @@ class MSMAnimationViewer(QMainWindow):
                 content_top = min(layer_info['y'] for layer_info in psd_layer_data)
                 content_right = max(layer_info['x'] + layer_info['width'] for layer_info in psd_layer_data)
                 content_bottom = max(layer_info['y'] + layer_info['height'] for layer_info in psd_layer_data)
-                
+
                 if not match_viewport:
                     # Always expand to include the full sprite content regardless of camera zoom
                     crop_left = int(math.floor(content_left))
                     crop_top = int(math.floor(content_top))
                     scaled_canvas_width = max(1, int(math.ceil(content_right - content_left)))
                     scaled_canvas_height = max(1, int(math.ceil(content_bottom - content_top)))
-                    
+
                     for layer_info in psd_layer_data:
                         layer_info['x'] -= crop_left
                         layer_info['y'] -= crop_top
                         _offset_polygon_canvas(layer_info, crop_left, crop_top)
-                    
+
                     self.log_widget.log(
                         f"Canvas set to full content bounds: {scaled_canvas_width}x{scaled_canvas_height}", "INFO"
                     )
@@ -23267,40 +28425,40 @@ class MSMAnimationViewer(QMainWindow):
                     visible_top = scaled_canvas_height
                     visible_right = 0
                     visible_bottom = 0
-                    
+
                     for layer_info in psd_layer_data:
                         left = max(0, min(scaled_canvas_width, layer_info['x']))
                         top = max(0, min(scaled_canvas_height, layer_info['y']))
                         right = max(left, min(scaled_canvas_width, layer_info['x'] + layer_info['width']))
                         bottom = max(top, min(scaled_canvas_height, layer_info['y'] + layer_info['height']))
-                        
+
                         if right <= left or bottom <= top:
                             continue
-                        
+
                         visible_left = min(visible_left, left)
                         visible_top = min(visible_top, top)
                         visible_right = max(visible_right, right)
                         visible_bottom = max(visible_bottom, bottom)
-                    
+
                     if visible_right > visible_left and visible_bottom > visible_top:
                         crop_left = int(visible_left)
                         crop_top = int(visible_top)
                         scaled_canvas_width = max(1, int(visible_right - visible_left))
                         scaled_canvas_height = max(1, int(visible_bottom - visible_top))
-                        
+
                         for layer_info in psd_layer_data:
                             layer_info['x'] -= crop_left
                             layer_info['y'] -= crop_top
                             _offset_polygon_canvas(layer_info, crop_left, crop_top)
-                        
+
                         self.log_widget.log(
                             f"Cropped PSD canvas to {scaled_canvas_width}x{scaled_canvas_height}", "INFO"
                         )
-            
+
             if scaled_canvas_width <= 0 or scaled_canvas_height <= 0:
                 scaled_canvas_width = max(1, int(round(max(1, viewport_width) * export_scale * (native_scale_factor if preserve_full_res else 1.0))))
                 scaled_canvas_height = max(1, int(round(max(1, viewport_height) * export_scale * (native_scale_factor if preserve_full_res else 1.0))))
-            
+
             self.log_widget.log(
                 f"Final PSD canvas: {scaled_canvas_width}x{scaled_canvas_height}", "INFO"
             )
@@ -23319,8 +28477,9 @@ class MSMAnimationViewer(QMainWindow):
                     'blend_mode': BlendMode.STANDARD,
                     'psd_blend_mode': self._map_psd_blend_mode(BlendMode.STANDARD),
                     'metadata': {'background_fill': True, 'color': {'r': bg_color[0], 'g': bg_color[1], 'b': bg_color[2], 'a': bg_color[3]}},
+                    'visible': True,
                 })
-            
+
             # Determine color mode enum (older pytoshop versions use lowercase names)
             psd_color_mode = getattr(ColorMode, 'RGB', None)
             if psd_color_mode is None:
@@ -23330,7 +28489,7 @@ class MSMAnimationViewer(QMainWindow):
                     psd_color_mode = ColorMode(3)  # RGB fallback
                 except Exception:
                     psd_color_mode = None
-            
+
             psd_kwargs = dict(
                 num_channels=4,
                 height=scaled_canvas_height,
@@ -23338,10 +28497,10 @@ class MSMAnimationViewer(QMainWindow):
             )
             if psd_color_mode is not None:
                 psd_kwargs['color_mode'] = psd_color_mode
-            
+
             # Create PSD file using pytoshop
             psd = PsdFile(**psd_kwargs)
-            
+
             # Add each layer
             for layer_info in psd_layer_data:
                 img = layer_info['image']
@@ -23349,35 +28508,35 @@ class MSMAnimationViewer(QMainWindow):
                 y = layer_info['y']
                 name = layer_info['name']
                 layer_opacity = layer_info['opacity']
-                
+
                 # Convert PIL image to numpy array
                 img_array = np.array(img)
-                
+
                 # Get layer dimensions
                 layer_h, layer_w = img_array.shape[:2]
-                
+
                 # Calculate layer bounds (clipped to canvas)
                 left = max(0, x)
                 top = max(0, y)
                 right = min(scaled_canvas_width, x + layer_w)
                 bottom = min(scaled_canvas_height, y + layer_h)
-                
+
                 # Skip if layer is completely outside canvas
                 if left >= right or top >= bottom:
                     continue
-                
+
                 # Calculate the portion of the image that's visible
                 img_left = left - x
                 img_top = top - y
                 img_right = img_left + (right - left)
                 img_bottom = img_top + (bottom - top)
-                
+
                 # Crop image to visible portion
                 visible_img = img_array[img_top:img_bottom, img_left:img_right]
-                
+
                 if visible_img.size == 0:
                     continue
-                
+
                 # Split into channels (R, G, B, A)
                 if len(visible_img.shape) == 3 and visible_img.shape[2] == 4:
                     alpha_channel = visible_img[:, :, 3]
@@ -23391,13 +28550,13 @@ class MSMAnimationViewer(QMainWindow):
                     blue_channel = visible_img[:, :, 2]
                 else:
                     continue
-                
+
                 # Create channel image data objects
                 alpha_data = psd_layers.ChannelImageData(image=alpha_channel, compression=compression_value)
                 red_data = psd_layers.ChannelImageData(image=red_channel, compression=compression_value)
                 green_data = psd_layers.ChannelImageData(image=green_channel, compression=compression_value)
                 blue_data = psd_layers.ChannelImageData(image=blue_channel, compression=compression_value)
-                
+
                 # Create layer record with channels and metadata blocks
                 blend_kwargs = {}
                 psd_blend_mode = layer_info.get('psd_blend_mode')
@@ -23423,8 +28582,9 @@ class MSMAnimationViewer(QMainWindow):
                     left=left,
                     bottom=bottom,
                     right=right,
-                    name=name[:31],
+                    name=_fit_psd_layer_name(name),
                     opacity=layer_opacity,
+                    visible=bool(layer_info.get('visible', True)),
                     channels={
                         -1: alpha_data,
                         0: red_data,
@@ -23434,32 +28594,36 @@ class MSMAnimationViewer(QMainWindow):
                     blocks=blocks or None,
                     **blend_kwargs
                 )
-                
+
                 psd.layer_and_mask_info.layer_info.layer_records.append(layer_record)
-            
+
             # Write PSD file
             with open(filename, 'wb') as f:
                 psd.write(f)
-            
+
             file_size = os.path.getsize(filename)
             self.log_widget.log(f"PSD exported to: {filename} ({file_size} bytes)", "SUCCESS")
-            
-            QMessageBox.information(
-                self, "Export Complete",
-                f"PSD exported successfully!\n\n"
-                f"File: {filename}\n"
-                f"Layers: {len(psd_layer_data)}\n"
-                f"Size: {scaled_canvas_width}x{scaled_canvas_height}"
-            )
-            
+
+            if not batch_mode:
+                QMessageBox.information(
+                    self, "Export Complete",
+                    f"PSD exported successfully!\n\n"
+                    f"File: {filename}\n"
+                    f"Layers: {len(psd_layer_data)}\n"
+                    f"Size: {scaled_canvas_width}x{scaled_canvas_height}"
+                )
+            return True
+
         except Exception as e:
             self.log_widget.log(f"Error exporting PSD: {e}", "ERROR")
             import traceback
             traceback.print_exc()
-            QMessageBox.warning(self, "Export Error", f"Failed to export PSD: {e}")
+            if not batch_mode:
+                QMessageBox.warning(self, "Export Error", f"Failed to export PSD: {e}")
+            return False
         finally:
             self._stop_hang_watchdog()
-    
+
     def get_psd_resample_filters(self, quality: str):
         """Return (transform_filter, resize_filter) for PSD export quality modes"""
         quality = (quality or 'balanced').lower()
@@ -23504,7 +28668,7 @@ class MSMAnimationViewer(QMainWindow):
             BlendMode.SCREEN: "Screen",
         }
         return labels.get(blend_mode, f"Unknown({blend_mode})")
-    
+
     def _resolve_ffmpeg_path(self) -> Optional[str]:
         """Return a working FFmpeg path, updating cached value as needed."""
         stored_path = self.settings.value('ffmpeg/path', '', type=str)
@@ -23730,34 +28894,38 @@ class MSMAnimationViewer(QMainWindow):
             "duration": real_duration,
         }
 
-    def export_as_mov(self):
+    def export_as_mov(self, filename: Optional[str] = None, *, batch_mode: bool = False):
         """Export animation as transparent MOV video"""
+        if filename is None and not batch_mode and self._export_all_animations_requested():
+            return self._export_all_loaded_animations("mov")
         if not self.gl_widget.player.animation:
             QMessageBox.warning(self, "Error", "No animation loaded")
-            return
-        
+            return False
+
         # Check for ffmpeg (supports auto-installed copy from settings)
         ffmpeg_path = self._resolve_ffmpeg_path()
         if not ffmpeg_path:
-            QMessageBox.warning(
-                self,
-                "FFmpeg Required",
-                "FFmpeg is required for MOV export.\n\n"
-                "Use Settings > Application > FFmpeg Tools to perform the one-click install, "
-                "or install FFmpeg manually and add it to PATH."
-            )
+            if not batch_mode:
+                QMessageBox.warning(
+                    self,
+                    "FFmpeg Required",
+                    "FFmpeg is required for MOV export.\n\n"
+                    "Use Settings > Application > FFmpeg Tools to perform the one-click install, "
+                    "or install FFmpeg manually and add it to PATH."
+                )
             self.log_widget.log("FFmpeg not available on PATH or managed install", "ERROR")
-            return
-        
+            return False
+
         self.log_widget.log(f"Found FFmpeg at: {ffmpeg_path}", "INFO")
-        
-        filename, _ = QFileDialog.getSaveFileName(
-            self, "Export Animation", "", "MOV Video (*.mov)"
-        )
-        
+
+        if filename is None:
+            filename, _ = QFileDialog.getSaveFileName(
+                self, "Export Animation", "", "MOV Video (*.mov)"
+            )
+
         if not filename:
-            return
-        
+            return False
+
         # Ensure .mov extension
         if not filename.lower().endswith('.mov'):
             filename += '.mov'
@@ -23833,7 +29001,7 @@ class MSMAnimationViewer(QMainWindow):
             )
             if not frame_info:
                 if not completed_outputs:
-                    return
+                    return False
                 break
 
             temp_dir = frame_info["temp_dir"]
@@ -23972,14 +29140,15 @@ class MSMAnimationViewer(QMainWindow):
                 completed_outputs.append(pass_output)
             else:
                 if total_passes > 1:
-                    QMessageBox.warning(
-                        self,
-                        "MOV Export Failed",
-                        (
-                            f"Pass {pass_number} could not be encoded.\n\n"
-                            "Check the log for FFmpeg details."
-                        ),
-                    )
+                    if not batch_mode:
+                        QMessageBox.warning(
+                            self,
+                            "MOV Export Failed",
+                            (
+                                f"Pass {pass_number} could not be encoded.\n\n"
+                                "Check the log for FFmpeg details."
+                            ),
+                        )
                 break
 
         if total_passes > 1 and completed_outputs:
@@ -23987,30 +29156,35 @@ class MSMAnimationViewer(QMainWindow):
                 f"MOV multi-pass export completed: {len(completed_outputs)} file(s).",
                 "SUCCESS",
             )
+        return bool(completed_outputs)
 
-    def export_as_mp4(self):
+    def export_as_mp4(self, filename: Optional[str] = None, *, batch_mode: bool = False):
         """Export animation as MP4 video."""
+        if filename is None and not batch_mode and self._export_all_animations_requested():
+            return self._export_all_loaded_animations("mp4")
         if not self.gl_widget.player.animation:
             QMessageBox.warning(self, "Error", "No animation loaded")
-            return
+            return False
 
         ffmpeg_path = self._resolve_ffmpeg_path()
         if not ffmpeg_path:
-            QMessageBox.warning(
-                self,
-                "FFmpeg Required",
-                "FFmpeg is required for MP4 export.\n\n"
-                "Use Settings > Application > FFmpeg Tools to install it, "
-                "or install FFmpeg manually and add it to PATH.",
-            )
+            if not batch_mode:
+                QMessageBox.warning(
+                    self,
+                    "FFmpeg Required",
+                    "FFmpeg is required for MP4 export.\n\n"
+                    "Use Settings > Application > FFmpeg Tools to install it, "
+                    "or install FFmpeg manually and add it to PATH.",
+                )
             self.log_widget.log("FFmpeg not available; MP4 export aborted.", "ERROR")
-            return
+            return False
 
-        filename, _ = QFileDialog.getSaveFileName(
-            self, "Export Animation", "", "MP4 Video (*.mp4)"
-        )
+        if filename is None:
+            filename, _ = QFileDialog.getSaveFileName(
+                self, "Export Animation", "", "MP4 Video (*.mp4)"
+            )
         if not filename:
-            return
+            return False
         if not filename.lower().endswith('.mp4'):
             filename += '.mp4'
 
@@ -24035,7 +29209,7 @@ class MSMAnimationViewer(QMainWindow):
             )
             if not frame_info:
                 if not completed_outputs:
-                    return
+                    return False
                 break
 
             temp_dir = frame_info["temp_dir"]
@@ -24136,40 +29310,46 @@ class MSMAnimationViewer(QMainWindow):
                 break
 
         if not completed_outputs or export_failed:
-            QMessageBox.warning(
-                self,
-                "MP4 Export Failed",
-                "FFmpeg was unable to encode one or more MP4 outputs. Check the log for details.",
-            )
+            if not batch_mode:
+                QMessageBox.warning(
+                    self,
+                    "MP4 Export Failed",
+                    "FFmpeg was unable to encode one or more MP4 outputs. Check the log for details.",
+                )
         elif total_passes > 1:
             self.log_widget.log(
                 f"MP4 multi-pass export completed: {len(completed_outputs)} file(s).",
                 "SUCCESS",
             )
+        return bool(completed_outputs) and not export_failed
 
-    def export_as_webm(self):
+    def export_as_webm(self, filename: Optional[str] = None, *, batch_mode: bool = False):
         """Export animation as WEBM video (supports alpha via VP9/AV1)."""
+        if filename is None and not batch_mode and self._export_all_animations_requested():
+            return self._export_all_loaded_animations("webm")
         if not self.gl_widget.player.animation:
             QMessageBox.warning(self, "Error", "No animation loaded")
-            return
+            return False
 
         ffmpeg_path = self._resolve_ffmpeg_path()
         if not ffmpeg_path:
-            QMessageBox.warning(
-                self,
-                "FFmpeg Required",
-                "FFmpeg is required for WEBM export.\n\n"
-                "Use Settings > Application > FFmpeg Tools to perform the one-click install, "
-                "or install FFmpeg manually and add it to PATH.",
-            )
+            if not batch_mode:
+                QMessageBox.warning(
+                    self,
+                    "FFmpeg Required",
+                    "FFmpeg is required for WEBM export.\n\n"
+                    "Use Settings > Application > FFmpeg Tools to perform the one-click install, "
+                    "or install FFmpeg manually and add it to PATH.",
+                )
             self.log_widget.log("FFmpeg not available on PATH or managed install", "ERROR")
-            return
+            return False
 
-        filename, _ = QFileDialog.getSaveFileName(
-            self, "Export Animation", "", "WEBM Video (*.webm)"
-        )
+        if filename is None:
+            filename, _ = QFileDialog.getSaveFileName(
+                self, "Export Animation", "", "WEBM Video (*.webm)"
+            )
         if not filename:
-            return
+            return False
         if not filename.lower().endswith('.webm'):
             filename += '.webm'
 
@@ -24198,7 +29378,7 @@ class MSMAnimationViewer(QMainWindow):
             )
             if not frame_info:
                 if not completed_outputs:
-                    return
+                    return False
                 break
 
             temp_dir = frame_info["temp_dir"]
@@ -24335,16 +29515,18 @@ class MSMAnimationViewer(QMainWindow):
                 break
 
         if export_failed:
-            QMessageBox.warning(
-                self,
-                "WEBM Export Failed",
-                "WEBM export failed for one or more passes. Check the log for details.",
-            )
+            if not batch_mode:
+                QMessageBox.warning(
+                    self,
+                    "WEBM Export Failed",
+                    "WEBM export failed for one or more passes. Check the log for details.",
+                )
         elif total_passes > 1 and completed_outputs:
             self.log_widget.log(
                 f"WEBM multi-pass export completed: {len(completed_outputs)} file(s).",
                 "SUCCESS",
             )
+        return bool(completed_outputs) and not export_failed
 
     def open_dof_asset_grabber(self) -> None:
         """Open the standalone Dawn of Fire asset downloader."""
@@ -24379,6 +29561,7 @@ class MSMAnimationViewer(QMainWindow):
     def show_settings(self):
         """Show settings dialog"""
         auto_refresh_before = self._monster_name_auto_refresh_enabled()
+        profiler_enabled_before = bool(getattr(self, "performance_profiler_enabled", False))
         dialog = SettingsDialog(
             self.export_settings,
             self.settings,
@@ -24388,7 +29571,10 @@ class MSMAnimationViewer(QMainWindow):
         )
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.log_widget.log("Settings saved", "SUCCESS")
+            self._configure_performance_profiler(reset=not profiler_enabled_before)
+            self._apply_ui_scale_from_settings(save=False, refresh_widgets=True)
             self._apply_ui_theme_colors()
+            self._apply_bin_revision_preferences()
             paths_changed = self._reload_primary_paths_from_settings(refresh=True)
             if paths_changed:
                 self.log_widget.log("Applied active path profile from Settings.", "INFO")
@@ -24418,6 +29604,9 @@ class MSMAnimationViewer(QMainWindow):
             elif auto_refresh_before != auto_refresh_after:
                 self._ensure_monster_name_rosetta_loaded(force=False)
             self.gl_widget.set_zoom_to_cursor(self.export_settings.camera_zoom_to_cursor)
+            self._read_spatial3d_settings()
+            self._sync_spatial3d_controls()
+            self._apply_spatial3d_settings_to_widget(self.gl_widget)
             sprite_filter = self.settings.value("viewport/sprite_filter", "bilinear", type=str)
             self.gl_widget.set_sprite_filter_mode(sprite_filter)
             sprite_filter_strength = self.settings.value("viewport/sprite_filter_strength", 1.0, type=float)
@@ -24682,24 +29871,27 @@ class MSMAnimationViewer(QMainWindow):
                 widget.set_dof_alpha_smoothing_strength(self.dof_alpha_edge_smoothing_strength)
                 widget.set_dof_alpha_smoothing_mode(self.dof_alpha_edge_smoothing_mode)
                 widget.set_dof_sprite_shader_mode(self.dof_sprite_shader_mode)
-    
-    def export_as_gif(self):
+
+    def export_as_gif(self, filename: Optional[str] = None, *, batch_mode: bool = False):
         """Export animation as animated GIF"""
+        if filename is None and not batch_mode and self._export_all_animations_requested():
+            return self._export_all_loaded_animations("gif")
         if not self.gl_widget.player.animation:
             QMessageBox.warning(self, "Error", "No animation loaded")
-            return
-        
-        filename, _ = QFileDialog.getSaveFileName(
-            self, "Export GIF", "", "GIF Animation (*.gif)"
-        )
-        
+            return False
+
+        if filename is None:
+            filename, _ = QFileDialog.getSaveFileName(
+                self, "Export GIF", "", "GIF Animation (*.gif)"
+            )
+
         if not filename:
-            return
-        
+            return False
+
         # Ensure .gif extension
         if not filename.lower().endswith('.gif'):
             filename += '.gif'
-        
+
         try:
             gif_fps = self.export_settings.gif_fps
             gif_colors = self.export_settings.gif_colors
@@ -24707,17 +29899,17 @@ class MSMAnimationViewer(QMainWindow):
             gif_dither = self.export_settings.gif_dither
             gif_optimize = self.export_settings.gif_optimize
             gif_loop = self.export_settings.gif_loop
-            
+
             real_duration = self._get_export_real_duration()
             total_frames = int(real_duration * gif_fps)
-            
+
             self.log_widget.log(f"GIF Export: {total_frames} frames at {gif_fps} FPS", "INFO")
             self.log_widget.log(f"Settings: {gif_colors} colors, {int(gif_scale*100)}% scale, dither={gif_dither}", "INFO")
-            
+
             if total_frames <= 0:
                 QMessageBox.warning(self, "Error", "Animation has no frames to export")
-                return
-            
+                return False
+
             base_width, base_height, camera_override, render_scale_override, apply_centering = (
                 self._compute_export_render_plan(
                     gif_fps,
@@ -24728,11 +29920,11 @@ class MSMAnimationViewer(QMainWindow):
             )
             output_width = int(base_width * gif_scale)
             output_height = int(base_height * gif_scale)
-            
+
             # Ensure even dimensions
             output_width = output_width if output_width % 2 == 0 else output_width + 1
             output_height = output_height if output_height % 2 == 0 else output_height + 1
-            
+
             self.log_widget.log(f"Output dimensions: {output_width}x{output_height}", "INFO")
 
             original_time = self.gl_widget.player.current_time
@@ -24874,7 +30066,7 @@ class MSMAnimationViewer(QMainWindow):
                     f"Export aborted. Passes completed: {len(completed_outputs)}",
                     "WARNING",
                 )
-                return
+                return False
 
             if total_passes <= 1:
                 final_output = completed_outputs[0]
@@ -24883,76 +30075,81 @@ class MSMAnimationViewer(QMainWindow):
                     size_str = f"{file_size / (1024*1024):.2f} MB"
                 else:
                     size_str = f"{file_size / 1024:.1f} KB"
-                QMessageBox.information(
-                    self, "Export Complete",
-                    f"GIF exported successfully!\n\n"
-                    f"File: {final_output}\n"
-                    f"Size: {size_str}\n"
-                    f"Frames: {total_frames}\n"
-                    f"Dimensions: {output_width}x{output_height}"
-                )
+                if not batch_mode:
+                    QMessageBox.information(
+                        self, "Export Complete",
+                        f"GIF exported successfully!\n\n"
+                        f"File: {final_output}\n"
+                        f"Size: {size_str}\n"
+                        f"Frames: {total_frames}\n"
+                        f"Dimensions: {output_width}x{output_height}"
+                    )
             else:
-                QMessageBox.information(
-                    self, "Export Complete",
-                    f"GIF multi-pass export complete.\n\n"
-                    f"Files: {len(completed_outputs)}\n"
-                    f"Frames per pass: {total_frames}\n"
-                    f"Dimensions: {output_width}x{output_height}"
-                )
+                if not batch_mode:
+                    QMessageBox.information(
+                        self, "Export Complete",
+                        f"GIF multi-pass export complete.\n\n"
+                        f"Files: {len(completed_outputs)}\n"
+                        f"Frames per pass: {total_frames}\n"
+                        f"Dimensions: {output_width}x{output_height}"
+                    )
                 self.log_widget.log(
                     f"GIF multi-pass export completed: {len(completed_outputs)} file(s).",
                     "SUCCESS",
                 )
-            
+            return True
+
         except Exception as e:
             self.log_widget.log(f"Error exporting GIF: {e}", "ERROR")
             import traceback
             traceback.print_exc()
-            QMessageBox.warning(self, "Export Error", f"Failed to export GIF: {e}")
+            if not batch_mode:
+                QMessageBox.warning(self, "Export Error", f"Failed to export GIF: {e}")
+            return False
         finally:
             self.gl_widget.player.current_time = original_time if 'original_time' in locals() else self.gl_widget.player.current_time
             if 'original_playing' in locals():
                 self._set_player_playing(original_playing)
             self.gl_widget.update()
-    
+
     def show_credits(self):
         """Show credits and acknowledgments dialog"""
         credits_dialog = QDialog(self)
         credits_dialog.setWindowTitle("Credits & Acknowledgments")
         credits_dialog.setMinimumWidth(450)
         credits_dialog.setMinimumHeight(400)
-        
+
         layout = QVBoxLayout(credits_dialog)
-        
+
         # Title with glow effect
         title_label = QLabel("MSM Animation Viewer")
         title_label.setStyleSheet("font-size: 18pt; font-weight: bold; color: white;")
         title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        
+
         # Add white glow effect
         glow_effect = QGraphicsDropShadowEffect()
         glow_effect.setBlurRadius(20)
         glow_effect.setColor(QColor(255, 255, 255))
         glow_effect.setOffset(0, 0)
         title_label.setGraphicsEffect(glow_effect)
-        
+
         layout.addWidget(title_label)
-        
+
         # Created by
         created_label = QLabel("Created by <b>LennyFaze</b> (MSM Green Screens)")
         created_label.setStyleSheet("font-size: 10pt; color: #aaa;")
         created_label.setTextFormat(Qt.TextFormat.RichText)
         created_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(created_label)
-        
+
         # Subtitle
         subtitle_label = QLabel(f"Credits & Acknowledgments — Build {self.build_version}")
         subtitle_label.setStyleSheet("font-size: 12pt; color: #666;")
         subtitle_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(subtitle_label)
-        
+
         layout.addSpacing(20)
-        
+
         # Credits content
         credits_text = """
 <div style="font-size: 10pt;">
@@ -24985,34 +30182,38 @@ All game assets and content are owned by Big Blue Bubble Inc.
 
 </div>
 """
-        
+
         credits_label = QLabel(credits_text)
         credits_label.setWordWrap(True)
         credits_label.setTextFormat(Qt.TextFormat.RichText)
         credits_label.setAlignment(Qt.AlignmentFlag.AlignLeft)
         layout.addWidget(credits_label)
-        
+
         layout.addStretch()
-        
+
         # Close button
         close_btn = QPushButton("Close")
         close_btn.clicked.connect(credits_dialog.accept)
         close_btn.setStyleSheet("padding: 8px 30px;")
-        
+
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
         btn_layout.addWidget(close_btn)
         btn_layout.addStretch()
         layout.addLayout(btn_layout)
-        
+
         credits_dialog.exec()
-    
+
     def load_settings(self):
         """Load saved settings"""
         self._apply_ui_theme_colors()
+        self._configure_performance_profiler()
         self.control_panel.set_dof_search_mode(self.dof_search_enabled)
+        self._read_spatial3d_settings()
+        self._sync_spatial3d_controls()
         sprite_filter = self.settings.value("viewport/sprite_filter", "bilinear", type=str)
         if hasattr(self, "gl_widget"):
+            self._apply_spatial3d_settings_to_widget(self.gl_widget)
             self.gl_widget.set_sprite_filter_mode(sprite_filter)
             sprite_filter_strength = self.settings.value("viewport/sprite_filter_strength", 1.0, type=float)
             self.gl_widget.set_sprite_filter_strength(sprite_filter_strength)
@@ -25163,7 +30364,7 @@ All game assets and content are owned by Big Blue Bubble Inc.
 
     def _on_control_panel_dof_include_mesh_xml_toggled(self, enabled: bool):
         self.settings.setValue("ui/control_panel/dof_include_mesh_xml", bool(enabled))
-    
+
     def on_layer_selection_changed(self, layer_ids: List[int], last_layer_id: int, added: bool):
         """Handle layer selection toggles from the layer panel."""
         self.selected_layer_ids = set(layer_ids)
@@ -25205,14 +30406,14 @@ All game assets and content are owned by Big Blue Bubble Inc.
             self.selected_attachment_id = None
             self.layer_panel.set_attachment_selection(None)
             self.gl_widget.set_attachment_selection(None)
-    
+
     def on_selection_lock_toggled(self, locked: bool):
         """Handle lock/unlock requests from the layer panel."""
         if locked and not self.selected_layer_ids:
             locked = False
         self.selection_lock_enabled = locked
         self.apply_selection_state()
-    
+
     def on_layer_selection_cleared(self):
         """Handle deselect-all events from the layer panel."""
         if not self.selected_layer_ids and not self.selection_lock_enabled:
@@ -25224,7 +30425,7 @@ All game assets and content are owned by Big Blue Bubble Inc.
         self._refresh_timeline_keyframes()
         self._update_nudge_controls_state()
         self.update_layer_readout()
-    
+
     def apply_selection_state(self):
         """Push current selection info to the GL widget."""
         self.gl_widget.set_selection_state(
@@ -25500,13 +30701,13 @@ All game assets and content are owned by Big Blue Bubble Inc.
         self.update_offset_display()
         self.gl_widget.update()
         self.log_widget.log(f"Applied offsets to {applied} layers from {os.path.basename(filename)}", "SUCCESS")
-    
+
     def reset_sprite_offsets(self):
         """Reset all sprite offsets to default"""
         self.gl_widget.reset_layer_offsets()
         self.update_offset_display()
         self.log_widget.log("Reset all sprite offsets to default", "SUCCESS")
-    
+
     def update_offset_display(self):
         """Update the offset display with current values"""
         self.control_panel.update_offset_display(
@@ -25516,7 +30717,7 @@ All game assets and content are owned by Big Blue Bubble Inc.
             self.gl_widget.layer_scale_offsets
         )
         self.update_layer_readout()
-        
+
         # Start a timer to update offsets periodically
         if not hasattr(self, 'offset_update_timer'):
             self.offset_update_timer = QTimer(self)
@@ -25824,6 +31025,11 @@ All game assets and content are owned by Big Blue Bubble Inc.
                 pass
             try:
                 self.audio_manager.clear()
+            except Exception:
+                pass
+        if getattr(self, "gl_widget", None):
+            try:
+                self.gl_widget.shutdown_spatial3d()
             except Exception:
                 pass
 

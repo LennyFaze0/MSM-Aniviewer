@@ -781,7 +781,7 @@ class MidiEditorDialog(QDialog):
         self._preview_bake_active = False
         self._reexport_queue: List[Tuple[int, str, Optional[str]]] = []
         self._reexport_active = False
-        self._reexport_process: Optional[subprocess.Popen] = None
+        self._reexport_future: Optional[Future] = None
         self._reexport_current: Optional[Tuple[int, str, Optional[str], str]] = None
         self._audio_preload_queue: List[Tuple[int, str]] = []
         self._audio_preload_active: bool = False
@@ -1253,13 +1253,17 @@ class MidiEditorDialog(QDialog):
         QTimer.singleShot(0, self._step_reexport_jsons)
 
     def _step_reexport_jsons(self) -> None:
-        if self._reexport_process is not None:
-            if self._reexport_process.poll() is None:
+        if self._reexport_future is not None:
+            if not self._reexport_future.done():
                 QTimer.singleShot(50, self._step_reexport_jsons)
                 return
-            return_code = self._reexport_process.returncode
+            try:
+                result = self._reexport_future.result()
+                return_code = int(getattr(result, "returncode", 1))
+            except Exception:
+                return_code = 1
             track_index, anim_name, token_hint, bin_path = self._reexport_current or (None, None, None, None)
-            self._reexport_process = None
+            self._reexport_future = None
             self._reexport_current = None
             if return_code == 0:
                 output_json = os.path.splitext(bin_path)[0] + ".json"
@@ -1328,15 +1332,14 @@ class MidiEditorDialog(QDialog):
             cmd = self.main_window._build_python_command(script_path) + ["d", bin_path]
             cwd = os.path.dirname(script_path) if script_path else None
             self._reexport_current = (track_index, anim_name, token_hint, bin_path)
-            self._reexport_process = subprocess.Popen(
+            self._reexport_future = self._world_state_executor.submit(
+                self.main_window._run_converter_command_blocking,
                 cmd,
-                cwd=cwd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                cwd,
             )
         except Exception:
             self._reexport_stats["failures"].append(os.path.basename(bin_path))
-            self._reexport_process = None
+            self._reexport_future = None
             self._reexport_current = None
             QTimer.singleShot(0, self._step_reexport_jsons)
 

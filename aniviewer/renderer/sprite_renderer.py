@@ -1229,10 +1229,7 @@ class ShaderOverlayTexture:
         try:
             image = Image.open(self.path)
             image = image.convert('RGBA')
-            img_data = np.array(image, dtype=np.float32) / 255.0
-            alpha = img_data[:, :, 3:4]
-            img_data[:, :, 0:3] *= alpha
-            img_data = (img_data * 255.0).astype(np.uint8)
+            img_data = TextureAtlas.prepare_premultiplied_upload_pixels(image, image_path=self.path)
             self.texture_id = glGenTextures(1)
             glBindTexture(GL_TEXTURE_2D, self.texture_id)
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
@@ -2436,8 +2433,9 @@ class SpriteRenderer:
                         sprite = found_sprite
                         # Check if pivot is non-default (not 0.5, 0.5)
                         if abs(sprite.pivot_x - 0.5) > 0.001 or abs(sprite.pivot_y - 0.5) > 0.001:
-                            # DOF sprites already encode pivot-local geometry; do not apply costume pivot adjustment.
-                            if getattr(search_atlas, "pivot_mode", None) == "dof":
+                            # DOF mesh sprites and baked DOF->Rev6 sprites already encode their anchor
+                            # relationship; generic pivot correction would double-apply it.
+                            if getattr(search_atlas, "pivot_mode", None) in {"dof", "dof_rev6_baked"}:
                                 pass
                             elif suppress_mixed_costume_pivot_fallback:
                                 # Mixed-pivot costume frame swaps need one

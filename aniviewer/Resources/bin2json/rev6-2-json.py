@@ -359,6 +359,9 @@ class Layer:
 
 
 class CloneLayer:
+	MAX_COUNT: int = 512
+	MAX_STRING_LENGTH: int = 512
+
 	def __init__(self, new_layer: str, source_layer: str, reference_layer: str, variant_index: int) -> None:
 		self.new_layer = new_layer
 		self.source_layer = source_layer
@@ -387,6 +390,23 @@ class CloneLayer:
 			bf.readUInt32()
 		)
 
+	@classmethod
+	def read_probe(cls, bf: BinFile, file_size: int) -> Self:
+		"""Read clone data defensively while probing optional rev6 extensions.
+
+		Rev6 animation records do not include an explicit "has clone data" flag,
+		so ordinary files can look like they have a small clone count when the
+		next animation's name length is read as an integer. Avoid unbounded
+		string reads in that case; reject the probe as soon as a string header is
+		not plausible.
+		"""
+		return cls(
+			cls._read_bounded_string(bf, file_size),
+			cls._read_bounded_string(bf, file_size),
+			cls._read_bounded_string(bf, file_size),
+			bf.readUInt32()
+		)
+
 	def to_dict(self) -> dict:
 		insert_mode = self._signed_variant(self.variant_index)
 		insert_mode = -1 if insert_mode < 0 else 1
@@ -406,6 +426,31 @@ class CloneLayer:
 		bf.writeString(self.source_layer)
 		bf.writeString(self.reference_layer)
 		bf.writeUInt32(CloneLayer._normalize_variant(self.variant_index))
+
+	@staticmethod
+	def _read_bounded_string(bf: BinFile, file_size: int) -> str:
+		start = bf.tell()
+		string_len_raw = bf.readUInt32()
+		if string_len_raw <= 0:
+			raise ValueError("invalid clone string length")
+		string_len = string_len_raw - 1
+		if string_len < 0 or string_len > CloneLayer.MAX_STRING_LENGTH:
+			raise ValueError("clone string length out of bounds")
+		if bf.tell() + string_len > file_size:
+			raise ValueError("clone string exceeds file bounds")
+		raw = bf.fp.read(string_len)
+		try:
+			string = raw.decode('ascii')
+		except UnicodeDecodeError as exc:
+			raise ValueError("clone string is not ASCII") from exc
+		if any(ord(char) < 32 or ord(char) > 126 for char in string):
+			raise ValueError("clone string has non-printable characters")
+		# Match BinFile.readString alignment after reading the raw bytes.
+		offset = len(string) % BinFile.CHUNK
+		bf.seek(BinFile.CHUNK - offset if offset != 0 else 4, BinFile.WHENCE_CURRENT)
+		if bf.tell() <= start or bf.tell() > file_size:
+			raise ValueError("clone string alignment exceeded file bounds")
+		return string
 
 	@staticmethod
 	def _signed_variant(value: int) -> int:
@@ -478,18 +523,28 @@ class Animation:
 	def _maybe_read_clone_layers(bf: BinFile) -> list["CloneLayer"]:
 		start = bf.tell()
 		clones: List["CloneLayer"] = []
+		file_size = getattr(bf, "_size", 0) or 0
 		try:
 			clone_count = bf.readUInt32()
 		except Exception:
 			bf.seek(start, BinFile.WHENCE_START)
 			return []
 
-		if clone_count > 512:
+		if clone_count > CloneLayer.MAX_COUNT:
+			bf.seek(start, BinFile.WHENCE_START)
+			return []
+		if clone_count <= 0:
+			bf.seek(start, BinFile.WHENCE_START)
+			return []
+		# Every clone has three bounded strings plus one u32 variant. This cheap
+		# lower-bound check rejects truncated/ordinary animation data before any
+		# deeper probe work.
+		if file_size and (bf.tell() + (clone_count * 16)) > file_size:
 			bf.seek(start, BinFile.WHENCE_START)
 			return []
 
 		try:
-			clones = [CloneLayer.read(bf) for _ in range(clone_count)]
+			clones = [CloneLayer.read_probe(bf, file_size) for _ in range(clone_count)]
 		except Exception:
 			bf.seek(start, BinFile.WHENCE_START)
 			return []

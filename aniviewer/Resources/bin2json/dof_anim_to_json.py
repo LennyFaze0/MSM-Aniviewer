@@ -58,6 +58,7 @@ _GUID_DISK_CACHE_NAME = ".dof_guid_cache.json"
 _LAST_SPRITE_DEFS: Dict[str, Dict[str, Any]] = {}
 _LAST_LAYER_DEBUG: List[Dict[str, Any]] = []
 _LAST_ALPHA_DEBUG: Dict[str, Any] = {}
+_SPRITE_IMAGE_EXTENSIONS = {".png", ".avif", ".webp", ".jpg", ".jpeg", ".tga", ".psd"}
 _SHADER_GUID_NAME_FALLBACKS: Dict[str, str] = {
     # Common DOF sprite shaders referenced by GUID in ANIMBBB assets.
     "dd781eb7e10bec14fbcbb1db8f78cd10": "Anim2D/Normal+Alpha",
@@ -68,6 +69,10 @@ _SHADER_GUID_NAME_FALLBACKS: Dict[str, str] = {
     "137eeed8c92c1a3479e6fdbc700f96fc": "Anim2D/Additive+Alpha",
     "d0687296b1e5d0043b7333b172489227": "Anim2D/Additive+Alpha",
 }
+
+
+def _progress(message: str) -> None:
+    print(f"Progress: {message}", flush=True)
 
 
 def _load_yaml(path: Path, text: Optional[str] = None) -> Dict[str, Any]:
@@ -90,6 +95,17 @@ def _strip_suffix(name: str, suffix: str) -> str:
     if name.lower().endswith(suffix.lower()):
         return name[: -len(suffix)]
     return name
+
+
+def _sprite_ref_name(name: Any) -> str:
+    text = str(name or "").strip().replace("\\", "/")
+    if not text:
+        return ""
+    base = text.rsplit("/", 1)[-1]
+    path = Path(base)
+    if path.suffix.lower() in _SPRITE_IMAGE_EXTENSIONS:
+        return path.stem
+    return base
 
 
 def _anim_name_from_path(path: Path) -> str:
@@ -1661,6 +1677,11 @@ def _infer_layer_blend(
 def _build_bundle_shader_ref_name_overrides(
     nodes: List[Dict[str, Any]],
     anim_name: str,
+    node_mappings_raw: Optional[List[str]] = None,
+    image_names: Optional[List[str]] = None,
+    sprite_defs: Optional[Dict[str, Dict[str, Any]]] = None,
+    atlas_path: Optional[Path] = None,
+    atlas_flip_y: bool = False,
 ) -> Dict[str, str]:
     """
     Infer shader names for bundle typetree refs that only expose m_FileID/m_PathID.
@@ -1698,6 +1719,108 @@ def _build_bundle_shader_ref_name_overrides(
     lowered_name = (anim_name or "").strip().lower()
     color_hint = _infer_chromatic_color_token(anim_name)
 
+    def _ref_sprite_names(ref_key: str) -> set[str]:
+        if not image_names:
+            return set()
+        names: set[str] = set()
+        for node_index, node in enumerate(nodes):
+            if not isinstance(node, dict) or node.get("NodeType") != 1:
+                continue
+            if _shader_ref_key(node.get("RenderTypeShader")) != ref_key:
+                continue
+            channels = node.get("BezierFramesTypes", []) or []
+            sprite_channel = channels[12] if len(channels) > 12 else {}
+            sprite_keys = _channel_key_map(sprite_channel)
+            mapping_hex = ""
+            if node_mappings_raw and node_index < len(node_mappings_raw):
+                mapping_hex = node_mappings_raw[node_index]
+            mapping = _resolve_node_mapping(mapping_hex, node)
+            default_sprite_name = _first_valid_sprite_name(mapping, image_names)
+            if sprite_keys:
+                names.update(
+                    _collect_layer_sprite_names(
+                        sprite_keys,
+                        mapping,
+                        image_names,
+                        default_sprite_name,
+                    )
+                )
+            elif default_sprite_name:
+                names.add(default_sprite_name)
+        return names
+
+    def _resolve_sprite_info(name: str) -> Optional[Dict[str, Any]]:
+        if not sprite_defs:
+            return None
+        direct = sprite_defs.get(name)
+        if isinstance(direct, dict):
+            return direct
+        lowered = name.strip().lower()
+        for key, value in sprite_defs.items():
+            if not isinstance(key, str) or not isinstance(value, dict):
+                continue
+            key_lower = key.strip().lower()
+            if key_lower == lowered:
+                return value
+            if Path(key_lower).stem == Path(lowered).stem:
+                return value
+        return None
+
+    def _ref_average_saturation(ref_key: str) -> Optional[float]:
+        if Image is None or not atlas_path or not atlas_path.exists() or not sprite_defs:
+            return None
+        sprite_names = _ref_sprite_names(ref_key)
+        if not sprite_names:
+            return None
+        try:
+            atlas = Image.open(atlas_path).convert("RGBA")
+        except Exception:
+            return None
+        atlas_w, atlas_h = atlas.size
+        total = 0.0
+        count = 0
+        for sprite_name in sprite_names:
+            sprite_info = _resolve_sprite_info(sprite_name)
+            if not isinstance(sprite_info, dict):
+                continue
+            rect = sprite_info.get("rect", {}) or {}
+            try:
+                sx = int(round(float(rect.get("x", 0.0) or 0.0)))
+                sy = int(round(float(rect.get("y", 0.0) or 0.0)))
+                sw = int(round(float(rect.get("w", 0.0) or 0.0)))
+                sh = int(round(float(rect.get("h", 0.0) or 0.0)))
+            except (TypeError, ValueError):
+                continue
+            if sw <= 0 or sh <= 0:
+                continue
+            if atlas_flip_y:
+                sy = int(round(float(atlas_h) - float(sy) - float(sh)))
+            x0 = max(0, sx)
+            y0 = max(0, sy)
+            x1 = min(atlas_w, sx + sw)
+            y1 = min(atlas_h, sy + sh)
+            if x1 <= x0 or y1 <= y0:
+                continue
+            crop = atlas.crop((x0, y0, x1, y1))
+            raw_pixels = crop.tobytes()
+            sprite_total = 0.0
+            sprite_count = 0
+            for idx in range(0, len(raw_pixels), 4):
+                r = raw_pixels[idx]
+                g = raw_pixels[idx + 1]
+                b = raw_pixels[idx + 2]
+                a = raw_pixels[idx + 3]
+                if a <= 0:
+                    continue
+                sprite_total += float(max(r, g, b) - min(r, g, b))
+                sprite_count += 1
+            if sprite_count:
+                total += sprite_total / float(sprite_count)
+                count += 1
+        if not count:
+            return None
+        return total / float(count)
+
     def _layer_count(ref_key: str) -> int:
         return len(ref_to_layer_names.get(ref_key, []))
 
@@ -1714,6 +1837,29 @@ def _build_bundle_shader_ref_name_overrides(
     selected_gradient: Optional[str] = None
 
     if color_hint and ("chromatic" in lowered_name or color_hint in lowered_name):
+        saturation_scores = {
+            key: _ref_average_saturation(key)
+            for key in non_additive_refs
+        }
+        usable_scores = {
+            key: value
+            for key, value in saturation_scores.items()
+            if value is not None
+        }
+        if len(usable_scores) == 2:
+            ordered_by_saturation = sorted(usable_scores, key=lambda key: usable_scores[key] or 0.0)
+            low_sat = usable_scores[ordered_by_saturation[0]] or 0.0
+            high_sat = usable_scores[ordered_by_saturation[1]] or 0.0
+            if low_sat <= 8.0 and (high_sat - low_sat) >= 20.0:
+                selected_gradient = ordered_by_saturation[0]
+                selected_normal = ordered_by_saturation[1]
+
+    if (
+        selected_normal is None
+        and selected_gradient is None
+        and color_hint
+        and ("chromatic" in lowered_name or color_hint in lowered_name)
+    ):
         hit_scores = {key: _color_tag_hits(key, color_hint) for key in non_additive_refs}
         ordered = sorted(
             non_additive_refs,
@@ -1796,6 +1942,86 @@ def _copy_shader_texture_for_output(
         return None
 
 
+def _normalize_assets_root(path: Optional[Path]) -> Optional[Path]:
+    if not path:
+        return None
+    candidates: List[Path] = []
+    try:
+        base = Path(path)
+    except Exception:
+        return None
+
+    def _add(candidate: Optional[Path]) -> None:
+        if candidate is None:
+            return
+        try:
+            resolved = candidate.resolve()
+        except Exception:
+            resolved = candidate
+        if resolved not in candidates:
+            candidates.append(resolved)
+
+    _add(_find_assets_root(base))
+    _add(base)
+    _add(base / "Assets")
+    _add(base / "ExportedProject" / "Assets")
+    if base.name.lower() == "msmdata":
+        _add(base.parent)
+
+    for candidate in candidates:
+        try:
+            if not candidate.exists() or not candidate.is_dir():
+                continue
+        except Exception:
+            continue
+        if (candidate / "Texture2D").is_dir() or (candidate / "texture2d").is_dir():
+            return candidate
+        if (candidate / "msmdata").is_dir():
+            return candidate
+    return None
+
+
+def _copy_project_chromatic_gradient_for_output(
+    assets_root: Optional[Path],
+    color_hint: Optional[str],
+    output_dir: Path,
+    output_stem: str,
+) -> Optional[Path]:
+    if not color_hint:
+        return None
+    normalized_root = _normalize_assets_root(assets_root)
+    if normalized_root is None:
+        return None
+    color = color_hint.strip().lower()
+    texture_dirs = [
+        normalized_root / "Texture2D",
+        normalized_root / "texture2d",
+    ]
+    names = [
+        f"gradient_{color}_chromatic.png",
+        f"gradient_{color}_chromatic_0.png",
+    ]
+    for texture_dir in texture_dirs:
+        if not texture_dir.is_dir():
+            continue
+        for name in names:
+            texture_path = texture_dir / name
+            if texture_path.exists():
+                saved = _copy_shader_texture_for_output(
+                    texture_path,
+                    output_dir,
+                    output_stem,
+                    "gradient",
+                )
+                if saved:
+                    print(
+                        f"Using project chromatic gradient LUT for {output_stem} "
+                        f"(color={color}, source={texture_path.name})."
+                    )
+                    return saved
+    return None
+
+
 def _collect_gradient_shader_sprite_names(anim_json: Dict[str, Any]) -> set[str]:
     names: set[str] = set()
     anims = anim_json.get("anims") or []
@@ -1834,6 +2060,81 @@ def _collect_gradient_shader_sprite_names(anim_json: Dict[str, Any]) -> set[str]
                 sprite_name = str(sprite_entry.get("string") or "").strip()
                 if sprite_name:
                     names.add(sprite_name)
+    return names
+
+
+def _sprite_numeric_family_prefix(name: str) -> Optional[str]:
+    stem = Path(str(name or "")).stem.strip().lower()
+    if not stem:
+        return None
+    match = _SPRITE_NUMERIC_SUFFIX_PATTERN.match(stem)
+    if not match:
+        return None
+    prefix, _number = match.groups()
+    return prefix or None
+
+
+def _collect_gradient_shader_mapped_sprite_names(
+    nodes: List[Dict[str, Any]],
+    node_mappings_raw: List[str],
+    image_names: List[str],
+    shader_ref_name_overrides: Optional[Dict[str, str]] = None,
+    resolve_guid: Optional[Callable[[Optional[str]], Optional[Path]]] = None,
+) -> set[str]:
+    names: set[str] = set()
+    if not nodes or not image_names:
+        return names
+    shader_ref_name_overrides = shader_ref_name_overrides or {}
+
+    for node_index, node in enumerate(nodes):
+        if not isinstance(node, dict) or node.get("NodeType") != 1:
+            continue
+        shader_entry = node.get("RenderTypeShader")
+        ref_key = _shader_ref_key(shader_entry)
+        shader_name = shader_ref_name_overrides.get(ref_key or "")
+        if not shader_name:
+            shader_name = _resolve_shader_name(shader_entry, resolve_guid or (lambda _guid: None))
+        if "shadergradientmap" not in str(shader_name or "").lower():
+            continue
+
+        channels = node.get("BezierFramesTypes", []) or []
+        sprite_channel = channels[12] if len(channels) > 12 else {}
+        raw_values: List[int] = []
+        for entry in _iter_keyframes(sprite_channel):
+            try:
+                value = int(round(float(entry.get("value", 0.0))))
+            except (TypeError, ValueError):
+                continue
+            if value >= 0:
+                raw_values.append(value)
+        if not raw_values:
+            continue
+
+        mapping_hex = node_mappings_raw[node_index] if node_index < len(node_mappings_raw) else ""
+        mapping = _resolve_node_mapping(mapping_hex, node)
+        used_names: set[str] = set()
+        for value in raw_values:
+            sprite_name = _resolve_sprite_name_safe(value, mapping, image_names, "")
+            if sprite_name:
+                used_names.add(sprite_name)
+        names.update(used_names)
+
+        family_prefixes = {
+            prefix
+            for prefix in (_sprite_numeric_family_prefix(sprite_name) for sprite_name in used_names)
+            if prefix
+        }
+        if not family_prefixes or not mapping:
+            continue
+        mapped_names: List[str] = []
+        for image_index in mapping:
+            if 0 <= image_index < len(image_names):
+                sprite_name = image_names[image_index]
+                if sprite_name:
+                    mapped_names.append(sprite_name)
+        for sprite_name in mapped_names:
+            if _sprite_numeric_family_prefix(sprite_name) in family_prefixes:
+                names.add(sprite_name)
     return names
 
 
@@ -2200,8 +2501,11 @@ def _resolve_gradient_texture_from_static_data(
     if not static_data_paths:
         return None
 
+    _progress(f"checking {len(static_data_paths)} static_data bundle(s) for gradient LUTs")
     static_name_prefix = f"staticinfo_{token}"
-    for static_data_path in static_data_paths:
+    for scan_index, static_data_path in enumerate(static_data_paths, start=1):
+        if len(static_data_paths) <= 20 or scan_index <= 3 or scan_index % 10 == 0 or scan_index == len(static_data_paths):
+            _progress(f"scanning static_data {scan_index}/{len(static_data_paths)}: {static_data_path.name}")
         try:
             env = UnityPy.load(str(static_data_path))
         except Exception:
@@ -2249,6 +2553,7 @@ def _resolve_gradient_texture_from_static_data(
                 if getattr(getattr(gradient_obj, "type", None), "name", None) != "Texture2D":
                     continue
                 try:
+                    _progress(f"found gradient LUT in static_data: {static_data_path.name}")
                     return gradient_obj.read()
                 except Exception:
                     continue
@@ -2257,6 +2562,7 @@ def _resolve_gradient_texture_from_static_data(
         # MonsterStatic typetree is stripped but the gradient textures are named.
         fallback = _find_gradient_texture_in_unity_env(env, color_hint)
         if fallback is not None:
+            _progress(f"found named gradient LUT fallback in static_data: {static_data_path.name}")
             return fallback
     return None
 
@@ -2266,11 +2572,22 @@ def _resolve_bundle_gradient_texture_output(
     bundle_root: Path,
     anim_name: str,
     output_dir: Path,
+    assets_root: Optional[Path] = None,
 ) -> Optional[Path]:
     color_hint = _infer_chromatic_color_token(anim_name)
+    _progress(f"resolving gradient texture assets (color hint: {color_hint or 'none'})")
     gradient_tex = _find_gradient_texture_in_unity_env(env, color_hint)
     output_path = output_dir / f"{Path(anim_name).stem}_gradient.png"
     saved = _save_unity_texture_to_path(gradient_tex, output_path)
+    if saved:
+        return saved
+
+    saved = _copy_project_chromatic_gradient_for_output(
+        assets_root,
+        color_hint,
+        output_dir,
+        Path(anim_name).stem,
+    )
     if saved:
         return saved
 
@@ -2293,6 +2610,7 @@ def _resolve_bundle_gradient_texture_output(
         return None
     candidates: List[Path] = []
     pattern = f"staticinfo_{token_lower}"
+    _progress(f"searching staticinfo bundles for gradient pattern: {pattern}")
     for path in bundle_root.rglob("*.unity3d"):
         lowered = path.name.lower()
         if pattern in lowered:
@@ -2300,7 +2618,11 @@ def _resolve_bundle_gradient_texture_output(
                 candidates.insert(0, path)
             else:
                 candidates.append(path)
-    for candidate in candidates:
+    if candidates:
+        _progress(f"checking {len(candidates)} staticinfo gradient candidate bundle(s)")
+    for scan_index, candidate in enumerate(candidates, start=1):
+        if len(candidates) <= 20 or scan_index <= 3 or scan_index % 10 == 0 or scan_index == len(candidates):
+            _progress(f"scanning staticinfo gradient bundle {scan_index}/{len(candidates)}: {candidate.name}")
         try:
             static_env = UnityPy.load(str(candidate))
         except Exception:
@@ -2308,11 +2630,12 @@ def _resolve_bundle_gradient_texture_output(
         gradient_tex = _find_gradient_texture_in_unity_env(static_env, color_hint)
         saved = _save_unity_texture_to_path(gradient_tex, output_path)
         if saved:
+            _progress(f"wrote gradient texture from {candidate.name}: {saved}")
             return saved
     synthesized = _build_synthetic_chromatic_gradient(output_path, color_hint)
     if synthesized:
         print(
-            f"Synthesized chromatic gradient fallback: {synthesized.name} "
+            f"Built-in sampled chromatic gradient fallback: {synthesized.name} "
             f"(color={color_hint})"
         )
         return synthesized
@@ -2327,34 +2650,46 @@ def _build_synthetic_chromatic_gradient(
     if Image is None or not color_hint:
         return None
     palette_map: Dict[str, List[Tuple[int, int, int]]] = {
-        # Dark stops stay chromatic (not neutral gray) to prevent gray leakage.
-        "red": [(22, 4, 4), (70, 16, 14), (135, 34, 30), (206, 74, 60), (255, 180, 150)],
-        "blue": [(5, 9, 26), (14, 31, 78), (26, 58, 148), (63, 112, 215), (165, 216, 255)],
-        "green": [(5, 18, 8), (15, 58, 24), (32, 111, 48), (62, 171, 74), (174, 248, 178)],
-        "yellow": [(28, 22, 2), (84, 67, 8), (148, 116, 20), (215, 170, 44), (255, 236, 148)],
-        "orange": [(32, 14, 3), (93, 43, 10), (159, 75, 20), (223, 116, 36), (255, 201, 150)],
-        "purple": [(20, 7, 30), (56, 24, 75), (100, 45, 133), (151, 83, 187), (220, 173, 255)],
+        # Sampled from the middle row of the game chromatic LUTs at 8px
+        # intervals. Real project textures are still preferred when available.
+        "blue": [(0, 4, 39), (0, 6, 43), (0, 9, 47), (0, 13, 52), (0, 18, 60), (0, 24, 68), (0, 31, 77), (0, 39, 88), (0, 46, 99), (0, 56, 111), (0, 66, 124), (0, 75, 138), (0, 85, 150), (0, 93, 162), (1, 103, 176), (10, 116, 190), (19, 127, 204), (30, 138, 219), (42, 150, 233), (55, 161, 242), (66, 170, 250), (82, 183, 255), (98, 197, 255), (116, 214, 254), (135, 225, 251), (155, 234, 250), (171, 241, 249), (192, 245, 250), (206, 248, 251), (223, 250, 252), (239, 252, 254), (250, 254, 254), (255, 255, 255)],
+        "green": [(0, 8, 41), (1, 10, 42), (1, 12, 43), (1, 14, 43), (2, 18, 45), (3, 22, 47), (3, 29, 47), (4, 35, 50), (6, 43, 54), (8, 53, 55), (9, 63, 60), (11, 72, 64), (12, 83, 66), (14, 92, 70), (15, 102, 74), (18, 118, 76), (21, 131, 82), (24, 146, 86), (25, 166, 87), (23, 180, 87), (25, 195, 85), (32, 213, 92), (72, 230, 103), (133, 241, 121), (186, 246, 134), (223, 250, 155), (237, 251, 171), (246, 252, 189), (250, 255, 208), (251, 254, 229), (253, 254, 247), (254, 254, 252), (255, 255, 255)],
+        "orange": [(0, 3, 39), (4, 3, 38), (10, 6, 39), (17, 5, 35), (24, 5, 34), (34, 6, 32), (48, 6, 32), (62, 8, 31), (77, 9, 27), (93, 12, 22), (109, 13, 20), (125, 17, 19), (141, 20, 15), (157, 24, 15), (170, 28, 13), (186, 39, 9), (203, 48, 6), (216, 60, 3), (233, 75, 3), (245, 93, 1), (254, 109, 0), (255, 124, 0), (254, 139, 0), (254, 152, 0), (255, 167, 0), (255, 178, 2), (254, 193, 28), (255, 207, 66), (255, 218, 103), (254, 230, 149), (254, 243, 190), (253, 251, 217), (254, 255, 231)],
+        "purple": [(1, 4, 41), (3, 3, 43), (7, 4, 47), (13, 3, 53), (20, 4, 61), (26, 4, 69), (37, 3, 79), (46, 3, 90), (57, 4, 103), (72, 3, 114), (83, 3, 126), (96, 4, 139), (113, 4, 147), (128, 5, 159), (144, 5, 171), (163, 6, 183), (190, 6, 194), (213, 11, 204), (231, 22, 213), (241, 39, 212), (250, 63, 204), (252, 92, 193), (254, 121, 179), (254, 149, 167), (255, 173, 160), (254, 192, 159), (254, 207, 164), (255, 222, 175), (255, 231, 188), (254, 240, 203), (255, 246, 216), (253, 252, 228), (253, 255, 233)],
+        "red": [(40, 0, 19), (43, 0, 19), (46, 0, 20), (51, 0, 21), (57, 0, 22), (64, 0, 23), (71, 0, 24), (80, 0, 26), (90, 0, 28), (101, 0, 29), (112, 1, 31), (124, 2, 34), (135, 4, 35), (145, 6, 38), (157, 10, 40), (174, 18, 44), (191, 25, 48), (209, 33, 53), (226, 45, 58), (239, 55, 62), (249, 63, 69), (255, 79, 75), (255, 103, 92), (254, 130, 113), (252, 157, 134), (250, 180, 155), (251, 195, 172), (249, 209, 191), (251, 222, 208), (253, 232, 224), (255, 243, 240), (254, 252, 251), (255, 255, 255)],
+        "yellow": [(1, 3, 39), (4, 5, 40), (9, 7, 41), (20, 10, 41), (27, 11, 42), (37, 16, 42), (52, 19, 45), (68, 24, 47), (84, 28, 48), (100, 33, 50), (118, 40, 53), (137, 48, 55), (152, 56, 55), (168, 64, 58), (181, 75, 61), (197, 92, 66), (209, 114, 67), (220, 134, 72), (233, 163, 75), (241, 191, 75), (250, 212, 72), (254, 226, 58), (254, 233, 33), (255, 238, 11), (254, 243, 0), (255, 246, 1), (254, 248, 23), (255, 252, 58), (255, 253, 100), (254, 254, 145), (255, 255, 186), (253, 255, 217), (254, 254, 231)],
     }
     stops = palette_map.get(color_hint.lower())
     if not stops:
         return None
     width = 256
-    height = 2
+    height = 16
     image = Image.new("RGBA", (width, height))
-    steps = len(stops) - 1
+    positions = list(range(0, width, 8))
+    if positions[-1] != width - 1:
+        positions.append(width - 1)
+    if len(positions) != len(stops):
+        positions = [
+            int(round(float(index) * float(width - 1) / float(max(1, len(stops) - 1))))
+            for index in range(len(stops))
+        ]
+    stop_index = 0
     for x in range(width):
-        t = float(x) / float(max(1, width - 1))
-        pos = t * steps
-        seg = int(min(steps - 1, max(0, int(pos))))
-        local = max(0.0, min(1.0, pos - float(seg)))
-        r0, g0, b0 = stops[seg]
-        r1, g1, b1 = stops[seg + 1]
+        while stop_index + 1 < len(positions) - 1 and x > positions[stop_index + 1]:
+            stop_index += 1
+        next_index = min(stop_index + 1, len(stops) - 1)
+        x0 = positions[stop_index]
+        x1 = positions[next_index]
+        local = 0.0 if x1 == x0 else (float(x) - float(x0)) / float(x1 - x0)
+        local = max(0.0, min(1.0, local))
+        r0, g0, b0 = stops[stop_index]
+        r1, g1, b1 = stops[next_index]
         r = int(round(r0 + (r1 - r0) * local))
         g = int(round(g0 + (g1 - g0) * local))
         b = int(round(b0 + (b1 - b0) * local))
         px = (r, g, b, 255)
-        image.putpixel((x, 0), px)
-        image.putpixel((x, 1), px)
+        for y in range(height):
+            image.putpixel((x, y), px)
     try:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         image.save(output_path)
@@ -2705,14 +3040,14 @@ def _detect_atlas_flip_y(
         if w <= 0 or h <= 0:
             continue
         region = alpha.crop((x, y, x + w, y + h))
-        total_normal += sum(region.getdata())
+        total_normal += sum(region.tobytes())
         y_flip = height - y - h
         if y_flip < 0:
             y_flip = 0
         if y_flip + h > height:
             y_flip = height - h
         region_flip = alpha.crop((x, y_flip, x + w, y_flip + h))
-        total_flipped += sum(region_flip.getdata())
+        total_flipped += sum(region_flip.tobytes())
         count += 1
         if count >= sample_limit:
             break
@@ -2743,7 +3078,7 @@ def _write_atlas_xml(
     has_mesh = False
     if include_mesh:
         for sprite in sprites:
-            sprite_key = Path(sprite["name"]).name
+            sprite_key = _sprite_ref_name(sprite.get("name"))
             mesh_vertices = sprite.get("mesh_vertices") or []
             mesh_uv = sprite.get("mesh_uv") or []
             mesh_triangles = sprite.get("mesh_triangles") or []
@@ -2783,7 +3118,7 @@ def _write_atlas_xml(
         o_y = float(trim.get("y", 0.0) or 0.0)
         o_w = float(trim.get("w", w) or w)
         o_h = float(trim.get("h", h) or h)
-        sprite_name = Path(sprite["name"]).name
+        sprite_name = _sprite_ref_name(sprite.get("name"))
         attrib = {
             "n": sprite_name,
             "x": str(x),
@@ -2798,7 +3133,7 @@ def _write_atlas_xml(
         attrib["oW"] = _fmt_float(o_w)
         attrib["oH"] = _fmt_float(o_h)
         sprite_elem = ET.SubElement(root, "sprite", attrib)
-        sprite_key = sprite_name
+        sprite_key = _sprite_ref_name(sprite.get("name"))
         mesh_vertices = sprite.get("mesh_vertices") or []
         mesh_uv = sprite.get("mesh_uv") or []
         mesh_triangles = sprite.get("mesh_triangles") or []
@@ -2854,7 +3189,7 @@ def _write_atlas_xml(
         '-->',
     ]
 
-    xml_body = ET.tostring(root, encoding="unicode")
+    xml_body = ET.tostring(root, encoding="unicode").replace(" />", "/>")
     xml_text = "\n".join(header_lines) + "\n" + xml_body.strip() + "\n"
     xml_path.parent.mkdir(parents=True, exist_ok=True)
     xml_path.write_text(xml_text, encoding="utf-8")
@@ -3140,6 +3475,7 @@ def _build_anim_json(
     source_name: str = "atlas",
     source_width: int = 0,
     source_height: int = 0,
+    progress_label: Optional[str] = None,
 ) -> Dict[str, Any]:
     global _LAST_LAYER_DEBUG
     _LAST_LAYER_DEBUG = []
@@ -3192,10 +3528,15 @@ def _build_anim_json(
             print(f"Swap anchor report failed: {exc}")
 
     additive_shader_refs = _collect_additive_shader_refs(nodes)
+    total_layer_nodes = sum(1 for node in nodes if node.get("NodeType") == 1)
+    if progress_label:
+        _progress(f"{progress_label}: building {total_layer_nodes} layer node(s).")
+    processed_layer_nodes = 0
     layers: List[Dict[str, Any]] = []
     for node_index, node in enumerate(nodes):
         if node.get("NodeType") != 1:
             continue
+        processed_layer_nodes += 1
         name = node.get("Name", f"Layer_{node_index}")
         offset_info = node.get("OffsetPos", {}) or {}
         try:
@@ -3715,6 +4056,15 @@ def _build_anim_json(
                 depth_value = node_offset_z
         layer_dict["_depth"] = float(depth_value)
         layers.append(layer_dict)
+        if progress_label and (
+            processed_layer_nodes == 1
+            or processed_layer_nodes % 25 == 0
+            or processed_layer_nodes == total_layer_nodes
+        ):
+            _progress(
+                f"{progress_label}: processed {processed_layer_nodes}/"
+                f"{total_layer_nodes} layer node(s)."
+            )
 
     # Convert DOF depth ordering into MSM-style front-to-back layer order.
     layers.sort(key=lambda layer: (-layer.get("_depth", 0.0), layer.get("_order", 0)))
@@ -3737,6 +4087,7 @@ def _build_anim_json(
         "dof_meta": {
             "anim_flip_y": bool(anim_flip_y),
             "sprite_flip_y": bool(sprite_flip_y),
+            "position_scale": float(position_scale),
         },
         "sources": [
             {
@@ -3863,6 +4214,8 @@ def convert_anim(
 ) -> Path:
     global _LAST_SPRITE_DEFS, _LAST_ALPHA_DEBUG
     _LAST_ALPHA_DEBUG = {}
+    _progress(f"starting asset conversion for {anim_path}")
+    _progress("reading ANIMBBB YAML")
     raw_text = anim_path.read_text(encoding="utf-8")
     data = _load_yaml(anim_path, raw_text)
     mono = data.get("MonoBehaviour", {})
@@ -3879,6 +4232,7 @@ def convert_anim(
                 guid = sprite_entry.get("guid")
                 if guid:
                     image_guids.append(guid)
+    _progress(f"found {len(image_guids)} sprite reference GUID(s)")
 
     size = mono.get("size", {}) or {}
     anim_width = int(round(float(size.get("x", 0) or 0)))
@@ -3911,13 +4265,17 @@ def convert_anim(
             sprites_dir = fallback_sprites_dir
         else:
             raise FileNotFoundError(f"Sprite folder not found: {sprites_dir}")
+    _progress(f"using sprite folder: {sprites_dir}")
 
     tpp_path = _find_tpp_asset(sprites_dir)
     if not tpp_path:
         raise FileNotFoundError(f"No .TPP.asset found in {sprites_dir}")
+    _progress(f"using TPP asset: {tpp_path.name}")
 
     tex_guid, alpha_guid, _tpp_sprites = _parse_tpp_asset(tpp_path)
+    _progress("building local GUID map for sprite assets")
     guid_map = _build_guid_map(sprites_dir)
+    _progress(f"local GUID map contains {len(guid_map)} entry(s)")
     fallback_map: Dict[str, Path] = {}
 
     def resolve_guid(guid: Optional[str]) -> Optional[Path]:
@@ -3940,6 +4298,9 @@ def convert_anim(
     alpha_path = resolve_guid(alpha_guid)
     if not texture_path or not texture_path.exists():
         raise FileNotFoundError("Texture PNG not found for TPP asset.")
+    _progress(f"resolved texture PNG: {texture_path.name}")
+    if alpha_path:
+        _progress(f"resolved alpha PNG: {alpha_path.name}")
 
     atlas_base = _strip_suffix(tpp_path.stem, ".TPP")
     output_is_xml_resources = output_dir.name.lower() == "xml_resources"
@@ -3958,6 +4319,7 @@ def convert_anim(
         texture_output = gfx_monsters / atlas_filename
         image_path = f"gfx/monsters/{atlas_filename}"
     sprite_defs: Dict[str, Dict[str, Any]] = {}
+    _progress(f"building atlas PNG: {texture_output}")
     image_size = _build_texture(
         texture_path,
         alpha_path,
@@ -3966,7 +4328,10 @@ def convert_anim(
         premultiply_alpha=premultiply_alpha,
         alpha_hardness=alpha_hardness,
     )
+    _progress(f"wrote atlas PNG {texture_output} ({image_size[0]}x{image_size[1]})")
     image_names: List[str] = []
+    _progress(f"parsing {len(image_guids)} sprite asset(s)")
+    parsed_sprite_count = 0
     for guid in image_guids:
         asset_path = resolve_guid(guid)
         if not asset_path:
@@ -3979,15 +4344,21 @@ def convert_anim(
             False,
             mesh_use_offset,
         )
-        sprite_name = Path(sprite_data["name"]).name
+        sprite_name = _sprite_ref_name(sprite_data.get("name"))
         sprite_defs[sprite_name] = sprite_data
         image_names.append(sprite_name)
+        parsed_sprite_count += 1
+        if parsed_sprite_count == 1 or parsed_sprite_count % 25 == 0 or parsed_sprite_count == len(image_guids):
+            _progress(f"parsed {parsed_sprite_count}/{len(image_guids)} sprite asset(s)")
 
     atlas_flip_y = _detect_atlas_flip_y(texture_output, list(sprite_defs.values()))
+    _progress(f"atlas Y orientation detected as {'flipped' if atlas_flip_y else 'normal'}")
 
     if atlas_flip_y and image_names:
         sprite_defs = {}
         image_names = []
+        _progress("re-parsing sprite assets for flipped atlas coordinates")
+        parsed_sprite_count = 0
         for guid in image_guids:
             asset_path = resolve_guid(guid)
             if not asset_path:
@@ -4000,10 +4371,14 @@ def convert_anim(
                 atlas_flip_y,
                 mesh_use_offset,
             )
-            sprite_name = Path(sprite_data["name"]).name
+            sprite_name = _sprite_ref_name(sprite_data.get("name"))
             sprite_defs[sprite_name] = sprite_data
             image_names.append(sprite_name)
+            parsed_sprite_count += 1
+            if parsed_sprite_count == 1 or parsed_sprite_count % 25 == 0 or parsed_sprite_count == len(image_guids):
+                _progress(f"re-parsed {parsed_sprite_count}/{len(image_guids)} sprite asset(s)")
     _LAST_SPRITE_DEFS = dict(sprite_defs)
+    _progress(f"prepared {len(sprite_defs)} sprite definition(s)")
 
     swap_override_by_index: Dict[int, Tuple[str, str]] = {}
     swap_override_by_name: Dict[str, Tuple[str, str]] = {}
@@ -4086,6 +4461,7 @@ def convert_anim(
             print(f"Swap anchor report failed: {exc}")
 
     hires_value = hires_override if hires_override is not None else output_is_xml_resources
+    _progress(f"writing atlas XML with {len(unique_sprites)} sprite(s): {atlas_xml}")
     _write_atlas_xml(
         atlas_xml,
         image_path,
@@ -4098,6 +4474,7 @@ def convert_anim(
         include_mesh=bool(include_mesh_xml),
     )
 
+    _progress("checking staticinfo shader textures")
     staticinfo_shader_textures = _collect_staticinfo_shader_texture_paths(monster_dir, resolve_guid)
     gradient_texture_output = _copy_shader_texture_for_output(
         staticinfo_shader_textures.get("_Gradient"),
@@ -4107,10 +4484,14 @@ def convert_anim(
     )
 
     additive_shader_refs = _collect_additive_shader_refs(nodes)
+    total_layer_nodes = sum(1 for node in nodes if node.get("NodeType") == 1)
+    _progress(f"building animation JSON from {total_layer_nodes} layer node(s)")
+    processed_layer_nodes = 0
     layers: List[Dict[str, Any]] = []
     for node_index, node in enumerate(nodes):
         if node.get("NodeType") != 1:
             continue
+        processed_layer_nodes += 1
         name = node.get("Name", f"Layer_{node_index}")
         offset_info = node.get("OffsetPos", {}) or {}
         try:
@@ -4560,6 +4941,14 @@ def convert_anim(
         if not shader_name:
             layer_payload.pop("shader", None)
         layers.append(layer_payload)
+        if (
+            processed_layer_nodes == 1
+            or processed_layer_nodes % 25 == 0
+            or processed_layer_nodes == total_layer_nodes
+        ):
+            _progress(
+                f"processed {processed_layer_nodes}/{total_layer_nodes} layer node(s)"
+            )
 
     layers.sort(key=lambda layer: (-layer.get("_depth", 0.0), layer.get("_order", 0)))
     for idx, layer in enumerate(layers):
@@ -4586,8 +4975,22 @@ def convert_anim(
         ],
     }
     gradient_sprite_names = _collect_gradient_shader_sprite_names(payload)
+    mapped_gradient_sprite_names = _collect_gradient_shader_mapped_sprite_names(
+        nodes,
+        node_mappings_raw,
+        image_names,
+        {},
+        resolve_guid,
+    )
+    if mapped_gradient_sprite_names:
+        before_count = len(gradient_sprite_names)
+        gradient_sprite_names.update(mapped_gradient_sprite_names)
+        added_count = len(gradient_sprite_names) - before_count
+        if added_count > 0:
+            print(f"Gradient bake: added {added_count} mapped sprite variant(s).")
     gradient_baked = False
     if gradient_sprite_names and gradient_texture_output:
+        _progress(f"baking gradient-map shader output for {len(gradient_sprite_names)} sprite(s)")
         gradient_baked = _apply_gradient_map_to_sprites(
             texture_output,
             sprite_defs,
@@ -4605,6 +5008,7 @@ def convert_anim(
         if shader_overrides:
             payload["shader_overrides"] = shader_overrides
     output_dir.mkdir(parents=True, exist_ok=True)
+    _progress(f"writing JSON file: {output_json}")
     output_json.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return output_json
 
@@ -4630,6 +5034,8 @@ def convert_anim_bundle(
     swap_anchor_report_override: bool = False,
     swap_anchor_report_override_path: Optional[Path] = None,
     hires_override: Optional[bool] = None,
+    full_alpha_search: bool = False,
+    assets_root: Optional[Path] = None,
 ) -> Path:
     global _LAST_SPRITE_DEFS, _LAST_ALPHA_DEBUG
     if UnityPy is None:
@@ -4639,23 +5045,32 @@ def convert_anim_bundle(
     target_name = anim_name
     if not target_name.lower().endswith(".animbbb"):
         target_name = f"{target_name}.ANIMBBB"
+    _progress(f"starting bundle conversion for {target_name}")
+    _progress(f"bundle root: {bundle_root}")
     anim_obj = None
     anim_data = None
     env = None
+    anim_bundle_path: Optional[Path] = None
 
     cached_bundle = _load_bundle_path_from_cache(bundle_root, target_name)
     bundle_paths: List[Path] = []
     if cached_bundle:
         # Fast path: try the known bundle first and avoid scanning the whole tree.
+        _progress(f"using cached bundle candidate: {cached_bundle}")
         bundle_paths = [cached_bundle]
     else:
+        _progress("searching Unity bundle files under the bundle root")
         bundle_paths = _resolve_bundle_paths(bundle_root)
         if not bundle_paths:
             raise FileNotFoundError(f"No Unity bundles found under: {bundle_root}")
+        _progress(f"found {len(bundle_paths)} Unity bundle file(s) to scan")
 
     def _scan_paths(paths: List[Path]) -> bool:
-        nonlocal env, anim_obj, anim_data
-        for bundle_path in paths:
+        nonlocal env, anim_obj, anim_data, anim_bundle_path
+        total_paths = len(paths)
+        for scan_index, bundle_path in enumerate(paths, start=1):
+            if total_paths <= 20 or scan_index <= 3 or scan_index % 10 == 0 or scan_index == total_paths:
+                _progress(f"scanning bundle {scan_index}/{total_paths}: {bundle_path.name}")
             try:
                 env = UnityPy.load(str(bundle_path))
             except Exception:
@@ -4671,7 +5086,9 @@ def convert_anim_bundle(
                 if name == target_name or name.endswith(target_name):
                     anim_obj = obj
                     anim_data = data
+                    anim_bundle_path = bundle_path
                     _update_bundle_path_cache(bundle_root, target_name, bundle_path)
+                    _progress(f"found {target_name} in {bundle_path}")
                     return True
         return False
 
@@ -4679,9 +5096,11 @@ def convert_anim_bundle(
         found = _scan_paths(bundle_paths)
     else:
         bundle_paths = _prioritize_bundle_paths_for_anim(bundle_paths, target_name)
+        _progress("prioritized likely bundle candidates")
         found = _scan_paths(bundle_paths)
     if not found and cached_bundle:
         # Cache miss/stale entry: fall back to full scan and keep behavior robust.
+        _progress("cached bundle did not contain the animation; falling back to full bundle scan")
         full_paths = _resolve_bundle_paths(bundle_root)
         if not full_paths:
             raise FileNotFoundError(f"No Unity bundles found under: {bundle_root}")
@@ -4691,6 +5110,7 @@ def convert_anim_bundle(
         found = _scan_paths(full_paths)
     if anim_obj is None or anim_data is None:
         raise FileNotFoundError(f"ANIMBBB not found in bundles: {target_name}")
+    _progress("reading animation typetree and sprite references")
 
     def _extract_anim_image_payload(
         source_anim_data: Any,
@@ -4734,7 +5154,7 @@ def convert_anim_bundle(
                 sprite_obj, None, sprite_flip_y, False, mesh_use_offset
             )
             sprite_data["offset_anchor_mode"] = "pivot_offset"
-            sprite_name = Path(sprite_data["name"]).name
+            sprite_name = _sprite_ref_name(sprite_data.get("name"))
             local_sprite_defs[sprite_name] = sprite_data
             local_image_names.append(sprite_name)
         return (
@@ -4756,12 +5176,18 @@ def convert_anim_bundle(
         alpha_candidates,
         unresolved_sprite_refs,
     ) = _extract_anim_image_payload(anim_data)
+    _progress(
+        f"resolved {len(image_names)} image reference(s), "
+        f"{len(sprite_defs)} sprite definition(s), "
+        f"{unresolved_sprite_refs} unresolved sprite reference(s)"
+    )
     alpha_candidate_scores: List[Dict[str, Any]] = []
     alpha_selected_flip_x = False
     alpha_selected_flip_y = False
     alpha_channel_override = None
 
     if texture_obj is None:
+        _progress("texture was not resolved from the bundle; trying folder-wide external references")
         # Some structure animations (e.g. str_breeder_*) live in prefabs bundles
         # and reference Sprite objects in sibling bundles via external file IDs.
         # A single-file UnityPy load cannot always dereference those pointers.
@@ -4805,20 +5231,66 @@ def convert_anim_bundle(
                             f"Bundle external-ref fallback: resolved {target_name} "
                             f"via folder context ({unresolved_sprite_refs} unresolved refs remain)."
                         )
+                        _progress(
+                            f"folder context resolved {len(sprite_defs)} sprite definition(s)"
+                        )
 
     _LAST_SPRITE_DEFS = dict(sprite_defs)
 
     if texture_obj is None:
         raise FileNotFoundError("Texture not found for bundle animation.")
     if alpha_obj is None and alpha_candidates:
+        _progress(f"searching for alpha texture candidates: {', '.join(alpha_candidates[:6])}")
         alpha_options: List[Any] = []
         alpha_options.extend(_find_textures_in_env(env, alpha_candidates))
-        if bundle_root:
-            for tex in _find_textures_in_bundles(bundle_root, alpha_candidates):
+        if alpha_options:
+            _progress(f"found {len(alpha_options)} alpha texture candidate(s) in the selected bundle")
+        if bundle_root and not alpha_options:
+            alpha_search_paths: List[Path] = []
+            cached_alpha_bundle = _load_texture_bundle_path_from_cache(bundle_root, alpha_candidates)
+            if cached_alpha_bundle:
+                _progress(f"using cached alpha texture bundle: {cached_alpha_bundle}")
+                alpha_search_paths = [cached_alpha_bundle]
+            else:
+                alpha_search_paths = _likely_texture_bundle_paths(
+                    bundle_paths,
+                    alpha_candidates,
+                    anim_bundle_path,
+                )
+                if alpha_search_paths:
+                    _progress(
+                        f"checking {len(alpha_search_paths)} likely alpha bundle(s); "
+                        "skipping unrelated bundles"
+                    )
+            for tex, source_bundle in _find_textures_in_bundles(
+                bundle_root,
+                alpha_candidates,
+                bundle_paths=alpha_search_paths,
+                discover_paths=False,
+            ):
                 name = (getattr(tex, "m_Name", "") or "").lower()
                 if name and all((getattr(existing, "m_Name", "") or "").lower() != name for existing in alpha_options):
                     alpha_options.append(tex)
+                    _update_texture_bundle_path_cache(bundle_root, alpha_candidates, source_bundle)
+            if not alpha_options and full_alpha_search:
+                _progress("likely alpha search failed; running explicit full alpha bundle scan")
+                for tex, source_bundle in _find_textures_in_bundles(
+                    bundle_root,
+                    alpha_candidates,
+                    bundle_paths=None,
+                    discover_paths=True,
+                ):
+                    name = (getattr(tex, "m_Name", "") or "").lower()
+                    if name and all((getattr(existing, "m_Name", "") or "").lower() != name for existing in alpha_options):
+                        alpha_options.append(tex)
+                        _update_texture_bundle_path_cache(bundle_root, alpha_candidates, source_bundle)
+            elif not alpha_options:
+                _progress(
+                    "no alpha texture found in selected or likely bundles; "
+                    "skipping full alpha scan"
+                )
         if alpha_options:
+            _progress(f"scoring {len(alpha_options)} alpha texture candidate(s)")
             base_size = texture_obj.image.size if getattr(texture_obj, "image", None) is not None else (0, 0)
             scored: List[Tuple[float, bool, bool, Any, Any]] = []
             for option in alpha_options:
@@ -4936,6 +5408,12 @@ def convert_anim_bundle(
         gfx_monsters.mkdir(parents=True, exist_ok=True)
         texture_output = gfx_monsters / atlas_filename
         image_path = f"gfx/monsters/{atlas_filename}"
+    texture_name = getattr(texture_obj, "m_Name", "") or Path(texture_output).stem
+    alpha_name = getattr(alpha_obj, "m_Name", "") if alpha_obj is not None else ""
+    if alpha_name:
+        _progress(f"building atlas PNG from texture {texture_name} with alpha {alpha_name}")
+    else:
+        _progress(f"building atlas PNG from texture {texture_name}")
     image_size = _build_texture_from_unitypy(
         texture_obj,
         alpha_obj,
@@ -4947,12 +5425,15 @@ def convert_anim_bundle(
         premultiply_alpha=premultiply_alpha,
         alpha_hardness=alpha_hardness,
     )
+    _progress(f"wrote atlas PNG {texture_output} ({image_size[0]}x{image_size[1]})")
     atlas_flip_y = _detect_atlas_flip_y(texture_output, list(sprite_defs.values()))
+    _progress(f"atlas Y orientation detected as {'flipped' if atlas_flip_y else 'normal'}")
 
     # Re-parse sprites now that atlas size is known.
     images = getattr(anim_data, "Images", None) or []
     sprite_defs = {}
     image_names = []
+    _progress(f"parsing {len(images)} sprite reference(s) with final atlas dimensions")
     for image in images:
         sprite_ptr = getattr(image, "sprite", None)
         if sprite_ptr is None:
@@ -4969,10 +5450,11 @@ def convert_anim_bundle(
             sprite_obj, image_size, sprite_flip_y, atlas_flip_y, mesh_use_offset
         )
         sprite_data["offset_anchor_mode"] = "pivot_offset"
-        sprite_name = Path(sprite_data["name"]).name
+        sprite_name = _sprite_ref_name(sprite_data.get("name"))
         sprite_defs[sprite_name] = sprite_data
         image_names.append(sprite_name)
     _LAST_SPRITE_DEFS = dict(sprite_defs)
+    _progress(f"parsed {len(sprite_defs)} final sprite definition(s)")
     _LAST_ALPHA_DEBUG = {}
     if alpha_obj is not None and getattr(alpha_obj, "image", None) is not None:
         chosen_alpha_name = getattr(alpha_obj, "m_Name", "") or ""
@@ -5016,9 +5498,18 @@ def convert_anim_bundle(
     nodes = mono.get("Nodes", []) or []
     particle_nodes = mono.get("ParticleNodes", []) or []
     properties = mono.get("Properties", {}) or {}
+    _progress(
+        f"preparing animation data from {len(nodes)} node(s) and "
+        f"{len(particle_nodes)} particle node(s)"
+    )
     bundle_shader_ref_name_overrides = _build_bundle_shader_ref_name_overrides(
         nodes,
         anim_name_out,
+        node_mappings_raw,
+        image_names,
+        sprite_defs,
+        texture_output,
+        atlas_flip_y,
     )
     if bundle_shader_ref_name_overrides:
         print(
@@ -5030,6 +5521,7 @@ def convert_anim_bundle(
         )
 
     hires_value = hires_override if hires_override is not None else output_is_xml_resources
+    _progress(f"writing atlas XML with {len(sprite_defs)} sprite(s): {atlas_xml}")
     _write_atlas_xml(
         atlas_xml,
         image_path,
@@ -5042,6 +5534,7 @@ def convert_anim_bundle(
         include_mesh=bool(include_mesh_xml),
     )
 
+    _progress("building viewer animation JSON")
     anim_json = _build_anim_json(
         anim_name_out,
         anim_width,
@@ -5075,17 +5568,34 @@ def convert_anim_bundle(
         atlas_xml.name,
         0,
         0,
+        "animation JSON",
     )
 
+    _progress("checking gradient-map shader assets")
     gradient_texture_output = _resolve_bundle_gradient_texture_output(
         env,
         bundle_root,
         anim_name_out,
         output_dir,
+        assets_root,
     )
     gradient_sprite_names = _collect_gradient_shader_sprite_names(anim_json)
+    mapped_gradient_sprite_names = _collect_gradient_shader_mapped_sprite_names(
+        nodes,
+        node_mappings_raw,
+        image_names,
+        bundle_shader_ref_name_overrides,
+        None,
+    )
+    if mapped_gradient_sprite_names:
+        before_count = len(gradient_sprite_names)
+        gradient_sprite_names.update(mapped_gradient_sprite_names)
+        added_count = len(gradient_sprite_names) - before_count
+        if added_count > 0:
+            print(f"Gradient bake: added {added_count} mapped sprite variant(s).")
     gradient_baked = False
     if gradient_sprite_names and gradient_texture_output:
+        _progress(f"baking gradient-map shader output for {len(gradient_sprite_names)} sprite(s)")
         gradient_baked = _apply_gradient_map_to_sprites(
             texture_output,
             sprite_defs,
@@ -5105,6 +5615,7 @@ def convert_anim_bundle(
 
     output_json = output_dir / f"{anim_name_out}.json"
     output_json.parent.mkdir(parents=True, exist_ok=True)
+    _progress(f"writing JSON file: {output_json}")
     output_json.write_text(json.dumps(anim_json, ensure_ascii=True, indent=2), encoding="utf-8")
     return output_json
 
@@ -5120,8 +5631,11 @@ def _iter_anim_assets(path: Path) -> Iterable[Path]:
 def _resolve_bundle_paths(bundle_root: Path) -> List[Path]:
     if bundle_root.is_file():
         return [bundle_root]
+    _progress(f"walking bundle root for Unity bundle files: {bundle_root}")
     bundle_paths: List[Path] = []
+    scanned_dirs = 0
     for root, _, files in os.walk(bundle_root):
+        scanned_dirs += 1
         candidates: List[Path] = []
         if "__data" in files:
             candidates.append(Path(root) / "__data")
@@ -5136,6 +5650,12 @@ def _resolve_bundle_paths(bundle_root: Path) -> List[Path]:
                 continue
             if magic.startswith((b"UnityFS", b"UnityRaw", b"UnityWeb")):
                 bundle_paths.append(candidate)
+        if scanned_dirs == 1 or scanned_dirs % 250 == 0:
+            _progress(
+                f"walked {scanned_dirs} folder(s); "
+                f"found {len(bundle_paths)} Unity bundle file(s)"
+            )
+    _progress(f"bundle discovery found {len(bundle_paths)} Unity bundle file(s)")
     return bundle_paths
 
 
@@ -5185,6 +5705,62 @@ def _update_bundle_path_cache(bundle_root: Path, anim_name: str, bundle_path: Pa
     bundle_map[anim_name.lower()] = bundle_path_str
     payload["bundle_map"] = bundle_map
     payload["root"] = str(bundle_root.resolve())
+    try:
+        output_root.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _load_texture_bundle_path_from_cache(
+    bundle_root: Path,
+    texture_names: List[str],
+) -> Optional[Path]:
+    output_root = bundle_root / "Output"
+    cache_path = output_root / "_bundle_index.json"
+    if not cache_path.exists():
+        return None
+    try:
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    texture_map = payload.get("texture_bundle_map", {})
+    if not isinstance(texture_map, dict):
+        return None
+    for name in texture_names:
+        key = str(name or "").lower()
+        if not key:
+            continue
+        entry = texture_map.get(key)
+        if not isinstance(entry, str):
+            continue
+        path = Path(entry)
+        if path.exists():
+            return path
+    return None
+
+
+def _update_texture_bundle_path_cache(
+    bundle_root: Path,
+    texture_names: List[str],
+    bundle_path: Path,
+) -> None:
+    output_root = bundle_root / "Output"
+    cache_path = output_root / "_bundle_index.json"
+    payload: Dict[str, Any] = {}
+    if cache_path.exists():
+        try:
+            payload = json.loads(cache_path.read_text(encoding="utf-8"))
+        except Exception:
+            payload = {}
+    texture_map = payload.get("texture_bundle_map")
+    if not isinstance(texture_map, dict):
+        texture_map = {}
+    for name in texture_names:
+        key = str(name or "").lower()
+        if key:
+            texture_map[key] = str(bundle_path)
+    payload["texture_bundle_map"] = texture_map
     try:
         output_root.mkdir(parents=True, exist_ok=True)
         cache_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -5247,6 +5823,82 @@ def _alpha_name_candidates(base_name: str) -> List[str]:
     return candidates
 
 
+def _likely_texture_bundle_paths(
+    bundle_paths: List[Path],
+    name_candidates: List[str],
+    context_bundle: Optional[Path] = None,
+    limit: int = 16,
+) -> List[Path]:
+    if not bundle_paths or not name_candidates:
+        return []
+
+    full_terms = {
+        str(name or "").strip().lower()
+        for name in name_candidates
+        if str(name or "").strip()
+    }
+    compact_terms = {term.replace("_", "").replace("-", "") for term in full_terms}
+    base_terms: set[str] = set()
+    for term in full_terms:
+        for marker in (
+            "_alphatexture",
+            "_alpha_texture",
+            "_alphatex",
+            "_alpha_tex",
+            "_alpha",
+            "alphatexture",
+            "alphatex",
+            "alpha",
+        ):
+            idx = term.find(marker)
+            if idx > 0:
+                base_terms.add(term[:idx])
+    base_terms = {term for term in base_terms if len(term) >= 5}
+    context_parent = None
+    try:
+        context_parent = context_bundle.parent.resolve() if context_bundle else None
+    except Exception:
+        context_parent = context_bundle.parent if context_bundle else None
+
+    scored: List[Tuple[int, Path]] = []
+    seen: set[str] = set()
+    for path in bundle_paths:
+        try:
+            resolved_key = str(path.resolve())
+        except Exception:
+            resolved_key = str(path)
+        if resolved_key in seen:
+            continue
+        seen.add(resolved_key)
+        text = str(path).replace("\\", "/").lower()
+        compact_text = text.replace("_", "").replace("-", "")
+        score = 0
+        if any(term and term in text for term in full_terms):
+            score += 100
+        if any(term and term in compact_text for term in compact_terms):
+            score += 80
+        has_alpha_hint = "alpha" in text or "alphatex" in text or "alphatexture" in text
+        for base in base_terms:
+            if base in text:
+                score += 45 if has_alpha_hint else 25
+            elif base.replace("_", "").replace("-", "") in compact_text:
+                score += 35 if has_alpha_hint else 20
+        if has_alpha_hint:
+            score += 5
+        if context_parent is not None:
+            try:
+                if path.parent.resolve() == context_parent:
+                    score += 5
+            except Exception:
+                if path.parent == context_parent:
+                    score += 5
+        if score >= 25:
+            scored.append((score, path))
+
+    scored.sort(key=lambda item: (-item[0], str(item[1]).lower()))
+    return [path for _, path in scored[:max(1, limit)]]
+
+
 def _find_texture_in_env(env: Any, name_candidates: List[str]) -> Optional[Any]:
     if not env or not name_candidates:
         return None
@@ -5291,31 +5943,48 @@ def _find_textures_in_env(env: Any, name_candidates: List[str]) -> List[Any]:
 def _find_texture_in_bundles(
     bundle_root: Path,
     name_candidates: List[str],
-) -> Optional[Any]:
+    bundle_paths: Optional[List[Path]] = None,
+    discover_paths: bool = True,
+) -> Optional[Tuple[Any, Path]]:
     if UnityPy is None or not name_candidates:
         return None
-    bundle_paths = _resolve_bundle_paths(bundle_root)
-    for bundle_path in bundle_paths:
+    if bundle_paths is None:
+        if not discover_paths:
+            return None
+        bundle_paths = _resolve_bundle_paths(bundle_root)
+    _progress(f"searching {len(bundle_paths)} candidate bundle(s) for alpha/texture candidates")
+    for scan_index, bundle_path in enumerate(bundle_paths, start=1):
+        if len(bundle_paths) <= 20 or scan_index <= 3 or scan_index % 10 == 0 or scan_index == len(bundle_paths):
+            _progress(f"checking texture bundle {scan_index}/{len(bundle_paths)}: {bundle_path.name}")
         try:
             env = UnityPy.load(str(bundle_path))
         except Exception:
             continue
         tex = _find_texture_in_env(env, name_candidates)
         if tex is not None:
-            return tex
+            _progress(f"found texture candidate in bundle: {bundle_path.name}")
+            return tex, bundle_path
     return None
 
 
 def _find_textures_in_bundles(
     bundle_root: Path,
     name_candidates: List[str],
-) -> List[Any]:
+    bundle_paths: Optional[List[Path]] = None,
+    discover_paths: bool = True,
+) -> List[Tuple[Any, Path]]:
     if UnityPy is None or not name_candidates:
         return []
-    found: List[Any] = []
+    found: List[Tuple[Any, Path]] = []
     seen: set[str] = set()
-    bundle_paths = _resolve_bundle_paths(bundle_root)
-    for bundle_path in bundle_paths:
+    if bundle_paths is None:
+        if not discover_paths:
+            return []
+        bundle_paths = _resolve_bundle_paths(bundle_root)
+    _progress(f"searching {len(bundle_paths)} candidate bundle(s) for alpha texture candidates")
+    for scan_index, bundle_path in enumerate(bundle_paths, start=1):
+        if len(bundle_paths) <= 20 or scan_index <= 3 or scan_index % 10 == 0 or scan_index == len(bundle_paths):
+            _progress(f"checking alpha bundle {scan_index}/{len(bundle_paths)}: {bundle_path.name}")
         try:
             env = UnityPy.load(str(bundle_path))
         except Exception:
@@ -5323,8 +5992,9 @@ def _find_textures_in_bundles(
         for tex in _find_textures_in_env(env, name_candidates):
             name = (getattr(tex, "m_Name", "") or "").lower()
             if name and name not in seen:
-                found.append(tex)
+                found.append((tex, bundle_path))
                 seen.add(name)
+                _progress(f"found alpha texture candidate: {name}")
     return found
 
 
@@ -5570,6 +6240,15 @@ def main() -> int:
         help="ANIMBBB name to extract from bundles (e.g. Foo.ANIMBBB).",
     )
     parser.add_argument(
+        "--full-alpha-search",
+        dest="full_alpha_search",
+        action="store_true",
+        help=(
+            "If selected/likely bundles do not contain a split alpha texture, "
+            "scan every bundle under --bundle-root. Slower; off by default."
+        ),
+    )
+    parser.add_argument(
         "--position-scale",
         type=float,
         default=2.0,
@@ -5756,6 +6435,7 @@ def main() -> int:
         dof_anchor_center=False,
         dof_debug_report=False,
         hires_xml=None,
+        full_alpha_search=False,
     )
 
     args = parser.parse_args()
@@ -5820,6 +6500,8 @@ def main() -> int:
                 swap_anchor_report_override,
                 override_path,
                 hires_override,
+                bool(args.full_alpha_search),
+                assets_root,
             )
             converted.append(output_json)
             print(f"Converted: {output_json}")

@@ -15,9 +15,11 @@ from PyQt6.QtCore import Qt, pyqtSignal, QSize, QTimer, QPropertyAnimation, QEas
 from PyQt6.QtGui import QPixmap, QColor, QPainter
 from typing import Any, Dict, List, Tuple, Optional
 
+from utils.ui_scaling import clamp_ui_scale, scale_float, scale_int
+
 
 class FullscreenSafeComboBox(QComboBox):
-    """ComboBox whose popup stays visible when the main window is fullscreen."""
+    """ComboBox with a stable list view."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -26,16 +28,7 @@ class FullscreenSafeComboBox(QComboBox):
         self.setView(view)
 
     def showPopup(self):
-        view = self.view()
-        popup = view.window()
-        desired_flags = popup.windowFlags() | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool
-        if popup.windowFlags() != desired_flags:
-            popup.setWindowFlags(desired_flags)
-            popup.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, False)
         super().showPopup()
-        popup.raise_()
-        popup.activateWindow()
-        view.setFocus(Qt.FocusReason.PopupFocusReason)
 
 
 class MetronomeBeatIndicator(QWidget):
@@ -54,6 +47,13 @@ class MetronomeBeatIndicator(QWidget):
         self._pulse_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
         self.setFixedSize(24, 24)
         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+
+    def set_ui_scale_factor(self, factor: float) -> None:
+        scale = clamp_ui_scale(factor)
+        self._base_diameter = 12.0 * scale
+        size = scale_int(24, scale)
+        self.setFixedSize(size, size)
+        self.update()
 
     def getPulseScale(self) -> float:
         return float(self._pulse_scale)
@@ -96,6 +96,7 @@ class ControlPanel(QWidget):
     bin_selected = pyqtSignal(int)
     convert_bin_clicked = pyqtSignal()
     convert_dof_clicked = pyqtSignal()
+    convert_dof_rev6_clicked = pyqtSignal()
     dof_asset_grabber_clicked = pyqtSignal()
     refresh_files_clicked = pyqtSignal()
     animation_selected = pyqtSignal(int)
@@ -119,6 +120,7 @@ class ControlPanel(QWidget):
     export_mp4_clicked = pyqtSignal()
     export_webm_clicked = pyqtSignal()
     export_gif_clicked = pyqtSignal()
+    export_all_animations_changed = pyqtSignal(bool)
     export_layer_pass_auto_assign_requested = pyqtSignal()
     export_layer_pass_auto_strict_requested = pyqtSignal()
     export_layer_pass_auto_blend_requested = pyqtSignal()
@@ -173,6 +175,7 @@ class ControlPanel(QWidget):
     diagnostics_enabled_changed = pyqtSignal(bool)
     diagnostics_refresh_requested = pyqtSignal()
     diagnostics_export_requested = pyqtSignal()
+    barebones_file_mode_changed = pyqtSignal(bool)
     pose_record_clicked = pyqtSignal()
     pose_mode_changed = pyqtSignal(str)
     pose_reset_clicked = pyqtSignal()
@@ -198,6 +201,11 @@ class ControlPanel(QWidget):
     viewport_bg_parallax_pan_strength_changed = pyqtSignal(float)
     viewport_bg_color_mode_changed = pyqtSignal(str)
     export_include_viewport_bg_changed = pyqtSignal(bool)
+    spatial3d_enabled_changed = pyqtSignal(bool)
+    spatial3d_depth_changed = pyqtSignal(float)
+    spatial3d_screen_plane_changed = pyqtSignal(float)
+    spatial3d_view_changed = pyqtSignal(float, float)
+    spatial3d_swap_eyes_changed = pyqtSignal(bool)
     sprite_assign_clicked = pyqtSignal()
     constraints_enabled_changed = pyqtSignal(bool)
     constraint_item_toggled = pyqtSignal(str, bool)
@@ -222,11 +230,16 @@ class ControlPanel(QWidget):
         super().__init__(parent)
         self._bin_convert_label = "Convert BIN to JSON"
         self._dof_convert_label = "Convert DOF to JSON"
+        self._dof_rev6_convert_label = "Convert DOF to Rev6 Package"
         self._bin_convert_active = False
         self._dof_convert_active = False
         self._bin_convert_busy_label_override: Optional[str] = None
         self._dof_convert_busy_label_override: Optional[str] = None
         self._convert_anim_index = 0
+        self._spatial3d_available = False
+        self._spatial3d_view_x = 0.0
+        self._spatial3d_view_y = 0.0
+        self._spatial3d_view_step = 0.1
         self._convert_anim_timer = QTimer(self)
         self._convert_anim_timer.setInterval(350)
         self._convert_anim_timer.timeout.connect(self._on_convert_anim_tick)
@@ -261,19 +274,25 @@ class ControlPanel(QWidget):
         self.section_mode_stack.addWidget(self.section_tabs)
         self.section_mode_stack.addWidget(self.simple_mode_scroll)
 
-        self.init_ui()
         self._updating_constraints_list = False
         self._compact_ui_enabled = False
         self._simple_mode_enabled = False
+        self._basic_viewer_mode_enabled = False
+        self._ui_scale_factor = 1.0
         self._simple_mode_mounted = False
         self._export_layer_pass_rows: Dict[int, Dict[str, Any]] = {}
+        self._basic_viewer_allowed_sections = {"files", "animation", "export"}
+        self._basic_viewer_hidden_widgets: List[QWidget] = []
+        self.init_ui()
 
         # Set up the main layout
         container_layout = QVBoxLayout(self)
         container_layout.setContentsMargins(0, 0, 0, 0)
         container_layout.addWidget(self.section_mode_stack, stretch=1)
-        self._preferred_width = 440
-        self._max_width = 600
+        self._base_preferred_width = 440
+        self._base_max_width = 600
+        self._preferred_width = self._base_preferred_width
+        self._max_width = self._base_max_width
         size_policy = QSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
         self.setSizePolicy(size_policy)
         self.setMaximumWidth(self._max_width)
@@ -310,6 +329,7 @@ class ControlPanel(QWidget):
             ("Animation", "animation"),
             ("Playback", "playback"),
             ("Viewport", "viewport"),
+            ("3D", "spatial3d"),
             ("Audio", "audio"),
             ("Sprites", "sprites"),
             ("Terrain", "terrain"),
@@ -359,6 +379,9 @@ class ControlPanel(QWidget):
                 QSizePolicy.Policy.Ignored,
                 QSizePolicy.Policy.Preferred,
             )
+            if entry.get("key") == "spatial3d" and not self._spatial3d_available:
+                heading.setVisible(False)
+                content.setVisible(False)
             entry["simple_heading"] = heading
             self.simple_mode_layout.addWidget(heading)
             self.simple_mode_layout.addWidget(content)
@@ -411,6 +434,7 @@ class ControlPanel(QWidget):
         animation_section = self._section_layouts["animation"]
         playback_section = self._section_layouts["playback"]
         viewport_section = self._section_layouts["viewport"]
+        spatial3d_section = self._section_layouts["spatial3d"]
         audio_section = self._section_layouts["audio"]
         sprites_section = self._section_layouts["sprites"]
         terrain_section = self._section_layouts["terrain"]
@@ -420,7 +444,15 @@ class ControlPanel(QWidget):
 
         # File selection
         file_group = QGroupBox("File Selection")
+        self.file_group = file_group
         file_layout = QVBoxLayout()
+
+        self.barebones_file_mode_check = QCheckBox("Barebones search for BIN/JSON files")
+        self.barebones_file_mode_check.setToolTip(
+            "Enable the classic text list. Disable to use the Monster Browser grid with portraits."
+        )
+        self.barebones_file_mode_check.toggled.connect(self.barebones_file_mode_changed.emit)
+        file_layout.addWidget(self.barebones_file_mode_check)
 
         self.barebones_container = QWidget()
         barebones_layout = QVBoxLayout(self.barebones_container)
@@ -461,6 +493,14 @@ class ControlPanel(QWidget):
         self.convert_dof_btn = QPushButton(self._dof_convert_label)
         self.convert_dof_btn.clicked.connect(self.convert_dof_clicked.emit)
         barebones_layout.addWidget(self.convert_dof_btn)
+
+        self.convert_dof_rev6_btn = QPushButton(self._dof_rev6_convert_label)
+        self.convert_dof_rev6_btn.setToolTip(
+            "Create a rev6-ready data package from the selected DOF animation. "
+            "Atlas mesh polygon data is omitted for game compatibility."
+        )
+        self.convert_dof_rev6_btn.clicked.connect(self.convert_dof_rev6_clicked.emit)
+        barebones_layout.addWidget(self.convert_dof_rev6_btn)
 
         self.dof_asset_grabber_btn = QPushButton("Dawn of Fire Asset Grabber")
         self.dof_asset_grabber_btn.setToolTip(
@@ -517,6 +557,18 @@ class ControlPanel(QWidget):
             "Use an existing swap-anchor report JSON to override per-node modes."
         )
         barebones_layout.addWidget(self.dof_swap_anchor_report_override_checkbox)
+        self._basic_viewer_hidden_widgets.extend(
+            [
+                self.dof_asset_grabber_btn,
+                self.dof_mesh_pivot_checkbox,
+                self.dof_include_mesh_xml_checkbox,
+                self.dof_premultiply_alpha_checkbox,
+                self.dof_swap_anchor_report_checkbox,
+                self.dof_swap_anchor_edge_align_checkbox,
+                self.dof_swap_anchor_pivot_offset_checkbox,
+                self.dof_swap_anchor_report_override_checkbox,
+            ]
+        )
         
         refresh_btn = QPushButton("Refresh File List")
         refresh_btn.clicked.connect(self.refresh_files_clicked.emit)
@@ -547,6 +599,7 @@ class ControlPanel(QWidget):
         
         # Animation selection
         anim_group = QGroupBox("Animation")
+        self.anim_group = anim_group
         anim_layout = QVBoxLayout()
         
         self.anim_combo = FullscreenSafeComboBox()
@@ -562,7 +615,9 @@ class ControlPanel(QWidget):
         self.costume_convert_btn.clicked.connect(self.costume_convert_clicked.emit)
         anim_layout.addWidget(self.costume_convert_btn)
 
-        pose_row = QHBoxLayout()
+        self.pose_controls_container = QWidget()
+        pose_row = QHBoxLayout(self.pose_controls_container)
+        pose_row.setContentsMargins(0, 0, 0, 0)
         pose_row.setSpacing(6)
         pose_row.addWidget(QLabel("Pose Influence:"))
         self.pose_mode_combo = FullscreenSafeComboBox()
@@ -576,7 +631,7 @@ class ControlPanel(QWidget):
         self.record_pose_btn.setToolTip("Bake current gizmo offsets into animation keyframes")
         self.record_pose_btn.clicked.connect(self.pose_record_clicked.emit)
         pose_row.addWidget(self.record_pose_btn)
-        anim_layout.addLayout(pose_row)
+        anim_layout.addWidget(self.pose_controls_container)
 
         self.preserve_children_on_record_checkbox = QCheckBox("Follow Parent When Recording")
         self.preserve_children_on_record_checkbox.setToolTip(
@@ -597,7 +652,9 @@ class ControlPanel(QWidget):
         )
         anim_layout.addWidget(self.simple_keyframe_mode_checkbox)
 
-        pose_actions = QGridLayout()
+        self.pose_actions_container = QWidget()
+        pose_actions = QGridLayout(self.pose_actions_container)
+        pose_actions.setContentsMargins(0, 0, 0, 0)
         pose_actions.setHorizontalSpacing(6)
         pose_actions.setVerticalSpacing(6)
         self.reset_pose_btn = QPushButton("Reset Pose")
@@ -636,13 +693,23 @@ class ControlPanel(QWidget):
         self.export_bin_btn.clicked.connect(self.export_animation_bin_clicked.emit)
         io_row.addWidget(self.export_bin_btn, 1, 0, 1, 2)
         anim_layout.addLayout(io_row)
-        anim_layout.addLayout(pose_actions)
+        anim_layout.addWidget(self.pose_actions_container)
+        self._basic_viewer_hidden_widgets.extend(
+            [
+                self.costume_convert_btn,
+                self.pose_controls_container,
+                self.preserve_children_on_record_checkbox,
+                self.simple_keyframe_mode_checkbox,
+                self.pose_actions_container,
+            ]
+        )
         
         anim_group.setLayout(anim_layout)
         animation_section.addWidget(anim_group)
         self.update_costume_options([])
 
         gizmo_toggle_group = QGroupBox("Gizmo Overlays")
+        self.gizmo_toggle_group = gizmo_toggle_group
         gizmo_toggle_layout = QHBoxLayout()
         gizmo_toggle_layout.setSpacing(8)
         self.rotation_gizmo_checkbox = QCheckBox("Rotation")
@@ -1581,8 +1648,101 @@ class ControlPanel(QWidget):
         viewport_bg_group.setLayout(viewport_bg_layout)
         viewport_section.addWidget(viewport_bg_group)
 
+        spatial3d_group = QGroupBox("Stereoscopic 3D")
+        spatial3d_layout = QVBoxLayout()
+
+        self.spatial3d_enable_checkbox = QCheckBox("Enable 3D View")
+        self.spatial3d_enable_checkbox.toggled.connect(self._on_spatial3d_enabled_toggled)
+        spatial3d_layout.addWidget(self.spatial3d_enable_checkbox)
+
+        self.spatial3d_swap_eyes_checkbox = QCheckBox("Swap left/right eyes")
+        self.spatial3d_swap_eyes_checkbox.setToolTip("Reverse stereo polarity for the live 3D viewport.")
+        self.spatial3d_swap_eyes_checkbox.toggled.connect(self._on_spatial3d_swap_eyes_toggled)
+        spatial3d_layout.addWidget(self.spatial3d_swap_eyes_checkbox)
+
+        self.spatial3d_status_label = QLabel("Stereoscopic 3D disabled")
+        self.spatial3d_status_label.setWordWrap(True)
+        self.spatial3d_status_label.setStyleSheet("color: gray; font-size: 8pt;")
+        spatial3d_layout.addWidget(self.spatial3d_status_label)
+
+        depth_row = QHBoxLayout()
+        depth_row.setSpacing(6)
+        depth_row.addWidget(QLabel("Depth:"))
+        self.spatial3d_depth_slider = QSlider(Qt.Orientation.Horizontal)
+        self.spatial3d_depth_slider.setRange(0, 100)
+        self.spatial3d_depth_slider.setValue(50)
+        self.spatial3d_depth_slider.valueChanged.connect(self._on_spatial3d_depth_slider_changed)
+        depth_row.addWidget(self.spatial3d_depth_slider, 1)
+        self.spatial3d_depth_spin = QDoubleSpinBox()
+        self.spatial3d_depth_spin.setRange(0.0, 1.0)
+        self.spatial3d_depth_spin.setDecimals(2)
+        self.spatial3d_depth_spin.setSingleStep(0.05)
+        self.spatial3d_depth_spin.setValue(0.5)
+        self.spatial3d_depth_spin.setFixedWidth(80)
+        self.spatial3d_depth_spin.valueChanged.connect(self._on_spatial3d_depth_spin_changed)
+        depth_row.addWidget(self.spatial3d_depth_spin, 0)
+        spatial3d_layout.addLayout(depth_row)
+
+        screen_plane_row = QHBoxLayout()
+        screen_plane_row.setSpacing(6)
+        screen_plane_row.addWidget(QLabel("Screen Plane:"))
+        self.spatial3d_screen_plane_slider = QSlider(Qt.Orientation.Horizontal)
+        self.spatial3d_screen_plane_slider.setRange(-100, 100)
+        self.spatial3d_screen_plane_slider.setValue(0)
+        self.spatial3d_screen_plane_slider.setToolTip("Shift stereo convergence: negative pops out, positive sinks in.")
+        self.spatial3d_screen_plane_slider.valueChanged.connect(
+            self._on_spatial3d_screen_plane_slider_changed
+        )
+        screen_plane_row.addWidget(self.spatial3d_screen_plane_slider, 1)
+        self.spatial3d_screen_plane_spin = QDoubleSpinBox()
+        self.spatial3d_screen_plane_spin.setRange(-1.0, 1.0)
+        self.spatial3d_screen_plane_spin.setDecimals(2)
+        self.spatial3d_screen_plane_spin.setSingleStep(0.05)
+        self.spatial3d_screen_plane_spin.setValue(0.0)
+        self.spatial3d_screen_plane_spin.setFixedWidth(80)
+        self.spatial3d_screen_plane_spin.setToolTip(
+            "Shift stereo convergence: negative pops out, positive sinks in."
+        )
+        self.spatial3d_screen_plane_spin.valueChanged.connect(
+            self._on_spatial3d_screen_plane_spin_changed
+        )
+        screen_plane_row.addWidget(self.spatial3d_screen_plane_spin, 0)
+        spatial3d_layout.addLayout(screen_plane_row)
+
+        pov_label = QLabel("Point of View")
+        pov_label.setStyleSheet("font-weight: bold; margin-top: 8px;")
+        spatial3d_layout.addWidget(pov_label)
+
+        joystick_grid = QGridLayout()
+        joystick_grid.setHorizontalSpacing(6)
+        joystick_grid.setVerticalSpacing(6)
+        self.spatial3d_view_up_btn = QPushButton("Up")
+        self.spatial3d_view_up_btn.clicked.connect(lambda: self._nudge_spatial3d_view(0.0, -self._spatial3d_view_step))
+        joystick_grid.addWidget(self.spatial3d_view_up_btn, 0, 1)
+        self.spatial3d_view_left_btn = QPushButton("Left")
+        self.spatial3d_view_left_btn.clicked.connect(lambda: self._nudge_spatial3d_view(-self._spatial3d_view_step, 0.0))
+        joystick_grid.addWidget(self.spatial3d_view_left_btn, 1, 0)
+        self.spatial3d_view_reset_btn = QPushButton("Center")
+        self.spatial3d_view_reset_btn.clicked.connect(lambda: self._set_spatial3d_view_offset(0.0, 0.0, emit=True))
+        joystick_grid.addWidget(self.spatial3d_view_reset_btn, 1, 1)
+        self.spatial3d_view_right_btn = QPushButton("Right")
+        self.spatial3d_view_right_btn.clicked.connect(lambda: self._nudge_spatial3d_view(self._spatial3d_view_step, 0.0))
+        joystick_grid.addWidget(self.spatial3d_view_right_btn, 1, 2)
+        self.spatial3d_view_down_btn = QPushButton("Down")
+        self.spatial3d_view_down_btn.clicked.connect(lambda: self._nudge_spatial3d_view(0.0, self._spatial3d_view_step))
+        joystick_grid.addWidget(self.spatial3d_view_down_btn, 2, 1)
+        spatial3d_layout.addLayout(joystick_grid)
+
+        self.spatial3d_view_label = QLabel("View: X 0.00, Y 0.00")
+        self.spatial3d_view_label.setStyleSheet("color: gray; font-size: 8pt;")
+        spatial3d_layout.addWidget(self.spatial3d_view_label)
+
+        spatial3d_group.setLayout(spatial3d_layout)
+        spatial3d_section.addWidget(spatial3d_group)
+
         # Export options
         export_group = QGroupBox("Export")
+        self.export_group = export_group
         export_layout = QVBoxLayout()
         
         export_frame_btn = QPushButton("Export Current Frame (PNG)")
@@ -1617,6 +1777,16 @@ class ControlPanel(QWidget):
         export_gif_btn = QPushButton("Export as GIF")
         export_gif_btn.clicked.connect(self.export_gif_clicked.emit)
         export_layout.addWidget(export_gif_btn)
+
+        self.export_all_animations_checkbox = QCheckBox("Export all animations for loaded monster")
+        self.export_all_animations_checkbox.setToolTip(
+            "When enabled, export buttons batch every animation for the current monster. "
+            "DOF exports stay within the loaded monster type, such as adult or baby."
+        )
+        self.export_all_animations_checkbox.toggled.connect(
+            self.export_all_animations_changed.emit
+        )
+        export_layout.addWidget(self.export_all_animations_checkbox)
 
         self.solid_bg_checkbox = QCheckBox("Fill background with solid color")
         self.solid_bg_checkbox.setToolTip("When enabled, exports are composited over a solid color instead of transparency.")
@@ -2084,6 +2254,13 @@ class ControlPanel(QWidget):
         self.set_viewport_bg_parallax_zoom_strength(0.5)
         self.set_viewport_bg_parallax_pan_strength(0.5)
         self.set_viewport_bg_enabled(True)
+        self.set_spatial3d_available(False)
+        self.set_spatial3d_enabled(False)
+        self.set_spatial3d_status("Stereoscopic 3D disabled")
+        self.set_spatial3d_swap_eyes(False)
+        self.set_spatial3d_depth_strength(0.5)
+        self.set_spatial3d_screen_plane(0.0)
+        self.set_spatial3d_view_offset(0.0, 0.0)
         self._wire_control_signals()
 
     def update_audio_status(self, message: str, success: bool = False):
@@ -2235,6 +2412,79 @@ class ControlPanel(QWidget):
         )
         for widget in controls:
             widget.setEnabled(bool(enabled))
+
+    def _set_spatial3d_controls_enabled(self) -> None:
+        available = bool(getattr(self, "_spatial3d_available", False))
+        active = available and bool(self.spatial3d_enable_checkbox.isChecked())
+        self.spatial3d_enable_checkbox.setEnabled(available)
+        controls = (
+            self.spatial3d_depth_slider,
+            self.spatial3d_depth_spin,
+            self.spatial3d_screen_plane_slider,
+            self.spatial3d_screen_plane_spin,
+            self.spatial3d_swap_eyes_checkbox,
+            self.spatial3d_view_up_btn,
+            self.spatial3d_view_left_btn,
+            self.spatial3d_view_reset_btn,
+            self.spatial3d_view_right_btn,
+            self.spatial3d_view_down_btn,
+            self.spatial3d_view_label,
+        )
+        for widget in controls:
+            widget.setEnabled(active)
+
+    def _on_spatial3d_enabled_toggled(self, enabled: bool) -> None:
+        self._set_spatial3d_controls_enabled()
+        self.spatial3d_enabled_changed.emit(bool(enabled))
+
+    def _on_spatial3d_swap_eyes_toggled(self, enabled: bool) -> None:
+        self.spatial3d_swap_eyes_changed.emit(bool(enabled))
+
+    def _on_spatial3d_depth_spin_changed(self, value: float) -> None:
+        clamped = max(0.0, min(1.0, float(value)))
+        slider_value = int(round(clamped * 100.0))
+        self.spatial3d_depth_slider.blockSignals(True)
+        self.spatial3d_depth_slider.setValue(slider_value)
+        self.spatial3d_depth_slider.blockSignals(False)
+        self.spatial3d_depth_changed.emit(clamped)
+
+    def _on_spatial3d_depth_slider_changed(self, value: int) -> None:
+        clamped = max(0.0, min(1.0, float(value) / 100.0))
+        self.spatial3d_depth_spin.blockSignals(True)
+        self.spatial3d_depth_spin.setValue(clamped)
+        self.spatial3d_depth_spin.blockSignals(False)
+        self.spatial3d_depth_changed.emit(clamped)
+
+    def _on_spatial3d_screen_plane_spin_changed(self, value: float) -> None:
+        clamped = max(-1.0, min(1.0, float(value)))
+        slider_value = int(round(clamped * 100.0))
+        self.spatial3d_screen_plane_slider.blockSignals(True)
+        self.spatial3d_screen_plane_slider.setValue(slider_value)
+        self.spatial3d_screen_plane_slider.blockSignals(False)
+        self.spatial3d_screen_plane_changed.emit(clamped)
+
+    def _on_spatial3d_screen_plane_slider_changed(self, value: int) -> None:
+        clamped = max(-1.0, min(1.0, float(value) / 100.0))
+        self.spatial3d_screen_plane_spin.blockSignals(True)
+        self.spatial3d_screen_plane_spin.setValue(clamped)
+        self.spatial3d_screen_plane_spin.blockSignals(False)
+        self.spatial3d_screen_plane_changed.emit(clamped)
+
+    def _set_spatial3d_view_offset(self, x_value: float, y_value: float, *, emit: bool) -> None:
+        self._spatial3d_view_x = max(-1.0, min(1.0, float(x_value)))
+        self._spatial3d_view_y = max(-1.0, min(1.0, float(y_value)))
+        self.spatial3d_view_label.setText(
+            f"View: X {self._spatial3d_view_x:.2f}, Y {self._spatial3d_view_y:.2f}"
+        )
+        if emit:
+            self.spatial3d_view_changed.emit(self._spatial3d_view_x, self._spatial3d_view_y)
+
+    def _nudge_spatial3d_view(self, dx: float, dy: float) -> None:
+        self._set_spatial3d_view_offset(
+            self._spatial3d_view_x + float(dx),
+            self._spatial3d_view_y + float(dy),
+            emit=True,
+        )
 
     def _on_viewport_bg_color_mode_changed(self, index: int):
         mode = self.viewport_bg_color_mode_combo.itemData(index)
@@ -2431,6 +2681,100 @@ class ControlPanel(QWidget):
         self.export_include_viewport_bg_checkbox.blockSignals(True)
         self.export_include_viewport_bg_checkbox.setChecked(bool(enabled))
         self.export_include_viewport_bg_checkbox.blockSignals(False)
+
+    def set_export_all_animations(self, enabled: bool):
+        self.export_all_animations_checkbox.blockSignals(True)
+        self.export_all_animations_checkbox.setChecked(bool(enabled))
+        self.export_all_animations_checkbox.blockSignals(False)
+
+    def export_all_animations_enabled(self) -> bool:
+        return bool(self.export_all_animations_checkbox.isChecked())
+
+    def _basic_viewer_section_visible(self, key: str) -> bool:
+        normalized = str(key or "").strip().lower()
+        if self._basic_viewer_mode_enabled and normalized not in self._basic_viewer_allowed_sections:
+            return False
+        if normalized == "spatial3d" and not self._spatial3d_available:
+            return False
+        return True
+
+    def set_basic_viewer_mode(self, enabled: bool) -> None:
+        """Apply the launch-only streamlined viewing/export control profile."""
+        self._basic_viewer_mode_enabled = bool(enabled)
+        if self._basic_viewer_mode_enabled and self.current_section_key() not in self._basic_viewer_allowed_sections:
+            self.set_active_section("files")
+        for idx, key in enumerate(self._section_tab_keys):
+            visible = self._basic_viewer_section_visible(key)
+            if hasattr(self.section_tabs, "setTabVisible"):
+                self.section_tabs.setTabVisible(idx, visible)
+        for entry in self._section_entries:
+            key = str(entry.get("key") or "")
+            visible = self._basic_viewer_section_visible(key)
+            entry["content"].setVisible(visible)
+            heading = entry.get("simple_heading")
+            if heading is not None:
+                heading.setVisible(visible)
+        for widget in list(getattr(self, "_basic_viewer_hidden_widgets", []) or []):
+            if widget is not None:
+                widget.setVisible(not self._basic_viewer_mode_enabled)
+        if hasattr(self, "simple_mode_checkbox"):
+            self.simple_mode_checkbox.setEnabled(not self._basic_viewer_mode_enabled)
+
+    def set_spatial3d_available(self, enabled: bool) -> None:
+        self._spatial3d_available = bool(enabled)
+        try:
+            tab_index = self._section_tab_keys.index("spatial3d")
+        except ValueError:
+            tab_index = -1
+        visible = self._basic_viewer_section_visible("spatial3d")
+        if tab_index >= 0 and hasattr(self.section_tabs, "setTabVisible"):
+            if not visible and self.section_tabs.currentIndex() == tab_index:
+                self.set_active_section("files" if self._basic_viewer_mode_enabled else "viewport")
+            self.section_tabs.setTabVisible(tab_index, visible)
+        for entry in self._section_entries:
+            if entry.get("key") == "spatial3d":
+                entry["content"].setVisible(visible)
+                heading = entry.get("simple_heading")
+                if heading is not None:
+                    heading.setVisible(visible)
+                break
+        self._set_spatial3d_controls_enabled()
+
+    def set_spatial3d_enabled(self, enabled: bool) -> None:
+        self.spatial3d_enable_checkbox.blockSignals(True)
+        self.spatial3d_enable_checkbox.setChecked(bool(enabled))
+        self.spatial3d_enable_checkbox.blockSignals(False)
+        self._set_spatial3d_controls_enabled()
+
+    def set_spatial3d_status(self, status: str) -> None:
+        if hasattr(self, "spatial3d_status_label"):
+            self.spatial3d_status_label.setText(str(status or "Stereoscopic 3D status unavailable"))
+
+    def set_spatial3d_swap_eyes(self, enabled: bool) -> None:
+        self.spatial3d_swap_eyes_checkbox.blockSignals(True)
+        self.spatial3d_swap_eyes_checkbox.setChecked(bool(enabled))
+        self.spatial3d_swap_eyes_checkbox.blockSignals(False)
+
+    def set_spatial3d_depth_strength(self, value: float) -> None:
+        clamped = max(0.0, min(1.0, float(value)))
+        self.spatial3d_depth_slider.blockSignals(True)
+        self.spatial3d_depth_slider.setValue(int(round(clamped * 100.0)))
+        self.spatial3d_depth_slider.blockSignals(False)
+        self.spatial3d_depth_spin.blockSignals(True)
+        self.spatial3d_depth_spin.setValue(clamped)
+        self.spatial3d_depth_spin.blockSignals(False)
+
+    def set_spatial3d_screen_plane(self, value: float) -> None:
+        clamped = max(-1.0, min(1.0, float(value)))
+        self.spatial3d_screen_plane_slider.blockSignals(True)
+        self.spatial3d_screen_plane_slider.setValue(int(round(clamped * 100.0)))
+        self.spatial3d_screen_plane_slider.blockSignals(False)
+        self.spatial3d_screen_plane_spin.blockSignals(True)
+        self.spatial3d_screen_plane_spin.setValue(clamped)
+        self.spatial3d_screen_plane_spin.blockSignals(False)
+
+    def set_spatial3d_view_offset(self, x_value: float, y_value: float) -> None:
+        self._set_spatial3d_view_offset(x_value, y_value, emit=False)
 
     def _on_export_layer_pass_toggled(self, enabled: bool):
         self.export_layer_pass_scroll.setEnabled(bool(enabled))
@@ -2929,6 +3273,10 @@ class ControlPanel(QWidget):
 
     def set_barebones_file_mode(self, enabled: bool):
         """Toggle between classic list search and the monster browser shortcut."""
+        if hasattr(self, "barebones_file_mode_check"):
+            self.barebones_file_mode_check.blockSignals(True)
+            self.barebones_file_mode_check.setChecked(bool(enabled))
+            self.barebones_file_mode_check.blockSignals(False)
         if hasattr(self, "barebones_container"):
             self.barebones_container.setVisible(enabled)
         if hasattr(self, "monster_browser_container"):
@@ -2971,8 +3319,7 @@ class ControlPanel(QWidget):
         self.costume_convert_btn.setEnabled(enabled)
 
     def _conversion_busy_label(self) -> str:
-        dots = "." * (self._convert_anim_index + 1)
-        return f"Converting{dots}"
+        return "Converting..."
 
     def _refresh_convert_button_labels(self) -> None:
         if hasattr(self, "convert_bin_btn"):
@@ -2987,23 +3334,20 @@ class ControlPanel(QWidget):
                 self.convert_dof_btn.setText(label)
             else:
                 self.convert_dof_btn.setText(self._dof_convert_label)
+        if hasattr(self, "convert_dof_rev6_btn"):
+            if self._dof_convert_active:
+                label = self._dof_convert_busy_label_override or self._conversion_busy_label()
+                self.convert_dof_rev6_btn.setText(label)
+            else:
+                self.convert_dof_rev6_btn.setText(self._dof_rev6_convert_label)
 
     def _sync_convert_anim_timer(self) -> None:
-        animated_active = (
-            (self._bin_convert_active and self._bin_convert_busy_label_override is None)
-            or (self._dof_convert_active and self._dof_convert_busy_label_override is None)
-        )
-        if animated_active:
-            if not self._convert_anim_timer.isActive():
-                self._convert_anim_timer.start()
-        else:
-            if self._convert_anim_timer.isActive():
-                self._convert_anim_timer.stop()
-            self._convert_anim_index = 0
+        if self._convert_anim_timer.isActive():
+            self._convert_anim_timer.stop()
+        self._convert_anim_index = 0
 
     def _on_convert_anim_tick(self) -> None:
-        self._convert_anim_index = (self._convert_anim_index + 1) % 3
-        self._refresh_convert_button_labels()
+        return
 
     def set_bin_convert_state(self, enabled: bool, label=None):
         """Enable/disable BIN conversion button and update its label."""
@@ -3020,6 +3364,8 @@ class ControlPanel(QWidget):
         self._dof_convert_busy_label_override = label if self._dof_convert_active else None
         if hasattr(self, "convert_dof_btn"):
             self.convert_dof_btn.setEnabled(bool(enabled))
+        if hasattr(self, "convert_dof_rev6_btn"):
+            self.convert_dof_rev6_btn.setEnabled(bool(enabled))
         self._refresh_convert_button_labels()
         self._sync_convert_anim_timer()
         if hasattr(self, "dof_mesh_pivot_checkbox"):
@@ -3210,6 +3556,20 @@ class ControlPanel(QWidget):
             self.compact_ui_checkbox.blockSignals(False)
         self._apply_compact_ui_styles()
 
+    def set_ui_scale_factor(self, factor: float):
+        """Apply the global viewer UI scale to fixed control-panel metrics."""
+        self._ui_scale_factor = clamp_ui_scale(factor)
+        self._preferred_width = scale_int(self._base_preferred_width, self._ui_scale_factor, minimum=260)
+        self._max_width = scale_int(self._base_max_width, self._ui_scale_factor, minimum=360)
+        self.setMaximumWidth(self._max_width)
+        if hasattr(self, "metronome_indicator"):
+            self.metronome_indicator.set_ui_scale_factor(self._ui_scale_factor)
+        if hasattr(self, "viewport_bg_thumbnail_label"):
+            thumb_size = scale_int(72, self._ui_scale_factor, minimum=40)
+            self.viewport_bg_thumbnail_label.setFixedSize(thumb_size, thumb_size)
+        self._apply_compact_ui_styles()
+        self.updateGeometry()
+
     def set_simple_mode(self, enabled: bool):
         """Switch between tabbed and single-scroll control panel modes."""
         self._simple_mode_enabled = bool(enabled)
@@ -3226,8 +3586,12 @@ class ControlPanel(QWidget):
         self._apply_compact_ui_styles()
 
     def _apply_compact_ui_styles(self):
-        spacing = 4 if self._compact_ui_enabled else 8
-        margins = (6, 6, 6, 6) if self._compact_ui_enabled else (8, 8, 8, 8)
+        factor = getattr(self, "_ui_scale_factor", 1.0)
+        spacing = scale_int(4 if self._compact_ui_enabled else 8, factor)
+        margins = tuple(
+            scale_int(value, factor)
+            for value in ((6, 6, 6, 6) if self._compact_ui_enabled else (8, 8, 8, 8))
+        )
         for layout in self._section_layouts.values():
             layout.setSpacing(spacing)
             layout.setContentsMargins(*margins)
@@ -3236,21 +3600,27 @@ class ControlPanel(QWidget):
         for group in self.findChildren(QGroupBox):
             layout = group.layout()
             if layout:
-                layout.setSpacing(4 if self._compact_ui_enabled else 6)
+                layout.setSpacing(scale_int(4 if self._compact_ui_enabled else 6, factor))
                 layout.setContentsMargins(*margins)
         if self._compact_ui_enabled:
+            font_pt = scale_float(9, factor, minimum=6.0)
+            min_height = scale_int(20, factor, minimum=16)
+            pad_v = scale_int(2, factor, minimum=1)
+            pad_h = scale_int(6, factor, minimum=3)
             self.setStyleSheet(
-                "QWidget { font-size: 9pt; }"
-                "QPushButton, QToolButton { padding: 2px 6px; }"
-                "QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox { min-height: 20px; }"
+                f"QWidget {{ font-size: {font_pt:.2f}pt; }}"
+                f"QPushButton, QToolButton {{ padding: {pad_v}px {pad_h}px; }}"
+                f"QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox {{ min-height: {min_height}px; }}"
             )
-            self.section_tabs.setStyleSheet("QTabBar::tab { padding: 2px 6px; }")
+            self.section_tabs.setStyleSheet(
+                f"QTabBar::tab {{ padding: {pad_v}px {pad_h}px; }}"
+            )
         else:
             self.setStyleSheet("")
             self.section_tabs.setStyleSheet("")
-        heading_font_size = "10pt" if not self._compact_ui_enabled else "9pt"
+        heading_font_size = scale_float(10 if not self._compact_ui_enabled else 9, factor, minimum=6.0)
         for heading in self.simple_mode_content.findChildren(QLabel, "simpleModeSectionHeading"):
-            heading.setStyleSheet(f"font-weight: 600; font-size: {heading_font_size};")
+            heading.setStyleSheet(f"font-weight: 600; font-size: {heading_font_size:.2f}pt;")
     
     def update_offset_display(self, layer_offsets, get_layer_by_id_func, layer_rotations=None, layer_scales=None):
         """

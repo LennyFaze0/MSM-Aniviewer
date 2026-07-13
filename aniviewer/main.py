@@ -39,8 +39,32 @@ def _print_boot_progress(step: int, total: int, message: str) -> None:
         print()
 
 
+def _extract_launch_flags(argv: list[str]) -> tuple[bool, list[str]]:
+    """Return launch-mode flags and argv safe to pass into QApplication."""
+    simple_mode = False
+    cleaned = [argv[0]] if argv else ["main.py"]
+    for arg in argv[1:]:
+        normalized = str(arg or "").strip().lower()
+        if normalized in {"--simple-mode", "--simple-viewer-mode", "--basic-mode"}:
+            simple_mode = True
+            continue
+        if normalized in {"--normal-mode", "--full-mode"}:
+            simple_mode = False
+            continue
+        cleaned.append(arg)
+    env_mode = os.environ.get("ANIVIEWER_LAUNCH_MODE", "").strip().lower()
+    if env_mode in {"simple", "basic", "2"}:
+        simple_mode = True
+    elif env_mode in {"normal", "full", "1"}:
+        simple_mode = False
+    return simple_mode, cleaned
+
+
 def main() -> int:
     """Main entry point"""
+    simple_mode, qt_argv = _extract_launch_flags(sys.argv)
+    sys.argv = qt_argv
+
     # Force desktop OpenGL before Qt creates the application/context.
     # The renderer relies on compatibility fixed-function APIs.
     os.environ.setdefault("QT_OPENGL", "desktop")
@@ -82,7 +106,7 @@ def main() -> int:
     app.setStyle('Fusion')
 
     _print_boot_progress(4, total, steps[3])
-    window = MSMAnimationViewer()
+    window = MSMAnimationViewer(simple_viewer_mode=simple_mode)
 
     _print_boot_progress(5, total, steps[4])
     window.show()

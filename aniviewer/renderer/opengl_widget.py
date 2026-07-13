@@ -34,6 +34,8 @@ try:
 except Exception:  # pragma: no cover - optional dependency
     QSvgRenderer = None
 from utils.shader_registry import ShaderRegistry
+from utils.spatiallabs_sdk import SpatialLabsGLWeaver, SpatialLabsSdk
+from utils.performance_profiler import profile_scope
 
 _TEXTURE_2D_CAPABILITY_WARNED: bool = False
 
@@ -99,6 +101,28 @@ void main()
 {
     gl_Position = ftransform();
     gl_TexCoord[0] = gl_MultiTexCoord0;
+}
+"""
+
+_ANAGLYPH_FRAGMENT_SHADER = """
+#version 120
+uniform sampler2D u_leftTexture;
+uniform sampler2D u_rightTexture;
+
+float luma(vec3 c)
+{
+    return dot(c, vec3(0.299, 0.587, 0.114));
+}
+
+void main()
+{
+    vec2 uv = gl_TexCoord[0].st;
+    vec4 leftColor = texture2D(u_leftTexture, uv);
+    vec4 rightColor = texture2D(u_rightTexture, uv);
+    float red = luma(leftColor.rgb);
+    vec3 cyan = vec3(0.0, rightColor.g, rightColor.b);
+    float alpha = max(leftColor.a, rightColor.a);
+    gl_FragColor = vec4(red, cyan.g, cyan.b, alpha);
 }
 """
 
@@ -467,6 +491,9 @@ class ParticleRenderEntry:
     control_channels: Optional[Dict[int, List[Tuple[float, float, int]]]] = None
     control_local_offset: Optional[Tuple[float, float]] = None
     control_local_offset_std: Optional[Tuple[float, float]] = None
+    baseline_name: Optional[str] = None
+    baseline_offset: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+    baseline_channels: Optional[Dict[int, List[Tuple[float, float, int]]]] = None
     source_layer_id: Optional[int] = None
     source_layer_name: Optional[str] = None
     source_layer_offset_local: Optional[Tuple[float, float]] = None
@@ -503,6 +530,7 @@ class ParticleDebugSample:
     life: float
     control_origin: Optional[Tuple[float, float]] = None
     derived_socket: Optional[Tuple[float, float]] = None
+    baseline_origin: Optional[Tuple[float, float]] = None
     node_xy_origin: Optional[Tuple[float, float]] = None
     node_alt_depth_origin: Optional[Tuple[float, float]] = None
 
@@ -534,6 +562,7 @@ class OpenGLAnimationWidget(QOpenGLWidget):
     transform_action_committed = pyqtSignal(dict)
     tile_render_stats = pyqtSignal(dict)
     runtime_error = pyqtSignal(str)
+    spatial3d_status_changed = pyqtSignal(str)
     
     def __init__(self, parent: Optional[QWidget] = None, shader_registry: Optional[ShaderRegistry] = None):
         super().__init__(parent)
@@ -605,6 +634,7 @@ class OpenGLAnimationWidget(QOpenGLWidget):
         self._last_runtime_error: Optional[str] = None
         self._last_texture_upload_failures: List[str] = []
         self._gl_context_summary: str = ""
+        self._gl_resource_generation: int = 0
 
         # Optional extra animation entries to render in the same viewport.
         # Each entry: {"animation": AnimationData, "atlases": List[TextureAtlas],
@@ -612,6 +642,13 @@ class OpenGLAnimationWidget(QOpenGLWidget):
         #              "duration": float}
         self.extra_render_entries: List[Dict[str, Any]] = []
         self._animation_layer_cache: Dict[int, Dict[str, Any]] = {}
+        self.baked_frame_cache_enabled: bool = False
+        self._baked_frame_cache: Dict[Tuple[Any, ...], Dict[int, Dict[str, Any]]] = {}
+        self._baked_frame_cache_order: List[Tuple[Any, ...]] = []
+        self._baked_frame_cache_limit: int = 4096
+        self._baked_frame_cache_fps: int = 60
+        self._baked_frame_cache_prewarm_queue: List[float] = []
+        self._baked_frame_cache_prewarm_index: int = 0
         self.fast_preview_enabled: bool = False
 
         # DOF particle rendering
@@ -653,6 +690,34 @@ class OpenGLAnimationWidget(QOpenGLWidget):
         self.blue_mode_overlay_rgba: Tuple[float, float, float, float] = (0.05, 0.25, 1.0, 0.45)
         self.post_motion_blur_enabled: bool = False
         self.post_motion_blur_strength: float = 0.35
+        self.spatial3d_support_enabled: bool = False
+        self.spatial3d_enabled: bool = False
+        self.spatial3d_mode: str = "spatiallabs"
+        self.spatial3d_swap_eyes: bool = False
+        self.spatial3d_depth_strength: float = 0.5
+        self.spatial3d_screen_plane: float = 0.0
+        self.spatial3d_view_x: float = 0.0
+        self.spatial3d_view_y: float = 0.0
+        self.spatial3d_eye_separation_px: float = 28.0
+        self.spatial3d_parallax_px: float = 48.0
+        self.spatial3d_perspective: float = 0.28
+        self._spatial3d_eye_sign: float = 0.0
+        self._spatial3d_viewport_size: Tuple[int, int] = (0, 0)
+        self._spatiallabs_sdk: Optional[SpatialLabsSdk] = None
+        self._spatiallabs_sdk_attempted: bool = False
+        self._spatiallabs_sdk_last_attempt: float = 0.0
+        self._spatiallabs_gl_weaver: Optional[SpatialLabsGLWeaver] = None
+        self._spatiallabs_gl_weaver_size: Tuple[int, int] = (0, 0)
+        self._spatiallabs_gl_weaver_failed: bool = False
+        self._spatiallabs_status: str = "Stereoscopic 3D disabled"
+        self._anaglyph_program: int = 0
+        self._anaglyph_uniform_left: int = -1
+        self._anaglyph_uniform_right: int = -1
+        self._spatial3d_left_fbo: Optional[int] = None
+        self._spatial3d_left_texture: Optional[int] = None
+        self._spatial3d_right_fbo: Optional[int] = None
+        self._spatial3d_right_texture: Optional[int] = None
+        self._spatial3d_eye_resource_size: Tuple[int, int] = (0, 0)
         self._post_aa_program: int = 0
         self._post_aa_uniform_texture: int = -1
         self._post_aa_uniform_prev_texture: int = -1
@@ -815,6 +880,9 @@ class OpenGLAnimationWidget(QOpenGLWidget):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.update_animation)
         self._sync_animation_timer()
+        self._baked_frame_cache_prewarm_timer = QTimer(self)
+        self._baked_frame_cache_prewarm_timer.setInterval(0)
+        self._baked_frame_cache_prewarm_timer.timeout.connect(self._prewarm_baked_frame_cache_step)
         self._svg_background_quality_timer = QTimer(self)
         self._svg_background_quality_timer.setSingleShot(True)
         self._svg_background_quality_timer.setInterval(300)
@@ -857,6 +925,7 @@ class OpenGLAnimationWidget(QOpenGLWidget):
     def position_scale(self, value: float):
         """Set position scale in renderer"""
         self.renderer.position_scale = value
+        self.clear_baked_frame_cache()
 
     def _resolve_sprite_name_with_atlases(
         self,
@@ -931,9 +1000,65 @@ class OpenGLAnimationWidget(QOpenGLWidget):
     
     def initializeGL(self):
         """Initialize OpenGL"""
+        self.ensure_scene_gl_resources(force_reload=True, reset_postfx=True, log_context=True)
+
+    def _reset_postfx_program_handles(self) -> None:
+        self._post_aa_program = 0
+        self._post_aa_uniform_texture = -1
+        self._post_aa_uniform_prev_texture = -1
+        self._post_aa_uniform_texel_size = -1
+        self._post_aa_uniform_strength = -1
+        self._post_aa_uniform_mode = -1
+        self._post_aa_uniform_aa_enabled = -1
+        self._post_aa_uniform_bloom_enabled = -1
+        self._post_aa_uniform_bloom_strength = -1
+        self._post_aa_uniform_bloom_threshold = -1
+        self._post_aa_uniform_bloom_radius = -1
+        self._post_aa_uniform_vignette_enabled = -1
+        self._post_aa_uniform_vignette_strength = -1
+        self._post_aa_uniform_grain_enabled = -1
+        self._post_aa_uniform_grain_strength = -1
+        self._post_aa_uniform_ca_enabled = -1
+        self._post_aa_uniform_ca_strength = -1
+        self._post_aa_uniform_motion_blur_enabled = -1
+        self._post_aa_uniform_motion_blur_strength = -1
+        self._post_aa_uniform_blue_mode_enabled = -1
+        self._post_aa_uniform_blue_mode_strength = -1
+        self._post_aa_uniform_blue_mode_hue = -1
+        self._post_aa_uniform_time = -1
+
+    def _ensure_atlas_texture_loaded(self, atlas: TextureAtlas, *, force_reload: bool) -> bool:
+        if not atlas:
+            return True
+        atlas_generation = getattr(atlas, "_aniviewer_gl_generation", None)
+        if (
+            not force_reload
+            and getattr(atlas, "texture_id", None)
+            and atlas_generation == self._gl_resource_generation
+        ):
+            return True
+        loaded = bool(atlas.load_texture())
+        if loaded:
+            try:
+                setattr(atlas, "_aniviewer_gl_generation", self._gl_resource_generation)
+            except Exception:
+                pass
+        return loaded
+
+    def ensure_scene_gl_resources(
+        self,
+        *,
+        force_reload: bool = False,
+        reset_postfx: bool = False,
+        log_context: bool = False,
+    ) -> None:
+        """Ensure current scene textures are resident without changing scene data."""
         self._last_texture_upload_failures = []
         self._gl_context_summary = self._summarize_context()
-        print(f"[OpenGL] {self._gl_context_summary}")
+        if force_reload:
+            self._gl_resource_generation += 1
+        if log_context:
+            print(f"[OpenGL] {self._gl_context_summary}")
         try:
             glEnable(GL_BLEND)
             # Use premultiplied alpha blending like the MSM game engine
@@ -948,7 +1073,7 @@ class OpenGLAnimationWidget(QOpenGLWidget):
 
             # Load textures
             for atlas in self.texture_atlases:
-                if not atlas.load_texture():
+                if not self._ensure_atlas_texture_loaded(atlas, force_reload=force_reload):
                     label = (
                         getattr(atlas, "source_name", None)
                         or os.path.basename(getattr(atlas, "image_path", "") or "")
@@ -956,112 +1081,120 @@ class OpenGLAnimationWidget(QOpenGLWidget):
                     )
                     self._last_texture_upload_failures.append(str(label))
             for batch in self.tile_batches:
-                if batch.atlas and not batch.atlas.load_texture():
+                if batch.atlas and not self._ensure_atlas_texture_loaded(batch.atlas, force_reload=force_reload):
                     label = (
                         getattr(batch.atlas, "source_name", None)
                         or os.path.basename(getattr(batch.atlas, "image_path", "") or "")
                         or "<tile atlas>"
                     )
                     self._last_texture_upload_failures.append(str(label))
-            self._upload_terrain_composite_texture()
+            if force_reload or not self._terrain_composite_texture_id:
+                self._upload_terrain_composite_texture()
             self._upload_particle_textures()
-            self._upload_viewport_background_texture()
-            self._upload_default_viewport_background_texture()
-            self._clear_post_aa_resources()
-            self._post_aa_program = 0
-            self._post_aa_uniform_texture = -1
-            self._post_aa_uniform_prev_texture = -1
-            self._post_aa_uniform_texel_size = -1
-            self._post_aa_uniform_strength = -1
-            self._post_aa_uniform_mode = -1
-            self._post_aa_uniform_aa_enabled = -1
-            self._post_aa_uniform_bloom_enabled = -1
-            self._post_aa_uniform_bloom_strength = -1
-            self._post_aa_uniform_bloom_threshold = -1
-            self._post_aa_uniform_bloom_radius = -1
-            self._post_aa_uniform_vignette_enabled = -1
-            self._post_aa_uniform_vignette_strength = -1
-            self._post_aa_uniform_grain_enabled = -1
-            self._post_aa_uniform_grain_strength = -1
-            self._post_aa_uniform_ca_enabled = -1
-            self._post_aa_uniform_ca_strength = -1
-            self._post_aa_uniform_motion_blur_enabled = -1
-            self._post_aa_uniform_motion_blur_strength = -1
-            self._post_aa_uniform_blue_mode_enabled = -1
-            self._post_aa_uniform_blue_mode_strength = -1
-            self._post_aa_uniform_blue_mode_hue = -1
-            self._post_aa_uniform_time = -1
+            if force_reload or not self._viewport_background_texture_id:
+                self._upload_viewport_background_texture()
+            if force_reload or not self._default_viewport_background_texture_id:
+                self._upload_default_viewport_background_texture()
+            if reset_postfx:
+                self._clear_post_aa_resources()
+                self._reset_postfx_program_handles()
 
             self._apply_antialiasing_state()
         except Exception as exc:
-            self._emit_runtime_error(f"initializeGL failed: {exc}")
+            self._emit_runtime_error(f"OpenGL resource preparation failed: {exc}")
             raise
     
     def resizeGL(self, w: int, h: int):
         """Handle resize"""
-        glViewport(0, 0, w, h)
+        self._set_ortho_viewport(0, 0, w, h)
+
+    def _set_ortho_viewport(
+        self,
+        x: int,
+        y: int,
+        w: int,
+        h: int,
+        *,
+        ortho_w: Optional[int] = None,
+        ortho_h: Optional[int] = None,
+    ) -> None:
+        """Set a Y-down orthographic projection for a viewport rectangle."""
+        w = max(1, int(w))
+        h = max(1, int(h))
+        logical_w = max(1, int(ortho_w if ortho_w is not None else w))
+        logical_h = max(1, int(ortho_h if ortho_h is not None else h))
+        glViewport(int(x), int(y), w, h)
         glMatrixMode(GL_PROJECTION)
         glLoadIdentity()
         # Use Y-down coordinates like Pygame (origin at top-left)
         # This matches the JSON data format
-        glOrtho(0, w, h, 0, -1, 1)
+        glOrtho(0, logical_w, logical_h, 0, -1, 1)
         glMatrixMode(GL_MODELVIEW)
     
     def paintGL(self):
         """Render the animation"""
-        try:
-            self._apply_antialiasing_state()
-            view_w, view_h = self._current_framebuffer_size()
-            glViewport(0, 0, view_w, view_h)
+        with profile_scope("viewport.paintGL"):
+            try:
+                self._apply_antialiasing_state()
+                view_w, view_h = self._current_framebuffer_size()
+                glViewport(0, 0, view_w, view_h)
 
-            if (
-                self._is_post_pass_required()
-                and self._ensure_post_aa_program()
-                and self._ensure_post_aa_resources(view_w, view_h)
-                and self._post_aa_scene_fbo
-                and self._post_aa_scene_texture
-            ):
-                default_fbo = int(self.defaultFramebufferObject())
-                source_texture = int(self._post_aa_scene_texture)
-                if self._should_use_subframe_motion_blur():
-                    source_texture = int(self._render_subframe_motion_blur(view_w, view_h))
-                else:
-                    glBindFramebuffer(GL_FRAMEBUFFER, int(self._post_aa_scene_fbo))
+                if self._spatial3d_active():
+                    self._render_spatial3d_scene(
+                        view_w,
+                        view_h,
+                        framebuffer_binding_hint=int(self.defaultFramebufferObject()),
+                    )
+                    return
+
+                if (
+                    self._is_post_pass_required()
+                    and self._ensure_post_aa_program()
+                    and self._ensure_post_aa_resources(view_w, view_h)
+                    and self._post_aa_scene_fbo
+                    and self._post_aa_scene_texture
+                ):
+                    default_fbo = int(self.defaultFramebufferObject())
+                    source_texture = int(self._post_aa_scene_texture)
+                    if self._should_use_subframe_motion_blur():
+                        source_texture = int(self._render_subframe_motion_blur(view_w, view_h))
+                    else:
+                        glBindFramebuffer(GL_FRAMEBUFFER, int(self._post_aa_scene_fbo))
+                        glViewport(0, 0, view_w, view_h)
+                        self._render_scene_contents(
+                            view_w,
+                            view_h,
+                            framebuffer_binding_hint=int(self._post_aa_scene_fbo),
+                        )
+                    glBindFramebuffer(GL_FRAMEBUFFER, default_fbo)
                     glViewport(0, 0, view_w, view_h)
+                    pass_ok = self._draw_post_aa_pass(
+                        source_texture=source_texture,
+                        width=view_w,
+                        height=view_h,
+                    )
+                    if pass_ok:
+                        return
+                    # Graceful fallback: if the post pass fails, draw scene directly.
                     self._render_scene_contents(
                         view_w,
                         view_h,
-                        framebuffer_binding_hint=int(self._post_aa_scene_fbo),
+                        framebuffer_binding_hint=int(default_fbo),
                     )
-                glBindFramebuffer(GL_FRAMEBUFFER, default_fbo)
-                glViewport(0, 0, view_w, view_h)
-                pass_ok = self._draw_post_aa_pass(
-                    source_texture=source_texture,
-                    width=view_w,
-                    height=view_h,
-                )
-                if pass_ok:
                     return
-                # Graceful fallback: if the post pass fails, draw scene directly.
+
                 self._render_scene_contents(
                     view_w,
                     view_h,
-                    framebuffer_binding_hint=int(default_fbo),
+                    framebuffer_binding_hint=int(self.defaultFramebufferObject()),
                 )
-                return
-
-            self._render_scene_contents(
-                view_w,
-                view_h,
-                framebuffer_binding_hint=int(self.defaultFramebufferObject()),
-            )
-        except Exception as exc:
-            self._emit_runtime_error(f"paintGL failed: {exc}")
-            try:
-                glClearColor(0.0, 0.0, 0.0, 1.0)
-                glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
             except Exception:
-                pass
+                self._emit_runtime_error(f"paintGL failed: {exc}")
+                try:
+                    glClearColor(0.0, 0.0, 0.0, 1.0)
+                    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+                except Exception:
+                    pass
 
     def _current_framebuffer_size(self) -> Tuple[int, int]:
         """Return current framebuffer pixel size (handles HiDPI correctly)."""
@@ -1088,6 +1221,716 @@ class OpenGLAnimationWidget(QOpenGLWidget):
             pass
 
         return width_px, height_px
+
+    def _spatial3d_active(self) -> bool:
+        """Return whether the live viewport should render in stereo."""
+        return bool(
+            self.spatial3d_support_enabled
+            and self.spatial3d_enabled
+            and self.spatial3d_depth_strength > 1e-4
+        )
+
+    def _set_spatial3d_status(self, status: str) -> None:
+        status_text = str(status or "").strip() or "Stereoscopic 3D status unavailable"
+        if status_text == self._spatiallabs_status:
+            return
+        self._spatiallabs_status = status_text
+        print(f"[Stereoscopic3D] {status_text}")
+        try:
+            self.spatial3d_status_changed.emit(status_text)
+        except Exception:
+            pass
+
+    def spatial3d_status(self) -> str:
+        return self._spatiallabs_status
+
+    def _drain_gl_errors(self) -> None:
+        """Clear GL errors that can be left behind by native SDK calls."""
+        try:
+            for _ in range(16):
+                if glGetError() == GL_NO_ERROR:
+                    break
+        except Exception:
+            pass
+
+    def _ensure_spatiallabs_sdk(self) -> Optional[SpatialLabsSdk]:
+        if not self.spatial3d_support_enabled:
+            self._set_spatial3d_status("Stereoscopic 3D disabled")
+            return None
+        if self._spatiallabs_sdk_attempted:
+            sdk = self._spatiallabs_sdk
+            if sdk is not None and sdk.available:
+                return sdk
+            if (time.perf_counter() - self._spatiallabs_sdk_last_attempt) < 2.0:
+                return None
+
+        self._spatiallabs_sdk_attempted = True
+        self._spatiallabs_sdk_last_attempt = time.perf_counter()
+        sdk = SpatialLabsSdk()
+        self._spatiallabs_sdk = sdk
+        if sdk.initialize():
+            self._set_spatial3d_status(sdk.describe())
+            return sdk
+        self._set_spatial3d_status(sdk.status)
+        return None
+
+    def _set_spatiallabs_lens_hint(self, enabled: bool) -> None:
+        sdk = self._spatiallabs_sdk
+        if sdk is None or not sdk.available:
+            return
+        try:
+            sdk.set_lens_hint(bool(enabled))
+        except Exception as exc:
+            self._set_spatial3d_status(f"SpatialLabs lens hint failed: {exc}")
+
+    def _spatiallabs_window_handle(self) -> int:
+        candidates = []
+        try:
+            window = self.window()
+            if window is not None:
+                candidates.append(window)
+        except Exception:
+            pass
+        candidates.append(self)
+        for candidate in candidates:
+            try:
+                handle = int(candidate.winId())
+                if handle:
+                    return handle
+            except Exception:
+                continue
+        return 0
+
+    def _ensure_spatiallabs_gl_weaver(
+        self,
+        view_w: int,
+        view_h: int,
+    ) -> Optional[SpatialLabsGLWeaver]:
+        if self._spatiallabs_gl_weaver_failed:
+            return None
+        target_size = (max(1, int(view_w)), max(1, int(view_h)))
+        if (
+            self._spatiallabs_gl_weaver is not None
+            and self._spatiallabs_gl_weaver_size == target_size
+        ):
+            return self._spatiallabs_gl_weaver
+        sdk = self._ensure_spatiallabs_sdk()
+        if sdk is None:
+            return None
+        hwnd = self._spatiallabs_window_handle()
+        try:
+            self._drain_gl_errors()
+            self._spatiallabs_gl_weaver = sdk.create_gl_weaver(
+                hwnd,
+                view_size=target_size,
+            )
+            self._spatiallabs_gl_weaver_size = target_size
+            self._drain_gl_errors()
+            suffix = ""
+            if self._spatiallabs_gl_weaver.create_error:
+                suffix = f" (CreateGLWeaver returned {self._spatiallabs_gl_weaver.create_error})"
+            self._set_spatial3d_status(f"{sdk.describe()} OpenGL weaver ready{suffix}")
+            return self._spatiallabs_gl_weaver
+        except Exception as exc:
+            self._spatiallabs_gl_weaver_failed = True
+            self._spatiallabs_gl_weaver_size = (0, 0)
+            self._set_spatial3d_status(f"SpatialLabs OpenGL weaver unavailable: {exc}")
+            return None
+
+    def _framebuffer_color_texture_size(
+        self,
+        fbo: int,
+        fallback: Tuple[int, int],
+    ) -> Tuple[int, int]:
+        fallback_w = max(1, int(fallback[0]))
+        fallback_h = max(1, int(fallback[1]))
+        if not fbo:
+            return fallback_w, fallback_h
+        try:
+            prev_fbo = int(glGetIntegerv(GL_FRAMEBUFFER_BINDING))
+        except Exception:
+            prev_fbo = 0
+        try:
+            prev_tex = int(glGetIntegerv(GL_TEXTURE_BINDING_2D))
+        except Exception:
+            prev_tex = 0
+        try:
+            glBindFramebuffer(GL_FRAMEBUFFER, int(fbo))
+            attachment_type = int(
+                glGetFramebufferAttachmentParameteriv(
+                    GL_FRAMEBUFFER,
+                    GL_COLOR_ATTACHMENT0,
+                    GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE,
+                )
+            )
+            attachment_name = int(
+                glGetFramebufferAttachmentParameteriv(
+                    GL_FRAMEBUFFER,
+                    GL_COLOR_ATTACHMENT0,
+                    GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME,
+                )
+            )
+            if attachment_type == GL_TEXTURE and attachment_name:
+                glBindTexture(GL_TEXTURE_2D, attachment_name)
+                width = int(glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH))
+                height = int(glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT))
+                if width > 0 and height > 0:
+                    return width, height
+        except Exception:
+            pass
+        finally:
+            try:
+                glBindTexture(GL_TEXTURE_2D, prev_tex)
+                glBindFramebuffer(GL_FRAMEBUFFER, prev_fbo)
+            except Exception:
+                pass
+        return fallback_w, fallback_h
+
+    def _render_spatial3d_scene(
+        self,
+        view_w: int,
+        view_h: int,
+        *,
+        framebuffer_binding_hint: Optional[int] = None,
+    ) -> None:
+        """Render the viewport with the selected stereoscopic backend."""
+        target_fbo = int(framebuffer_binding_hint or self.defaultFramebufferObject())
+        mode = self._normalized_spatial3d_mode()
+        if mode == "anaglyph":
+            self._set_spatiallabs_lens_hint(False)
+            if self._render_spatial3d_anaglyph_scene(view_w, view_h, framebuffer_binding_hint=target_fbo):
+                return
+            self._render_spatial3d_side_by_side_scene(
+                view_w,
+                view_h,
+                framebuffer_binding_hint=target_fbo,
+            )
+            return
+        if mode == "side_by_side":
+            self._set_spatiallabs_lens_hint(False)
+            self._render_spatial3d_side_by_side_scene(
+                view_w,
+                view_h,
+                framebuffer_binding_hint=target_fbo,
+            )
+            return
+
+        if self._render_spatiallabs_sdk_scene(view_w, view_h, framebuffer_binding_hint=target_fbo):
+            return
+        self._render_spatial3d_side_by_side_scene(
+            view_w,
+            view_h,
+            framebuffer_binding_hint=target_fbo,
+        )
+
+    def _normalized_spatial3d_mode(self) -> str:
+        mode = str(getattr(self, "spatial3d_mode", "spatiallabs") or "spatiallabs").strip().lower()
+        aliases = {
+            "spatial": "spatiallabs",
+            "spatial_labs": "spatiallabs",
+            "acer_spatiallabs": "spatiallabs",
+            "sbs": "side_by_side",
+            "side-by-side": "side_by_side",
+            "side_by_side": "side_by_side",
+            "anaglyph": "anaglyph",
+        }
+        return aliases.get(mode, "spatiallabs")
+
+    def _spatial3d_eye_signs(self) -> Tuple[float, float]:
+        if bool(getattr(self, "spatial3d_swap_eyes", False)):
+            return 1.0, -1.0
+        return -1.0, 1.0
+
+    def _compile_anaglyph_program(self) -> int:
+        try:
+            vert = glCreateShader(GL_VERTEX_SHADER)
+            glShaderSource(vert, _POST_AA_VERTEX_SHADER)
+            glCompileShader(vert)
+            if glGetShaderiv(vert, GL_COMPILE_STATUS) != GL_TRUE:
+                info = glGetShaderInfoLog(vert).decode("utf-8", "ignore")
+                print(f"[Stereoscopic3D] Anaglyph vertex shader compile failed: {info}")
+                glDeleteShader(vert)
+                return 0
+
+            frag = glCreateShader(GL_FRAGMENT_SHADER)
+            glShaderSource(frag, _ANAGLYPH_FRAGMENT_SHADER)
+            glCompileShader(frag)
+            if glGetShaderiv(frag, GL_COMPILE_STATUS) != GL_TRUE:
+                info = glGetShaderInfoLog(frag).decode("utf-8", "ignore")
+                print(f"[Stereoscopic3D] Anaglyph fragment shader compile failed: {info}")
+                glDeleteShader(vert)
+                glDeleteShader(frag)
+                return 0
+
+            program = glCreateProgram()
+            glAttachShader(program, vert)
+            glAttachShader(program, frag)
+            glLinkProgram(program)
+            if glGetProgramiv(program, GL_LINK_STATUS) != GL_TRUE:
+                info = glGetProgramInfoLog(program).decode("utf-8", "ignore")
+                print(f"[Stereoscopic3D] Anaglyph program link failed: {info}")
+                glDeleteShader(vert)
+                glDeleteShader(frag)
+                glDeleteProgram(program)
+                return 0
+
+            glDeleteShader(vert)
+            glDeleteShader(frag)
+            self._anaglyph_uniform_left = glGetUniformLocation(program, "u_leftTexture")
+            self._anaglyph_uniform_right = glGetUniformLocation(program, "u_rightTexture")
+            return int(program)
+        except Exception as exc:
+            print(f"[Stereoscopic3D] Failed to compile anaglyph shader: {exc}")
+            return 0
+
+    def _ensure_anaglyph_program(self) -> bool:
+        if self._anaglyph_program:
+            return True
+        self._anaglyph_program = self._compile_anaglyph_program()
+        return bool(self._anaglyph_program)
+
+    def _clear_spatial3d_eye_resources(self) -> None:
+        for attr in ("_spatial3d_left_fbo", "_spatial3d_right_fbo"):
+            fbo = getattr(self, attr, None)
+            if fbo:
+                try:
+                    glDeleteFramebuffers(1, [int(fbo)])
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+        for attr in ("_spatial3d_left_texture", "_spatial3d_right_texture"):
+            tex = getattr(self, attr, None)
+            if tex:
+                try:
+                    glDeleteTextures(1, [int(tex)])
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+        self._spatial3d_eye_resource_size = (0, 0)
+
+    def _create_spatial3d_eye_target(self, width: int, height: int) -> Tuple[int, int]:
+        tex = glGenTextures(1)
+        glBindTexture(GL_TEXTURE_2D, tex)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+        glTexImage2D(
+            GL_TEXTURE_2D,
+            0,
+            GL_RGBA,
+            max(1, int(width)),
+            max(1, int(height)),
+            0,
+            GL_RGBA,
+            GL_UNSIGNED_BYTE,
+            None,
+        )
+        fbo = glGenFramebuffers(1)
+        glBindFramebuffer(GL_FRAMEBUFFER, fbo)
+        glFramebufferTexture2D(
+            GL_FRAMEBUFFER,
+            GL_COLOR_ATTACHMENT0,
+            GL_TEXTURE_2D,
+            tex,
+            0,
+        )
+        if glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE:
+            glDeleteFramebuffers(1, [fbo])
+            glDeleteTextures(1, [tex])
+            raise RuntimeError("Anaglyph eye framebuffer is incomplete")
+        return int(fbo), int(tex)
+
+    def _ensure_spatial3d_eye_resources(self, width: int, height: int) -> bool:
+        target_w = max(1, int(width))
+        target_h = max(1, int(height))
+        if (
+            self._spatial3d_left_fbo
+            and self._spatial3d_left_texture
+            and self._spatial3d_right_fbo
+            and self._spatial3d_right_texture
+            and self._spatial3d_eye_resource_size == (target_w, target_h)
+        ):
+            return True
+        self._clear_spatial3d_eye_resources()
+        try:
+            prev_fbo = int(glGetIntegerv(GL_FRAMEBUFFER_BINDING))
+            prev_tex = int(glGetIntegerv(GL_TEXTURE_BINDING_2D))
+            left_fbo, left_tex = self._create_spatial3d_eye_target(target_w, target_h)
+            right_fbo, right_tex = self._create_spatial3d_eye_target(target_w, target_h)
+            glBindFramebuffer(GL_FRAMEBUFFER, prev_fbo)
+            glBindTexture(GL_TEXTURE_2D, prev_tex)
+            self._spatial3d_left_fbo = left_fbo
+            self._spatial3d_left_texture = left_tex
+            self._spatial3d_right_fbo = right_fbo
+            self._spatial3d_right_texture = right_tex
+            self._spatial3d_eye_resource_size = (target_w, target_h)
+            return True
+        except Exception as exc:
+            print(f"[Stereoscopic3D] Failed to create anaglyph eye targets: {exc}")
+            self._clear_spatial3d_eye_resources()
+            return False
+
+    def _draw_anaglyph_pass(
+        self,
+        left_texture: int,
+        right_texture: int,
+        width: int,
+        height: int,
+    ) -> bool:
+        if not left_texture or not right_texture or not self._ensure_anaglyph_program():
+            return False
+        program = int(self._anaglyph_program or 0)
+        try:
+            prev_program = glGetIntegerv(GL_CURRENT_PROGRAM)
+        except Exception:
+            prev_program = 0
+        try:
+            prev_active = glGetIntegerv(GL_ACTIVE_TEXTURE)
+        except Exception:
+            prev_active = GL_TEXTURE0
+        try:
+            glActiveTexture(GL_TEXTURE0)
+            prev_tex0 = glGetIntegerv(GL_TEXTURE_BINDING_2D)
+        except Exception:
+            prev_tex0 = 0
+        try:
+            glActiveTexture(GL_TEXTURE1)
+            prev_tex1 = glGetIntegerv(GL_TEXTURE_BINDING_2D)
+        except Exception:
+            prev_tex1 = 0
+        blend_enabled = bool(glIsEnabled(GL_BLEND))
+        if blend_enabled:
+            glDisable(GL_BLEND)
+
+        glMatrixMode(GL_PROJECTION)
+        glPushMatrix()
+        glLoadIdentity()
+        glOrtho(0, width, height, 0, -1, 1)
+        glMatrixMode(GL_MODELVIEW)
+        glPushMatrix()
+        glLoadIdentity()
+
+        glUseProgram(program)
+        glActiveTexture(GL_TEXTURE0)
+        glBindTexture(GL_TEXTURE_2D, int(left_texture))
+        if self._anaglyph_uniform_left >= 0:
+            glUniform1i(self._anaglyph_uniform_left, 0)
+        glActiveTexture(GL_TEXTURE1)
+        glBindTexture(GL_TEXTURE_2D, int(right_texture))
+        if self._anaglyph_uniform_right >= 0:
+            glUniform1i(self._anaglyph_uniform_right, 1)
+        glActiveTexture(GL_TEXTURE0)
+
+        glColor4f(1.0, 1.0, 1.0, 1.0)
+        glBegin(GL_QUADS)
+        glTexCoord2f(0.0, 1.0)
+        glVertex2f(0.0, 0.0)
+        glTexCoord2f(1.0, 1.0)
+        glVertex2f(float(width), 0.0)
+        glTexCoord2f(1.0, 0.0)
+        glVertex2f(float(width), float(height))
+        glTexCoord2f(0.0, 0.0)
+        glVertex2f(0.0, float(height))
+        glEnd()
+
+        glUseProgram(int(prev_program or 0))
+        glActiveTexture(GL_TEXTURE1)
+        glBindTexture(GL_TEXTURE_2D, int(prev_tex1))
+        glActiveTexture(GL_TEXTURE0)
+        glBindTexture(GL_TEXTURE_2D, int(prev_tex0))
+        glActiveTexture(int(prev_active))
+
+        glMatrixMode(GL_MODELVIEW)
+        glPopMatrix()
+        glMatrixMode(GL_PROJECTION)
+        glPopMatrix()
+        glMatrixMode(GL_MODELVIEW)
+
+        if blend_enabled:
+            glEnable(GL_BLEND)
+        else:
+            glDisable(GL_BLEND)
+        glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA)
+        return True
+
+    def _render_spatial3d_anaglyph_scene(
+        self,
+        view_w: int,
+        view_h: int,
+        *,
+        framebuffer_binding_hint: Optional[int] = None,
+    ) -> bool:
+        """Render red/cyan anaglyph stereo into the viewport."""
+        view_w = max(1, int(view_w))
+        view_h = max(1, int(view_h))
+        target_fbo = int(framebuffer_binding_hint or self.defaultFramebufferObject())
+        if not self._ensure_spatial3d_eye_resources(view_w, view_h):
+            self._set_spatial3d_status("Anaglyph 3D unavailable; using SBS preview")
+            return False
+
+        prev_fbo = 0
+        prev_viewport = None
+        try:
+            prev_fbo = int(glGetIntegerv(GL_FRAMEBUFFER_BINDING))
+        except Exception:
+            prev_fbo = target_fbo
+        try:
+            prev_viewport = glGetIntegerv(GL_VIEWPORT)
+        except Exception:
+            prev_viewport = None
+
+        try:
+            left_eye_sign, right_eye_sign = self._spatial3d_eye_signs()
+            for eye_sign, eye_fbo in (
+                (left_eye_sign, int(self._spatial3d_left_fbo or 0)),
+                (right_eye_sign, int(self._spatial3d_right_fbo or 0)),
+            ):
+                if not eye_fbo:
+                    return False
+                self._spatial3d_eye_sign = float(eye_sign)
+                self._spatial3d_viewport_size = (view_w, view_h)
+                glBindFramebuffer(GL_FRAMEBUFFER, eye_fbo)
+                self._set_ortho_viewport(0, 0, view_w, view_h)
+                self._render_scene_contents(
+                    view_w,
+                    view_h,
+                    framebuffer_binding_hint=eye_fbo,
+                )
+
+            self._spatial3d_eye_sign = 0.0
+            self._spatial3d_viewport_size = (0, 0)
+            glBindFramebuffer(GL_FRAMEBUFFER, target_fbo)
+            glViewport(0, 0, view_w, view_h)
+            glClearColor(0.0, 0.0, 0.0, 1.0)
+            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+            ok = self._draw_anaglyph_pass(
+                int(self._spatial3d_left_texture or 0),
+                int(self._spatial3d_right_texture or 0),
+                view_w,
+                view_h,
+            )
+            if ok:
+                self._set_ortho_viewport(0, 0, view_w, view_h)
+                self._set_spatial3d_status("Anaglyph 3D active")
+            return ok
+        except Exception as exc:
+            self._set_spatial3d_status(f"Anaglyph 3D failed: {exc}")
+            return False
+        finally:
+            self._spatial3d_eye_sign = 0.0
+            self._spatial3d_viewport_size = (0, 0)
+            try:
+                glBindFramebuffer(GL_FRAMEBUFFER, prev_fbo)
+                if prev_viewport is not None and len(prev_viewport) >= 4:
+                    glViewport(
+                        int(prev_viewport[0]),
+                        int(prev_viewport[1]),
+                        int(prev_viewport[2]),
+                        int(prev_viewport[3]),
+                    )
+            except Exception:
+                pass
+
+    def _render_spatiallabs_sdk_scene(
+        self,
+        view_w: int,
+        view_h: int,
+        *,
+        framebuffer_binding_hint: Optional[int] = None,
+    ) -> bool:
+        """Render stereo views into the Acer SDK OpenGL weaver."""
+        sdk = self._ensure_spatiallabs_sdk()
+        if sdk is None:
+            return False
+        view_w = max(1, int(view_w))
+        view_h = max(1, int(view_h))
+        weaver = self._ensure_spatiallabs_gl_weaver(view_w, view_h)
+        if weaver is None:
+            return False
+        target_fbo = int(framebuffer_binding_hint or self.defaultFramebufferObject())
+        input_fbo = 0
+        try:
+            self._drain_gl_errors()
+            input_fbo = int(weaver.framebuffer())
+            self._drain_gl_errors()
+        except Exception as exc:
+            self._spatiallabs_gl_weaver_failed = True
+            self._set_spatial3d_status(f"SpatialLabs framebuffer unavailable: {exc}")
+            return False
+        if input_fbo <= 0:
+            self._spatiallabs_gl_weaver_failed = True
+            self._set_spatial3d_status("SpatialLabs framebuffer unavailable")
+            return False
+
+        input_w, input_h = self._framebuffer_color_texture_size(
+            input_fbo,
+            sdk.recommended_view_size((view_w, view_h)),
+        )
+        try:
+            self._drain_gl_errors()
+            if not weaver.can_weave(input_w, input_h):
+                self._drain_gl_errors()
+                self._spatiallabs_gl_weaver_failed = True
+                self._set_spatial3d_status(
+                    f"SpatialLabs weaver cannot use {input_w}x{input_h}; using preview stereo"
+                )
+                return False
+            self._drain_gl_errors()
+        except Exception:
+            self._drain_gl_errors()
+            pass
+
+        prev_fbo = 0
+        prev_viewport = None
+        try:
+            prev_fbo = int(glGetIntegerv(GL_FRAMEBUFFER_BINDING))
+        except Exception:
+            prev_fbo = target_fbo
+        try:
+            prev_viewport = glGetIntegerv(GL_VIEWPORT)
+        except Exception:
+            prev_viewport = None
+
+        try:
+            glBindFramebuffer(GL_FRAMEBUFFER, input_fbo)
+            if glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE:
+                self._spatiallabs_gl_weaver_failed = True
+                self._set_spatial3d_status("SpatialLabs framebuffer is incomplete; using preview stereo")
+                return False
+            self._set_spatiallabs_lens_hint(True)
+            self._render_spatial3d_views_to_current_framebuffer(
+                input_w,
+                input_h,
+                framebuffer_binding_hint=input_fbo,
+                anamorphic_side_by_side=True,
+            )
+
+            glBindFramebuffer(GL_FRAMEBUFFER, target_fbo)
+            glViewport(0, 0, view_w, view_h)
+            glClearColor(0.0, 0.0, 0.0, 1.0)
+            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+            self._drain_gl_errors()
+            weaver.weave(input_w, input_h)
+            self._drain_gl_errors()
+            self._set_ortho_viewport(0, 0, view_w, view_h)
+            self._set_spatial3d_status(f"{sdk.describe()} active")
+            return True
+        except Exception as exc:
+            self._spatiallabs_gl_weaver_failed = True
+            self._set_spatial3d_status(f"SpatialLabs OpenGL weave failed: {exc}")
+            return False
+        finally:
+            self._spatial3d_eye_sign = 0.0
+            self._spatial3d_viewport_size = (0, 0)
+            try:
+                glBindFramebuffer(GL_FRAMEBUFFER, prev_fbo)
+                if prev_viewport is not None and len(prev_viewport) >= 4:
+                    glViewport(
+                        int(prev_viewport[0]),
+                        int(prev_viewport[1]),
+                        int(prev_viewport[2]),
+                        int(prev_viewport[3]),
+                    )
+            except Exception:
+                pass
+
+    def _render_spatial3d_side_by_side_scene(
+        self,
+        view_w: int,
+        view_h: int,
+        *,
+        framebuffer_binding_hint: Optional[int] = None,
+    ) -> None:
+        """Render the viewport as left/right side-by-side preview stereo."""
+        self._set_spatiallabs_lens_hint(False)
+        status_lower = self._spatiallabs_status.lower()
+        if self._normalized_spatial3d_mode() == "side_by_side":
+            self._set_spatial3d_status("Side-by-Side 3D active")
+        elif "preview stereo" not in status_lower:
+            if any(term in status_lower for term in ("unavailable", "failed", "cannot", "incomplete")):
+                self._set_spatial3d_status(f"{self._spatiallabs_status} (preview stereo)")
+            else:
+                self._set_spatial3d_status("SpatialLabs SDK fallback: preview stereo")
+        self._render_spatial3d_views_to_current_framebuffer(
+            view_w,
+            view_h,
+            framebuffer_binding_hint=framebuffer_binding_hint,
+        )
+
+    def _render_spatial3d_views_to_current_framebuffer(
+        self,
+        view_w: int,
+        view_h: int,
+        *,
+        framebuffer_binding_hint: Optional[int] = None,
+        anamorphic_side_by_side: bool = False,
+    ) -> None:
+        """Render left/right stereo views into the current framebuffer."""
+        view_w = max(1, int(view_w))
+        view_h = max(1, int(view_h))
+        target_fbo = int(framebuffer_binding_hint or self.defaultFramebufferObject())
+        glBindFramebuffer(GL_FRAMEBUFFER, target_fbo)
+
+        if view_w < 2:
+            self._spatial3d_eye_sign = 0.0
+            self._spatial3d_viewport_size = (view_w, view_h)
+            self._set_ortho_viewport(0, 0, view_w, view_h)
+            self._render_scene_contents(
+                view_w,
+                view_h,
+                framebuffer_binding_hint=target_fbo,
+            )
+            return
+
+        left_w = max(1, view_w // 2)
+        right_w = max(1, view_w - left_w)
+        prev_scissor_enabled = bool(glIsEnabled(GL_SCISSOR_TEST))
+        try:
+            prev_scissor_box = glGetIntegerv(GL_SCISSOR_BOX)
+        except Exception:
+            prev_scissor_box = None
+
+        try:
+            glEnable(GL_SCISSOR_TEST)
+            left_eye_sign, right_eye_sign = self._spatial3d_eye_signs()
+            for eye_sign, x_pos, eye_w in (
+                (left_eye_sign, 0, left_w),
+                (right_eye_sign, left_w, right_w),
+            ):
+                logical_w = view_w if anamorphic_side_by_side else int(eye_w)
+                logical_h = int(view_h)
+                glScissor(int(x_pos), 0, int(eye_w), int(view_h))
+                self._set_ortho_viewport(
+                    int(x_pos),
+                    0,
+                    int(eye_w),
+                    int(view_h),
+                    ortho_w=logical_w,
+                    ortho_h=logical_h,
+                )
+                self._spatial3d_eye_sign = float(eye_sign)
+                self._spatial3d_viewport_size = (int(logical_w), int(logical_h))
+                self._render_scene_contents(
+                    int(logical_w),
+                    int(logical_h),
+                    framebuffer_binding_hint=target_fbo,
+                )
+        finally:
+            self._spatial3d_eye_sign = 0.0
+            self._spatial3d_viewport_size = (0, 0)
+            if prev_scissor_enabled:
+                glEnable(GL_SCISSOR_TEST)
+                if prev_scissor_box is not None and len(prev_scissor_box) >= 4:
+                    glScissor(
+                        int(prev_scissor_box[0]),
+                        int(prev_scissor_box[1]),
+                        int(prev_scissor_box[2]),
+                        int(prev_scissor_box[3]),
+                    )
+            else:
+                glDisable(GL_SCISSOR_TEST)
+            self._set_ortho_viewport(0, 0, view_w, view_h)
 
     def _should_use_subframe_motion_blur(self) -> bool:
         """Return whether AE-like subframe motion blur should be applied this frame."""
@@ -1289,6 +2132,11 @@ class OpenGLAnimationWidget(QOpenGLWidget):
         if self.player.animation:
             fast_preview = bool(self.fast_preview_enabled)
             current_time = float(self.player.current_time if main_time is None else main_time)
+            apply_constraints = not fast_preview
+            world_states = self._get_baked_frame_world_states(
+                current_time,
+                apply_constraints=apply_constraints,
+            )
             self._render_animation_entry(
                 self.player.animation,
                 current_time,
@@ -1298,10 +2146,10 @@ class OpenGLAnimationWidget(QOpenGLWidget):
                 offset_y=0.0,
                 render_overlays=not fast_preview,
                 render_tiles=not fast_preview,
-                apply_constraints=not fast_preview,
+                apply_constraints=apply_constraints,
                 render_attachments=not fast_preview,
                 render_particles=not fast_preview,
-                world_states=None,
+                world_states=world_states,
             )
 
         if self.extra_render_entries:
@@ -1792,6 +2640,197 @@ class OpenGLAnimationWidget(QOpenGLWidget):
     def invalidate_animation_cache(self) -> None:
         """Drop cached layer maps/order when the active animation changes."""
         self._animation_layer_cache.clear()
+        self.clear_baked_frame_cache()
+
+    def clear_baked_frame_cache(self) -> None:
+        """Drop cached evaluated animation frames."""
+        self._baked_frame_cache.clear()
+        self._baked_frame_cache_order.clear()
+        self._baked_frame_cache_prewarm_queue = []
+        self._baked_frame_cache_prewarm_index = 0
+        timer = getattr(self, "_baked_frame_cache_prewarm_timer", None)
+        if timer is not None and timer.isActive():
+            timer.stop()
+
+    def set_baked_frame_cache_enabled(self, enabled: bool, *, fps: Optional[int] = None) -> None:
+        """Enable a launch-mode cache of evaluated layer states."""
+        normalized = bool(enabled)
+        if fps is not None:
+            self.set_baked_frame_cache_fps(fps)
+        if self.baked_frame_cache_enabled == normalized:
+            return
+        self.baked_frame_cache_enabled = normalized
+        self.clear_baked_frame_cache()
+        self.update()
+
+    def set_baked_frame_cache_fps(self, fps: int) -> None:
+        try:
+            value = int(fps)
+        except (TypeError, ValueError):
+            value = 60
+        value = max(1, min(240, value))
+        if value == self._baked_frame_cache_fps:
+            return
+        self._baked_frame_cache_fps = value
+        self.clear_baked_frame_cache()
+
+    def start_baked_frame_cache_prewarm(self, *, fps: Optional[int] = None, max_frames: int = 4096) -> None:
+        """Warm evaluated frame states in small GUI-thread chunks."""
+        if fps is not None:
+            self.set_baked_frame_cache_fps(fps)
+        if not self.baked_frame_cache_enabled or not self.player.animation:
+            return
+        duration = max(0.0, float(self.player.duration or 0.0))
+        cache_fps = max(1, int(self._baked_frame_cache_fps))
+        frame_count = int(math.floor(duration * cache_fps)) + 1 if duration > 1e-6 else 1
+        frame_count = max(1, min(max(1, int(max_frames)), frame_count))
+        queue = [idx / float(cache_fps) for idx in range(frame_count)]
+        if duration > 1e-6 and abs(queue[-1] - duration) > (0.5 / cache_fps):
+            queue.append(duration)
+        self._baked_frame_cache_prewarm_queue = queue
+        self._baked_frame_cache_prewarm_index = 0
+        self._baked_frame_cache_prewarm_timer.start()
+
+    def _prewarm_baked_frame_cache_step(self) -> None:
+        if not self.baked_frame_cache_enabled or not self.player.animation:
+            self.clear_baked_frame_cache()
+            return
+        queue = self._baked_frame_cache_prewarm_queue
+        index = self._baked_frame_cache_prewarm_index
+        if index >= len(queue):
+            self._baked_frame_cache_prewarm_timer.stop()
+            return
+        deadline = time.perf_counter() + 0.006
+        built = 0
+        while index < len(queue):
+            self._get_baked_frame_world_states(queue[index], apply_constraints=True)
+            index += 1
+            built += 1
+            if built >= 16 or time.perf_counter() >= deadline:
+                break
+        self._baked_frame_cache_prewarm_index = index
+        if index >= len(queue):
+            self._baked_frame_cache_prewarm_timer.stop()
+
+    @staticmethod
+    def _rounded_pair(value: Any, default: Tuple[float, float]) -> Tuple[float, float]:
+        try:
+            x, y = value
+            return (round(float(x), 4), round(float(y), 4))
+        except Exception:
+            return default
+
+    def _baked_frame_dependency_signature(self, apply_constraints: bool) -> Tuple[Any, ...]:
+        atlas_sig = tuple(
+            (
+                id(atlas),
+                int(getattr(atlas, "texture_id", 0) or 0),
+                str(getattr(atlas, "xml_path", "") or ""),
+                str(getattr(atlas, "image_path", "") or ""),
+            )
+            for atlas in self.texture_atlases
+        )
+        override_sig = tuple(
+            (int(layer_id), tuple(id(atlas) for atlas in atlases))
+            for layer_id, atlases in sorted(self.layer_atlas_overrides.items())
+        )
+        offsets_sig = tuple(
+            (int(layer_id), self._rounded_pair(value, (0.0, 0.0)))
+            for layer_id, value in sorted(self.layer_offsets.items())
+        )
+        rotations_sig = tuple(
+            (int(layer_id), round(float(value), 4))
+            for layer_id, value in sorted(self.layer_rotations.items())
+        )
+        scales_sig = tuple(
+            (int(layer_id), self._rounded_pair(value, (1.0, 1.0)))
+            for layer_id, value in sorted(self.layer_scale_offsets.items())
+        )
+        anchors_sig = tuple(
+            (int(layer_id), self._rounded_pair(value, (0.0, 0.0)))
+            for layer_id, value in sorted(self.layer_anchor_overrides.items())
+        )
+        pivot_sig = tuple((int(layer_id), bool(value)) for layer_id, value in sorted(self.layer_pivot_context.items()))
+        renderer_sig = (
+            round(float(getattr(self.renderer, "base_world_scale", 1.0) or 1.0), 6),
+            round(float(getattr(self.renderer, "position_scale", 1.0) or 1.0), 6),
+            round(float(getattr(self.renderer, "local_position_multiplier", 1.0) or 1.0), 6),
+            round(float(getattr(self.renderer, "anchor_bias_x", 0.0) or 0.0), 4),
+            round(float(getattr(self.renderer, "anchor_bias_y", 0.0) or 0.0), 4),
+        )
+        constraints_enabled = bool(
+            apply_constraints
+            and self.constraint_manager is not None
+            and getattr(self.constraint_manager, "enabled", False)
+        )
+        return (
+            atlas_sig,
+            override_sig,
+            offsets_sig,
+            rotations_sig,
+            scales_sig,
+            anchors_sig,
+            pivot_sig,
+            renderer_sig,
+            bool(self.propagate_user_transforms),
+            constraints_enabled,
+            id(self.constraint_manager) if constraints_enabled else 0,
+        )
+
+    def _baked_frame_cache_key(self, time_value: float, apply_constraints: bool) -> Tuple[Tuple[Any, ...], float]:
+        fps = max(1, int(self._baked_frame_cache_fps))
+        frame_index = int(round(max(0.0, float(time_value)) * fps))
+        frame_time = frame_index / float(fps)
+        animation = self.player.animation
+        duration = round(float(self.player.duration or 0.0), 6)
+        layer_sig = tuple(
+            (
+                int(getattr(layer, "layer_id", idx)),
+                len(getattr(layer, "keyframes", []) or []),
+                len(getattr(layer, "extra_keyframe_lanes", []) or []),
+            )
+            for idx, layer in enumerate(getattr(animation, "layers", []) or [])
+        )
+        key = (
+            id(animation),
+            frame_index,
+            fps,
+            duration,
+            layer_sig,
+            self._baked_frame_dependency_signature(apply_constraints),
+        )
+        return key, frame_time
+
+    def _store_baked_frame_world_states(self, key: Tuple[Any, ...], states: Dict[int, Dict[str, Any]]) -> None:
+        if key in self._baked_frame_cache:
+            self._baked_frame_cache[key] = states
+            return
+        self._baked_frame_cache[key] = states
+        self._baked_frame_cache_order.append(key)
+        while len(self._baked_frame_cache_order) > self._baked_frame_cache_limit:
+            old_key = self._baked_frame_cache_order.pop(0)
+            self._baked_frame_cache.pop(old_key, None)
+
+    def _get_baked_frame_world_states(
+        self,
+        time_value: float,
+        *,
+        apply_constraints: bool,
+    ) -> Optional[Dict[int, Dict[str, Any]]]:
+        if not self.baked_frame_cache_enabled or not self.player.animation:
+            return None
+        key, frame_time = self._baked_frame_cache_key(time_value, apply_constraints)
+        cached = self._baked_frame_cache.get(key)
+        if cached is not None:
+            return cached
+        restore_last_states = abs(frame_time - float(self.player.current_time or 0.0)) > 1e-5
+        previous_last_states = self._last_layer_world_states
+        states = self._build_layer_world_states(frame_time, apply_constraints=apply_constraints)
+        if restore_last_states:
+            self._last_layer_world_states = previous_last_states
+        if states:
+            self._store_baked_frame_world_states(key, states)
+        return states or None
 
     def set_fast_preview_enabled(self, enabled: bool) -> None:
         self.fast_preview_enabled = bool(enabled)
@@ -2556,8 +3595,11 @@ class OpenGLAnimationWidget(QOpenGLWidget):
             self.texture_atlases = list(atlases or [])
             glPushMatrix()
             if animation.centered:
-                w = self.width()
-                h = self.height()
+                if self._spatial3d_eye_sign and self._spatial3d_viewport_size[0] > 0:
+                    w, h = self._spatial3d_viewport_size
+                else:
+                    w = self.width()
+                    h = self.height()
                 glTranslatef(w / 2, h / 2, 0)
             if offset_x or offset_y:
                 glTranslatef(offset_x, offset_y, 0)
@@ -2573,6 +3615,7 @@ class OpenGLAnimationWidget(QOpenGLWidget):
             else:
                 layer_world_states = self.render_layers_from_states(
                     world_states,
+                    time_value=time_value,
                     render_attachments=render_attachments,
                     render_particles=render_particles,
                 )
@@ -3177,6 +4220,131 @@ class OpenGLAnimationWidget(QOpenGLWidget):
             self._tile_last_signature = signature
             self._tile_stats_last_emit = now
             self.tile_render_stats.emit(dict(stats))
+
+    def _spatial3d_chain_depth(
+        self,
+        layer: LayerData,
+        layer_map: Dict[int, LayerData],
+    ) -> int:
+        depth = 0
+        current = layer
+        visited: Set[int] = set()
+        while current.parent_id is not None and current.parent_id >= 0:
+            parent_id = int(current.parent_id)
+            if parent_id in visited or parent_id not in layer_map:
+                break
+            visited.add(parent_id)
+            depth += 1
+            current = layer_map[parent_id]
+            if depth > 64:
+                break
+        return depth
+
+    def _compute_spatial3d_layer_depths(
+        self,
+        render_layers: List[LayerData],
+        layer_world_states: Dict[int, Dict],
+    ) -> Dict[int, float]:
+        if not self._spatial3d_eye_sign or not self._spatial3d_active() or not render_layers:
+            return {}
+
+        layer_map, _order_map, _cached_layers, _has_depth = self._get_animation_layer_cache(
+            self.player.animation
+        )
+        raw_depths: List[float] = []
+        y_values: List[float] = []
+        for layer in render_layers:
+            state = layer_world_states.get(layer.layer_id) or {}
+            try:
+                raw_depths.append(float(state.get("depth", 0.0) or 0.0))
+            except (TypeError, ValueError):
+                raw_depths.append(0.0)
+            try:
+                y_values.append(float(state.get("anchor_world_y", state.get("ty", 0.0)) or 0.0))
+            except (TypeError, ValueError):
+                y_values.append(0.0)
+
+        explicit_min = min(raw_depths) if raw_depths else 0.0
+        explicit_max = max(raw_depths) if raw_depths else 0.0
+        has_explicit_depth = (explicit_max - explicit_min) > 1e-5
+        y_min = min(y_values) if y_values else 0.0
+        y_max = max(y_values) if y_values else 0.0
+        y_range = y_max - y_min
+        chain_depths = {
+            layer.layer_id: self._spatial3d_chain_depth(layer, layer_map)
+            for layer in render_layers
+        }
+        max_chain = max(chain_depths.values()) if chain_depths else 0
+        layer_count = len(render_layers)
+        result: Dict[int, float] = {}
+
+        for index, layer in enumerate(render_layers):
+            layer_id = layer.layer_id
+            state = layer_world_states.get(layer_id) or {}
+            if has_explicit_depth:
+                try:
+                    raw_depth = float(state.get("depth", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    raw_depth = 0.0
+                z_value = ((raw_depth - explicit_min) / (explicit_max - explicit_min) - 0.5) * 1.24
+            else:
+                order_norm = ((float(index) / float(layer_count - 1)) - 0.5) if layer_count > 1 else 0.0
+                chain_norm = (
+                    (float(chain_depths.get(layer_id, 0)) / float(max_chain)) - 0.5
+                    if max_chain > 0
+                    else 0.0
+                )
+                try:
+                    y_value = float(state.get("anchor_world_y", state.get("ty", 0.0)) or 0.0)
+                except (TypeError, ValueError):
+                    y_value = 0.0
+                y_norm = ((y_value - y_min) / y_range - 0.5) if y_range > 1e-5 else 0.0
+                z_value = (order_norm * 0.8) + (chain_norm * 0.25) + (y_norm * 0.2)
+            result[layer_id] = max(-0.62, min(0.62, float(z_value)))
+        return result
+
+    def _push_spatial3d_layer_transform(
+        self,
+        layer: LayerData,
+        world_state: Dict,
+        depth_z: float,
+    ) -> bool:
+        if not self._spatial3d_eye_sign or not self._spatial3d_active():
+            return False
+        try:
+            z_value = max(-0.75, min(0.75, float(depth_z)))
+        except (TypeError, ValueError):
+            return False
+        strength = max(0.0, min(1.0, float(self.spatial3d_depth_strength)))
+        try:
+            screen_plane = max(-1.0, min(1.0, float(self.spatial3d_screen_plane)))
+        except (TypeError, ValueError):
+            screen_plane = 0.0
+        parallax_z = max(-1.5, min(1.5, z_value + (screen_plane * 0.75)))
+        if strength <= 1e-4 or (abs(z_value) <= 1e-5 and abs(parallax_z) <= 1e-5):
+            return False
+
+        offset_x = (
+            (self._spatial3d_eye_sign * parallax_z * self.spatial3d_eye_separation_px)
+            + (self.spatial3d_view_x * z_value * self.spatial3d_parallax_px)
+        ) * strength
+        offset_y = self.spatial3d_view_y * z_value * self.spatial3d_parallax_px * strength
+        scale = max(0.2, 1.0 + (self.spatial3d_perspective * z_value * strength))
+        if abs(offset_x) < 0.01 and abs(offset_y) < 0.01 and abs(scale - 1.0) < 1e-4:
+            return False
+
+        try:
+            center_x = float(world_state.get("anchor_world_x", world_state.get("tx", 0.0)) or 0.0)
+            center_y = float(world_state.get("anchor_world_y", world_state.get("ty", 0.0)) or 0.0)
+        except (TypeError, ValueError):
+            center_x = 0.0
+            center_y = 0.0
+
+        glPushMatrix()
+        glTranslatef(center_x + offset_x, center_y + offset_y, 0.0)
+        glScalef(scale, scale, 1.0)
+        glTranslatef(-center_x, -center_y, 0.0)
+        return True
     
     def render_all_layers(
         self,
@@ -3205,6 +4373,7 @@ class OpenGLAnimationWidget(QOpenGLWidget):
             self.player.animation
         )
         render_layers = self._get_render_layers(layer_world_states)
+        spatial_depths = self._compute_spatial3d_layer_depths(render_layers, layer_world_states)
         particle_draws = self._build_particle_draws(self.player.animation, time) if render_particles else []
         if particle_draws and layer_world_states:
             depths = [state.get("depth", 0.0) for state in layer_world_states.values()]
@@ -3251,12 +4420,21 @@ class OpenGLAnimationWidget(QOpenGLWidget):
                     if override_atlases
                     else self.texture_atlases
                 )
-                self.renderer.render_layer(
-                    layer, world_state, atlas_chain, self.layer_offsets
+                spatial_pushed = self._push_spatial3d_layer_transform(
+                    layer,
+                    world_state,
+                    spatial_depths.get(layer.layer_id, 0.0),
                 )
-                if attachment_map:
-                    for instance in attachment_map.get(layer.layer_id, []):
-                        self._render_attachment_layers(instance, world_state)
+                try:
+                    self.renderer.render_layer(
+                        layer, world_state, atlas_chain, self.layer_offsets
+                    )
+                    if attachment_map:
+                        for instance in attachment_map.get(layer.layer_id, []):
+                            self._render_attachment_layers(instance, world_state)
+                finally:
+                    if spatial_pushed:
+                        glPopMatrix()
         if particle_draws:
             for idx in range(particle_idx, len(particle_draws)):
                 self._render_particle_draw(particle_draws[idx])
@@ -3268,12 +4446,16 @@ class OpenGLAnimationWidget(QOpenGLWidget):
         self,
         layer_world_states: Dict[int, Dict],
         *,
+        time_value: Optional[float] = None,
         render_attachments: bool = True,
         render_particles: bool = False,
     ) -> Dict[int, Dict]:
         """Render layers using precomputed world states (skip compute)."""
         if not self.player.animation:
             return layer_world_states
+        render_time = float(self.player.current_time if time_value is None else time_value)
+        self.renderer.current_time = render_time
+        self.renderer.animation_duration = self.player.duration or 0.0
         self._last_layer_world_states = layer_world_states
         attachment_map = self._group_attachments_by_layer() if render_attachments else {}
         self.renderer.reset_layer_masks()
@@ -3281,7 +4463,8 @@ class OpenGLAnimationWidget(QOpenGLWidget):
             self.player.animation
         )
         render_layers = self._get_render_layers(layer_world_states)
-        particle_draws = self._build_particle_draws(self.player.animation, self.player.current_time) if render_particles else []
+        spatial_depths = self._compute_spatial3d_layer_depths(render_layers, layer_world_states)
+        particle_draws = self._build_particle_draws(self.player.animation, render_time) if render_particles else []
         if particle_draws and layer_world_states:
             depths = [state.get("depth", 0.0) for state in layer_world_states.values()]
             if depths:
@@ -3325,12 +4508,21 @@ class OpenGLAnimationWidget(QOpenGLWidget):
                 if override_atlases
                 else self.texture_atlases
             )
-            self.renderer.render_layer(
-                layer, world_state, atlas_chain, self.layer_offsets
+            spatial_pushed = self._push_spatial3d_layer_transform(
+                layer,
+                world_state,
+                spatial_depths.get(layer.layer_id, 0.0),
             )
-            if attachment_map:
-                for instance in attachment_map.get(layer.layer_id, []):
-                    self._render_attachment_layers(instance, world_state)
+            try:
+                self.renderer.render_layer(
+                    layer, world_state, atlas_chain, self.layer_offsets
+                )
+                if attachment_map:
+                    for instance in attachment_map.get(layer.layer_id, []):
+                        self._render_attachment_layers(instance, world_state)
+            finally:
+                if spatial_pushed:
+                    glPopMatrix()
         if particle_draws:
             for idx in range(particle_idx, len(particle_draws)):
                 self._render_particle_draw(particle_draws[idx])
@@ -3450,7 +4642,7 @@ class OpenGLAnimationWidget(QOpenGLWidget):
             animation_layer_map = {layer.layer_id: layer for layer in animation.layers}
         matched_layer_state_cache: Dict[Tuple[int, int], Optional[Dict[str, Any]]] = {}
         matched_layer_point_cache: Dict[Tuple[int, int], Optional[Tuple[float, float]]] = {}
-        emitter_origin_cache: Dict[Tuple[int, int, bool, bool], Tuple[float, float, float]] = {}
+        emitter_origin_cache: Dict[Tuple[int, int, bool, bool, bool], Tuple[float, float, float]] = {}
 
         def rotate_by_quat(x: float, y: float, z: float, qx: float, qy: float, qz: float, qw: float) -> Tuple[float, float, float]:
             # t = 2 * cross(q.xyz, v)
@@ -3552,6 +4744,73 @@ class OpenGLAnimationWidget(QOpenGLWidget):
                 py *= base_scale
             return px, py, pz
 
+        def _entry_has_stable_control_socket(entry: ParticleRenderEntry) -> bool:
+            if not entry.control_channels or entry.control_local_offset is None:
+                return False
+            std = entry.control_local_offset_std
+            if std is None:
+                return False
+            try:
+                max_std = max(abs(float(std[0])), abs(float(std[1])))
+            except Exception:
+                return False
+            return max_std <= 0.5
+
+        def _sample_control_socket_pos(
+            entry: ParticleRenderEntry,
+            sample_time: float,
+            node_z: float,
+        ) -> Optional[Tuple[float, float, float]]:
+            if not _entry_has_stable_control_socket(entry):
+                return None
+            control_x, control_y, _control_z = _sample_authored_node_pos(
+                entry.control_channels,
+                sample_time,
+                offset=entry.control_offset,
+                fold_depth=False,
+                apply_flip=False,
+                apply_scale=False,
+            )
+            control_rot = self._eval_particle_channel(
+                entry.control_channels.get(5, []),
+                sample_time,
+                0.0,
+            )
+            cos_c = math.cos(control_rot)
+            sin_c = math.sin(control_rot)
+            local_dx, local_dy = entry.control_local_offset or (0.0, 0.0)
+            source_x = control_x + (local_dx * cos_c - local_dy * sin_c)
+            source_y = control_y + (local_dx * sin_c + local_dy * cos_c)
+            return source_x, source_y, node_z
+
+        def _sample_baseline_pos(
+            entry: ParticleRenderEntry,
+            sample_time: float,
+        ) -> Optional[Tuple[float, float, float]]:
+            if not entry.baseline_name:
+                return None
+            return _sample_authored_node_pos(
+                entry.baseline_channels,
+                sample_time,
+                offset=entry.baseline_offset,
+                fold_depth=False,
+                apply_flip=False,
+                apply_scale=False,
+            )
+
+        def _apply_controller_baseline(
+            entry: ParticleRenderEntry,
+            sample_time: float,
+            x: float,
+            y: float,
+            z: float,
+        ) -> Tuple[float, float, float]:
+            baseline_pos = _sample_baseline_pos(entry, sample_time)
+            if baseline_pos is None:
+                return x, y, z
+            baseline_x, baseline_y, _baseline_z = baseline_pos
+            return x - baseline_x, y - baseline_y, z
+
         def _sample_emitter_origin(
             entry: ParticleRenderEntry,
             sample_time: float,
@@ -3586,7 +4845,10 @@ class OpenGLAnimationWidget(QOpenGLWidget):
             source_x = node_x
             source_y = node_y
             source_z = node_z
-            if entry.control_channels:
+            control_socket_pos = _sample_control_socket_pos(entry, sample_time, node_z)
+            if control_socket_pos is not None:
+                source_x, source_y, source_z = control_socket_pos
+            elif entry.control_channels:
                 control_x, control_y, control_z = _sample_authored_node_pos(
                     entry.control_channels,
                     sample_time,
@@ -3599,7 +4861,16 @@ class OpenGLAnimationWidget(QOpenGLWidget):
                 source_y = control_y
                 source_z = control_z
 
-            source_y -= source_z
+            source_x, source_y, source_z = _apply_controller_baseline(
+                entry,
+                sample_time,
+                source_x,
+                source_y,
+                source_z,
+            )
+
+            # These are live Unity particle-node coordinates, not converted JSON
+            # layer positions. Do not apply DOF converter position_scale here.
             if apply_flip and flip_y:
                 source_y = -source_y
             if apply_scale:
@@ -3607,7 +4878,7 @@ class OpenGLAnimationWidget(QOpenGLWidget):
                 source_y *= base_scale
                 source_x += self.renderer.world_offset_x
                 source_y += self.renderer.world_offset_y
-                if use_surface_projection:
+                if use_surface_projection and control_socket_pos is None:
                     matched_source = _sample_matched_layer_surface(entry, sample_time)
                     if matched_source is not None:
                         source_x, source_y = matched_source
@@ -3636,10 +4907,29 @@ class OpenGLAnimationWidget(QOpenGLWidget):
             # layer rotates or changes scale, which can keep heavy emitters like
             # Fireboss artificially saturated even during low-motion periods.
             use_control_source = bool(entry.control_channels and entry.source_layer_id is None)
+            if use_control_source:
+                _node_x, _node_y, node_z = _sample_authored_node_pos(
+                    entry.channels,
+                    sample_time,
+                    offset=entry.offset,
+                    prefab_pos=entry.prefab_pos,
+                    fold_depth=False,
+                    apply_flip=False,
+                    apply_scale=False,
+                )
+                control_socket_pos = _sample_control_socket_pos(entry, sample_time, node_z)
+                if control_socket_pos is not None:
+                    return _apply_controller_baseline(
+                        entry,
+                        sample_time,
+                        control_socket_pos[0],
+                        control_socket_pos[1],
+                        control_socket_pos[2],
+                    )
             channels = entry.control_channels if use_control_source else entry.channels
             offset = entry.control_offset if use_control_source else entry.offset
             prefab_pos = (0.0, 0.0, 0.0) if use_control_source else entry.prefab_pos
-            return _sample_authored_node_pos(
+            source_x, source_y, source_z = _sample_authored_node_pos(
                 channels,
                 sample_time,
                 offset=offset,
@@ -3647,6 +4937,13 @@ class OpenGLAnimationWidget(QOpenGLWidget):
                 fold_depth=False,
                 apply_flip=False,
                 apply_scale=False,
+            )
+            return _apply_controller_baseline(
+                entry,
+                sample_time,
+                source_x,
+                source_y,
+                source_z,
             )
 
         def _get_matched_layer_state(
@@ -3982,6 +5279,7 @@ class OpenGLAnimationWidget(QOpenGLWidget):
                 tuple(entry.channels.get(2, [])),
                 entry.source_layer_id,
                 entry.control_name,
+                entry.baseline_name,
             )
             cached = self._particle_emission_cache.get(cache_key)
             if cached is not None:
@@ -4266,6 +5564,10 @@ class OpenGLAnimationWidget(QOpenGLWidget):
                     entry.name,
                     entry.source_layer_id,
                     entry.control_name,
+                    entry.baseline_name,
+                    round(float(entry.baseline_offset[0]), 4),
+                    round(float(entry.baseline_offset[1]), 4),
+                    round(float(entry.baseline_offset[2]), 4),
                     round(float(entry.offset[0]), 4),
                     round(float(entry.offset[1]), 4),
                     round(float(entry.offset[2]), 4),
@@ -4432,11 +5734,21 @@ class OpenGLAnimationWidget(QOpenGLWidget):
                 self._particle_debug_info = {
                     "emitter_name": entry.name,
                     "control_name": entry.control_name,
+                    "baseline_name": entry.baseline_name,
+                    "baseline_offset": entry.baseline_offset,
                     "source_layer_name": entry.source_layer_name,
                     "source_layer_offset_local": entry.source_layer_offset_local,
                     "source_layer_offset_std": entry.source_layer_offset_std,
                     "source_surface_direction": entry.source_surface_direction,
-                    "source_mode": "layer_surface_projection" if entry.source_layer_id is not None else "raw_node",
+                    "source_mode": (
+                        "control_socket"
+                        if _entry_has_stable_control_socket(entry)
+                        else (
+                            "layer_surface_projection"
+                            if entry.source_layer_id is not None
+                            else ("control_point" if entry.control_channels else "raw_node")
+                        )
+                    ),
                     "shape_type": entry.shape_type,
                     "shape_placement_mode": entry.shape_placement_mode,
                     "shape_angle": entry.shape_angle,
@@ -4464,7 +5776,7 @@ class OpenGLAnimationWidget(QOpenGLWidget):
                 }
 
             matched_layer_depth = None
-            if entry.source_layer_id is not None:
+            if entry.source_layer_id is not None and not _entry_has_stable_control_socket(entry):
                 matched_source_state = _get_matched_layer_state(entry.source_layer_id, time_value)
                 if matched_source_state:
                     try:
@@ -4718,6 +6030,7 @@ class OpenGLAnimationWidget(QOpenGLWidget):
                     sample_particle_y = particle_y
                     sample_control_origin = None
                     sample_derived_socket = None
+                    sample_baseline_origin = None
                     sample_node_xy_origin = None
                     sample_node_alt_depth_origin = None
                     node_raw_x, node_raw_y, node_raw_z = _sample_authored_node_pos(
@@ -4729,17 +6042,31 @@ class OpenGLAnimationWidget(QOpenGLWidget):
                         apply_flip=False,
                         apply_scale=False,
                     )
-                    node_xy_screen_y = node_raw_y
-                    node_alt_depth_screen_y = node_raw_y - node_raw_z
+                    baseline_raw_x = 0.0
+                    baseline_raw_y = 0.0
+                    baseline_pos = _sample_baseline_pos(entry, origin_sample_time)
+                    if baseline_pos is not None:
+                        baseline_raw_x, baseline_raw_y, _baseline_raw_z = baseline_pos
+                        baseline_screen_y = baseline_raw_y
+                        if flip_y:
+                            baseline_screen_y = -baseline_screen_y
+                        sample_baseline_origin = (
+                            baseline_raw_x * base_scale + self.renderer.world_offset_x,
+                            baseline_screen_y * base_scale + self.renderer.world_offset_y,
+                        )
+                    node_display_x = node_raw_x - baseline_raw_x
+                    node_display_y = node_raw_y - baseline_raw_y
+                    node_xy_screen_y = node_display_y
+                    node_alt_depth_screen_y = node_display_y - node_raw_z
                     if flip_y:
                         node_xy_screen_y = -node_xy_screen_y
                         node_alt_depth_screen_y = -node_alt_depth_screen_y
                     sample_node_xy_origin = (
-                        node_raw_x * base_scale + self.renderer.world_offset_x,
+                        node_display_x * base_scale + self.renderer.world_offset_x,
                         node_xy_screen_y * base_scale + self.renderer.world_offset_y,
                     )
                     sample_node_alt_depth_origin = (
-                        node_raw_x * base_scale + self.renderer.world_offset_x,
+                        node_display_x * base_scale + self.renderer.world_offset_x,
                         node_alt_depth_screen_y * base_scale + self.renderer.world_offset_y,
                     )
                     if entry.control_channels:
@@ -4751,11 +6078,13 @@ class OpenGLAnimationWidget(QOpenGLWidget):
                             apply_flip=False,
                             apply_scale=False,
                         )
-                        control_screen_y = control_raw_y - control_raw_z
+                        control_display_x = control_raw_x - baseline_raw_x
+                        control_display_y = control_raw_y - baseline_raw_y
+                        control_screen_y = control_display_y
                         if flip_y:
                             control_screen_y = -control_screen_y
                         sample_control_origin = (
-                            control_raw_x * base_scale + self.renderer.world_offset_x,
+                            control_display_x * base_scale + self.renderer.world_offset_x,
                             control_screen_y * base_scale + self.renderer.world_offset_y,
                         )
                         if entry.control_local_offset:
@@ -4769,11 +6098,13 @@ class OpenGLAnimationWidget(QOpenGLWidget):
                             local_dx, local_dy = entry.control_local_offset
                             derived_raw_x = control_raw_x + (local_dx * cos_c - local_dy * sin_c)
                             derived_raw_y = control_raw_y + (local_dx * sin_c + local_dy * cos_c)
-                            derived_screen_y = derived_raw_y - node_raw_z
+                            derived_display_x = derived_raw_x - baseline_raw_x
+                            derived_display_y = derived_raw_y - baseline_raw_y
+                            derived_screen_y = derived_display_y
                             if flip_y:
                                 derived_screen_y = -derived_screen_y
                             sample_derived_socket = (
-                                derived_raw_x * base_scale + self.renderer.world_offset_x,
+                                derived_display_x * base_scale + self.renderer.world_offset_x,
                                 derived_screen_y * base_scale + self.renderer.world_offset_y,
                             )
                     self._particle_debug_samples.append(
@@ -4789,6 +6120,7 @@ class OpenGLAnimationWidget(QOpenGLWidget):
                             life=life,
                             control_origin=sample_control_origin,
                             derived_socket=sample_derived_socket,
+                            baseline_origin=sample_baseline_origin,
                             node_xy_origin=sample_node_xy_origin,
                             node_alt_depth_origin=sample_node_alt_depth_origin,
                         )
@@ -5093,6 +6425,7 @@ class OpenGLAnimationWidget(QOpenGLWidget):
 
     def set_constraint_manager(self, manager: Optional[ConstraintManager]) -> None:
         self.constraint_manager = manager
+        self.clear_baked_frame_cache()
 
     def _apply_constraints_to_offsets(self) -> None:
         if not self.constraint_manager or not self.constraint_manager.enabled:
@@ -5114,25 +6447,43 @@ class OpenGLAnimationWidget(QOpenGLWidget):
         )
         if self.joint_solver_enabled:
             self._apply_joint_solver_to_offsets()
+        self.clear_baked_frame_cache()
 
     def set_joint_solver_enabled(self, enabled: bool) -> None:
-        self.joint_solver_enabled = bool(enabled)
+        normalized = bool(enabled)
+        if self.joint_solver_enabled == normalized:
+            return
+        self.joint_solver_enabled = normalized
+        self.clear_baked_frame_cache()
         if self.joint_solver_enabled:
             self.capture_joint_rest_lengths()
 
     def set_joint_solver_iterations(self, value: int) -> None:
-        self.joint_solver_iterations = max(1, int(value))
+        normalized = max(1, int(value))
+        if self.joint_solver_iterations != normalized:
+            self.joint_solver_iterations = normalized
+            self.clear_baked_frame_cache()
 
     def set_joint_solver_strength(self, value: float) -> None:
-        self.joint_solver_strength = max(0.0, min(1.0, float(value)))
+        normalized = max(0.0, min(1.0, float(value)))
+        if abs(self.joint_solver_strength - normalized) > 1e-9:
+            self.joint_solver_strength = normalized
+            self.clear_baked_frame_cache()
 
     def set_joint_solver_parented(self, enabled: bool) -> None:
-        self.joint_solver_parented = bool(enabled)
+        normalized = bool(enabled)
+        if self.joint_solver_parented == normalized:
+            return
+        self.joint_solver_parented = normalized
+        self.clear_baked_frame_cache()
         if self.joint_solver_enabled:
             self.capture_joint_rest_lengths()
 
     def set_propagate_user_transforms(self, enabled: bool) -> None:
-        self.propagate_user_transforms = bool(enabled)
+        normalized = bool(enabled)
+        if self.propagate_user_transforms != normalized:
+            self.propagate_user_transforms = normalized
+            self.clear_baked_frame_cache()
 
     def capture_joint_rest_lengths(self) -> None:
         """Capture rest lengths from the current pose (anchors with offsets)."""
@@ -5277,6 +6628,7 @@ class OpenGLAnimationWidget(QOpenGLWidget):
                         child_offset[0] + delta_x,
                         child_offset[1] + delta_y,
                     )
+                    self.clear_baked_frame_cache()
 
     def refresh_joint_solver_after_pose_record(self, fixed_layer_ids: Optional[Set[int]] = None) -> None:
         """Re-run joint solver after pose recording so children stay aligned."""
@@ -6536,6 +7888,7 @@ class OpenGLAnimationWidget(QOpenGLWidget):
             f"Emitters: {len(self.particle_entries)}",
             f"Emitter: {info.get('emitter_name', '?')}",
             f"Control: {info.get('control_name', '-')}",
+            f"Baseline: {info.get('baseline_name') or '-'}",
             f"Viewport cap: {int(info.get('viewport_particle_cap', 0))}",
             f"Emitter cap: {int(info.get('emitter_particle_cap', 0))}",
             f"Missing textures: {missing_textures}",
@@ -6587,6 +7940,10 @@ class OpenGLAnimationWidget(QOpenGLWidget):
                 lines.append(
                     f"Socket: ({sample.derived_socket[0]:.2f}, {sample.derived_socket[1]:.2f})"
                 )
+            if sample.baseline_origin:
+                lines.append(
+                    f"Baseline raw: ({sample.baseline_origin[0]:.2f}, {sample.baseline_origin[1]:.2f})"
+                )
             if sample.node_xy_origin:
                 lines.append(
                     f"Node XY: ({sample.node_xy_origin[0]:.2f}, {sample.node_xy_origin[1]:.2f})"
@@ -6605,6 +7962,11 @@ class OpenGLAnimationWidget(QOpenGLWidget):
         particle_origin_offset = info.get("particle_origin_offset")
         particle_distance_sensitivity = info.get("particle_distance_sensitivity")
         current_source = info.get("current_source")
+        baseline_offset = info.get("baseline_offset")
+        if info.get("baseline_name") and baseline_offset:
+            lines.append(
+                f"Baseline offset: ({baseline_offset[0]:.2f}, {baseline_offset[1]:.2f}, {baseline_offset[2]:.2f})"
+            )
         if control_offset:
             lines.append(
                 f"Local socket: ({control_offset[0]:.2f}, {control_offset[1]:.2f})"
@@ -6675,6 +8037,7 @@ class OpenGLAnimationWidget(QOpenGLWidget):
                 trail_color = QColor(255, 255, 255, 120)
                 control_color = QColor(210, 120, 255, 220)
                 socket_color = QColor(255, 120, 210, 220)
+                baseline_color = QColor(140, 255, 220, 220)
                 node_xy_color = QColor(120, 180, 255, 220)
                 node_alt_color = QColor(255, 120, 120, 220)
                 current_source_color = QColor(255, 255, 64, 220)
@@ -6688,9 +8051,16 @@ class OpenGLAnimationWidget(QOpenGLWidget):
                     trail_color.setAlpha(max(60, alpha - 80))
                     control_color.setAlpha(alpha)
                     socket_color.setAlpha(alpha)
+                    baseline_color.setAlpha(alpha)
                     node_xy_color.setAlpha(alpha)
                     node_alt_color.setAlpha(alpha)
                     current_source_color.setAlpha(alpha)
+                if sample.baseline_origin:
+                    bx, by = self.world_to_screen(*sample.baseline_origin)
+                    painter.setPen(baseline_color)
+                    painter.drawLine(int(bx - 4), int(by - 4), int(bx + 4), int(by + 4))
+                    painter.drawLine(int(bx - 4), int(by + 4), int(bx + 4), int(by - 4))
+                    painter.drawEllipse(QRectF(bx - 3.0, by - 3.0, 6.0, 6.0))
                 if sample.node_xy_origin:
                     nx, ny = self.world_to_screen(*sample.node_xy_origin)
                     painter.setPen(node_xy_color)
@@ -6982,6 +8352,7 @@ class OpenGLAnimationWidget(QOpenGLWidget):
                     new_sy = clamp(init_sy * ratio_y)
                 self.layer_scale_offsets[target] = (new_sx, new_sy)
         self._apply_constraints_to_offsets()
+        self.clear_baked_frame_cache()
 
     def _update_rotation_drag(self, world_x: float, world_y: float):
         """Update rotation offset while dragging the gizmo."""
@@ -7016,6 +8387,7 @@ class OpenGLAnimationWidget(QOpenGLWidget):
                 value = round(value / snap_step) * snap_step
             self.layer_rotations[layer_id] = value
         self._apply_constraints_to_offsets()
+        self.clear_baked_frame_cache()
         self.update()
 
     def _get_layer_anchor_value(self, layer_id: int) -> Optional[Tuple[float, float]]:
@@ -7102,6 +8474,7 @@ class OpenGLAnimationWidget(QOpenGLWidget):
                 self.layer_anchor_overrides.pop(layer_id, None)
             else:
                 self.layer_anchor_overrides[layer_id] = tuple(anchor)
+        self.clear_baked_frame_cache()
         self.update()
     
     def _begin_anchor_drag(self, layer_id: int):
@@ -7154,6 +8527,7 @@ class OpenGLAnimationWidget(QOpenGLWidget):
         new_anchor = (anchor_value[0] + delta_json_x, anchor_value[1] + delta_json_y)
         self._set_layer_anchor_override(self.anchor_drag_layer_id, new_anchor)
         self.anchor_drag_last_world = (world_x, world_y)
+        self.clear_baked_frame_cache()
         self.update()
 
     def _end_anchor_drag(self):
@@ -7185,6 +8559,7 @@ class OpenGLAnimationWidget(QOpenGLWidget):
         old_x, old_y = self.layer_offsets.get(layer_id, (0.0, 0.0))
         self.layer_offsets[layer_id] = (old_x + dx, old_y + dy)
         self.parent_drag_last_world = (world_x, world_y)
+        self.clear_baked_frame_cache()
         self.update()
 
     def _end_parent_drag(self):
@@ -7373,27 +8748,28 @@ class OpenGLAnimationWidget(QOpenGLWidget):
     
     def update_animation(self):
         """Update animation state with proper delta time"""
-        if not self.player.playing or not self.player.animation:
-            self._sync_animation_timer()
-            return
+        with profile_scope("viewport.update_animation"):
+            if not self.player.playing or not self.player.animation:
+                self._sync_animation_timer()
+                return
 
-        current_time = time.time()
+            current_time = time.time()
 
-        if self.last_update_time is not None:
-            delta_time = current_time - self.last_update_time
-            delta_time = min(delta_time, 0.1)
-        else:
-            delta_time = 0.016
+            if self.last_update_time is not None:
+                delta_time = current_time - self.last_update_time
+                delta_time = min(delta_time, 0.1)
+            else:
+                delta_time = 0.016
 
-        self.last_update_time = current_time
-        self._motion_blur_frame_dt = max(1.0 / 240.0, min(1.0 / 20.0, float(delta_time)))
+            self.last_update_time = current_time
+            self._motion_blur_frame_dt = max(1.0 / 240.0, min(1.0 / 20.0, float(delta_time)))
 
-        was_playing = self.player.playing
-        previous_time = self.player.current_time
+            was_playing = self.player.playing
+            previous_time = self.player.current_time
 
-        self.player.update(delta_time)
-        if self.player.animation:
-            self.animation_time_changed.emit(self.player.current_time, self.player.duration)
+            self.player.update(delta_time)
+            if self.player.animation:
+                self.animation_time_changed.emit(self.player.current_time, self.player.duration)
             if self.player.loop and self.player.current_time + 1e-5 < previous_time:
                 self.animation_looped.emit()
         self.update()
@@ -7420,6 +8796,128 @@ class OpenGLAnimationWidget(QOpenGLWidget):
         """Enable or disable OpenGL multisample anti-aliasing."""
         self.antialias_enabled = enabled
         self._apply_antialiasing_state()
+        self.update()
+
+    def set_spatial3d_support_enabled(self, enabled: bool) -> None:
+        normalized = bool(enabled)
+        if self.spatial3d_support_enabled == normalized:
+            return
+        self.spatial3d_support_enabled = normalized
+        if normalized:
+            self._spatiallabs_sdk_attempted = False
+            self._spatiallabs_gl_weaver_failed = False
+            mode = self._normalized_spatial3d_mode()
+            if mode == "side_by_side":
+                self._set_spatial3d_status("Side-by-Side 3D ready")
+            elif mode == "anaglyph":
+                self._set_spatial3d_status("Anaglyph 3D ready")
+            else:
+                self._set_spatial3d_status("SpatialLabs SDK pending")
+        else:
+            self._set_spatiallabs_lens_hint(False)
+            self._set_spatial3d_status("Stereoscopic 3D disabled")
+        self.update()
+
+    def set_spatial3d_enabled(self, enabled: bool) -> None:
+        normalized = bool(enabled)
+        if self.spatial3d_enabled == normalized:
+            return
+        self.spatial3d_enabled = normalized
+        if normalized:
+            self._spatiallabs_gl_weaver_failed = False
+            if self._spatiallabs_sdk is None or not self._spatiallabs_sdk.available:
+                self._spatiallabs_sdk_attempted = False
+        else:
+            self._set_spatiallabs_lens_hint(False)
+            if self.spatial3d_support_enabled:
+                self._set_spatial3d_status("Stereoscopic 3D view off")
+        self.update()
+
+    def set_spatial3d_mode(self, mode: str) -> None:
+        normalized = str(mode or "spatiallabs").strip().lower()
+        if normalized in {"spatial", "spatial_labs", "acer_spatiallabs"}:
+            normalized = "spatiallabs"
+        elif normalized in {"sbs", "side-by-side", "side_by_side"}:
+            normalized = "side_by_side"
+        elif normalized != "anaglyph":
+            normalized = "spatiallabs"
+        if self.spatial3d_mode == normalized:
+            return
+        self.spatial3d_mode = normalized
+        if normalized != "spatiallabs":
+            self._set_spatiallabs_lens_hint(False)
+        else:
+            self._spatiallabs_gl_weaver_failed = False
+        if self.spatial3d_support_enabled:
+            if normalized == "spatiallabs":
+                self._set_spatial3d_status("SpatialLabs SDK pending")
+            elif normalized == "side_by_side":
+                self._set_spatial3d_status("Side-by-Side 3D ready")
+            else:
+                self._set_spatial3d_status("Anaglyph 3D ready")
+        self.update()
+
+    def set_spatial3d_swap_eyes(self, enabled: bool) -> None:
+        normalized = bool(enabled)
+        if self.spatial3d_swap_eyes == normalized:
+            return
+        self.spatial3d_swap_eyes = normalized
+        self.update()
+
+    def shutdown_spatial3d(self) -> None:
+        """Release SDK hints/resources held by the optional SpatialLabs bridge."""
+        self._set_spatiallabs_lens_hint(False)
+        # The SR runtime logs noisy socket-abort messages when contexts are
+        # explicitly deleted; the application process owns this context lifetime.
+        self._spatiallabs_sdk = None
+        self._spatiallabs_sdk_attempted = False
+        self._spatiallabs_sdk_last_attempt = 0.0
+        self._spatiallabs_gl_weaver = None
+        self._spatiallabs_gl_weaver_size = (0, 0)
+        self._spatiallabs_gl_weaver_failed = False
+        self._clear_spatial3d_eye_resources()
+        self._set_spatial3d_status("Stereoscopic 3D disabled")
+
+    def set_spatial3d_depth_strength(self, value: float) -> None:
+        try:
+            normalized = float(value)
+        except (TypeError, ValueError):
+            normalized = 0.5
+        normalized = max(0.0, min(1.0, normalized))
+        if abs(self.spatial3d_depth_strength - normalized) < 1e-6:
+            return
+        self.spatial3d_depth_strength = normalized
+        self.update()
+
+    def set_spatial3d_screen_plane(self, value: float) -> None:
+        try:
+            normalized = float(value)
+        except (TypeError, ValueError):
+            normalized = 0.0
+        normalized = max(-1.0, min(1.0, normalized))
+        if abs(self.spatial3d_screen_plane - normalized) < 1e-6:
+            return
+        self.spatial3d_screen_plane = normalized
+        self.update()
+
+    def set_spatial3d_view_offset(self, x_value: float, y_value: float) -> None:
+        try:
+            normalized_x = float(x_value)
+        except (TypeError, ValueError):
+            normalized_x = 0.0
+        try:
+            normalized_y = float(y_value)
+        except (TypeError, ValueError):
+            normalized_y = 0.0
+        normalized_x = max(-1.0, min(1.0, normalized_x))
+        normalized_y = max(-1.0, min(1.0, normalized_y))
+        if (
+            abs(self.spatial3d_view_x - normalized_x) < 1e-6
+            and abs(self.spatial3d_view_y - normalized_y) < 1e-6
+        ):
+            return
+        self.spatial3d_view_x = normalized_x
+        self.spatial3d_view_y = normalized_y
         self.update()
 
     def set_post_aa_enabled(self, enabled: bool) -> None:
@@ -8013,6 +9511,7 @@ class OpenGLAnimationWidget(QOpenGLWidget):
                     self.layer_offsets[layer_id] = (old_x + dx, old_y + dy)
 
                 self._apply_constraints_to_offsets()
+                self.clear_baked_frame_cache()
                 
                 self.last_mouse_x = current_x
                 self.last_mouse_y = current_y
@@ -8582,6 +10081,7 @@ class OpenGLAnimationWidget(QOpenGLWidget):
         self.parent_dragging = False
         self.anchor_drag_layer_id = None
         self.parent_drag_layer_id = None
+        self.clear_baked_frame_cache()
         self.update()
 
     def set_layer_atlas_overrides(self, overrides: Dict[int, List[TextureAtlas]]):
@@ -8592,6 +10092,7 @@ class OpenGLAnimationWidget(QOpenGLWidget):
             }
         else:
             self.layer_atlas_overrides = {}
+        self.clear_baked_frame_cache()
         self.update()
 
     def set_layer_pivot_context(self, context: Dict[int, bool]):
@@ -8600,6 +10101,7 @@ class OpenGLAnimationWidget(QOpenGLWidget):
             self.layer_pivot_context = dict(context)
         else:
             self.layer_pivot_context = {}
+        self.clear_baked_frame_cache()
         self.update()
 
     def set_shader_registry(self, registry: Optional[ShaderRegistry]):

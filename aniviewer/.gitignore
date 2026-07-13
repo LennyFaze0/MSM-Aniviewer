@@ -11,6 +11,7 @@ anchor_debug.txt
 build/
 dist/
 Output/
+build_exe.bat
 
 # Local environment
 .venv/

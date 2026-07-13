@@ -10,3 +10,6 @@ pillow-avif-plugin>=1.5.2
 soundfile>=0.12.1
 sounddevice>=0.4.6
 UnityPy>=1.25.0
+archspec>=0.2.0
+PyYAML>=6.0.1
+six>=1.16.0

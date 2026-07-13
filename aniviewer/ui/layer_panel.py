@@ -18,6 +18,7 @@ from PyQt6.QtCore import Qt, pyqtSignal, QSize, QPoint, QMimeData
 from PyQt6.QtGui import QIcon, QAction, QColor, QDrag, QPixmap
 
 from core.data_structures import LayerData
+from utils.ui_scaling import clamp_ui_scale, scale_float, scale_int
 
 
 LAYER_DRAG_MIME = "application/x-msm-layer-id"
@@ -81,6 +82,7 @@ class LayerPanel(QWidget):
         self._show_placeholder_layers: bool = True
         self._thumbnail_size = QSize(26, 26)
         self._compact_ui = False
+        self._ui_scale_factor = 1.0
         self._variant_layers: Set[int] = set()
         self._readout_fields: Dict[str, QLabel] = {}
         self._readout_text: Optional[QPlainTextEdit] = None
@@ -325,29 +327,40 @@ class LayerPanel(QWidget):
     def set_compact_ui(self, enabled: bool):
         """Apply compact spacing and row sizing."""
         self._compact_ui = bool(enabled)
-        root_margin = 6 if self._compact_ui else 8
-        root_spacing = 6 if self._compact_ui else 8
+        factor = getattr(self, "_ui_scale_factor", 1.0)
+        root_margin = scale_int(6 if self._compact_ui else 8, factor)
+        root_spacing = scale_int(6 if self._compact_ui else 8, factor)
         layout = self.layout()
         if isinstance(layout, QVBoxLayout):
             layout.setContentsMargins(root_margin, root_margin, root_margin, root_margin)
             layout.setSpacing(root_spacing)
         self.layer_layout.setContentsMargins(
-            2 if self._compact_ui else 4,
-            2 if self._compact_ui else 4,
-            2 if self._compact_ui else 4,
-            2 if self._compact_ui else 4,
+            scale_int(2 if self._compact_ui else 4, factor),
+            scale_int(2 if self._compact_ui else 4, factor),
+            scale_int(2 if self._compact_ui else 4, factor),
+            scale_int(2 if self._compact_ui else 4, factor),
         )
-        self.layer_layout.setSpacing(1 if self._compact_ui else 2)
-        group_spacing = 4 if self._compact_ui else 6
-        group_margins = (6, 6, 6, 6) if self._compact_ui else (8, 6, 8, 6)
+        self.layer_layout.setSpacing(scale_int(1 if self._compact_ui else 2, factor))
+        group_spacing = scale_int(4 if self._compact_ui else 6, factor)
+        group_margins = tuple(
+            scale_int(value, factor)
+            for value in ((6, 6, 6, 6) if self._compact_ui else (8, 6, 8, 6))
+        )
         for group in self.findChildren(QGroupBox):
             group_layout = group.layout()
             if group_layout:
                 group_layout.setSpacing(group_spacing)
                 group_layout.setContentsMargins(*group_margins)
-        self._thumbnail_size = QSize(20, 20) if self._compact_ui else QSize(26, 26)
+        thumb_size = scale_int(20 if self._compact_ui else 26, factor, minimum=12)
+        self._thumbnail_size = QSize(thumb_size, thumb_size)
         for row in self.layer_rows.values():
-            row.set_compact_ui(self._compact_ui, self.thumbnail_size())
+            row.set_compact_ui(self._compact_ui, self.thumbnail_size(), self._ui_scale_factor)
+
+    def set_ui_scale_factor(self, factor: float):
+        """Apply the global viewer UI scale to fixed layer-panel metrics."""
+        self._ui_scale_factor = clamp_ui_scale(factor)
+        self.set_compact_ui(self._compact_ui)
+        self.updateGeometry()
 
     # ------------------------------------------------------------------ #
     # Drag and drop support
@@ -565,20 +578,21 @@ class LayerPanel(QWidget):
         while self.layer_layout.count() > 1:
             item = self.layer_layout.takeAt(0)
             if widget := item.widget():
+                widget.hide()
                 widget.deleteLater()
 
         self.layer_rows.clear()
         self._all_layers = layers
 
         for layer in layers:
-            row = LayerRow(layer)
+            row = LayerRow(layer, parent=self.layer_widget)
             row.visibility_toggled.connect(self.layer_visibility_changed.emit)
             row.select_toggled.connect(self._on_layer_toggle)
             row.sprite_assign_requested.connect(self._on_row_sprite_assign)
             row.constraint_toggled.connect(self._on_constraint_toggle)
             row.is_placeholder = layer.layer_id in self._default_hidden_layers
             row.set_sprite_variant_enabled(layer.layer_id in self._variant_layers)
-            row.set_compact_ui(self._compact_ui, self.thumbnail_size())
+            row.set_compact_ui(self._compact_ui, self.thumbnail_size(), self._ui_scale_factor)
             self.layer_rows[layer.layer_id] = row
             self.layer_layout.insertWidget(self.layer_layout.count() - 1, row)
             row.set_thumbnail(None, self.thumbnail_size())
@@ -596,15 +610,13 @@ class LayerPanel(QWidget):
 
     def _clear_attachment_rows(self):
         """Remove all attachment rows from the panel."""
+        for _, button, _ in self._attachment_rows.values():
+            self._attachment_button_group.removeButton(button)
         while self.attachment_layout.count():
             item = self.attachment_layout.takeAt(0)
             if widget := item.widget():
+                widget.hide()
                 widget.deleteLater()
-        for container, button, checkbox in self._attachment_rows.values():
-            self._attachment_button_group.removeButton(button)
-            button.deleteLater()
-            checkbox.deleteLater()
-            container.deleteLater()
         self._attachment_rows.clear()
         self._attachment_selected_id = None
 
@@ -618,7 +630,8 @@ class LayerPanel(QWidget):
         for attachment_id, name, visible, target in entries:
             row = QHBoxLayout()
             row.setSpacing(6)
-            checkbox = QCheckBox()
+            container = QWidget(self.attach_group)
+            checkbox = QCheckBox(container)
             checkbox.setChecked(bool(visible))
             checkbox.toggled.connect(
                 lambda checked, aid=attachment_id: self.attachment_visibility_changed.emit(aid, checked)
@@ -627,12 +640,11 @@ class LayerPanel(QWidget):
             label = name or "attachment"
             if target:
                 label = f"{label} ({target})"
-            button = QToolButton()
+            button = QToolButton(container)
             button.setText(label)
             button.setCheckable(True)
             self._attachment_button_group.addButton(button, attachment_id)
             row.addWidget(button, 1)
-            container = QWidget()
             container.setLayout(row)
             self.attachment_layout.addWidget(container)
             self._attachment_rows[attachment_id] = (container, button, checkbox)
@@ -1055,6 +1067,8 @@ class LayerRow(QFrame):
         self._pending_ctrl_select = False
         self.is_placeholder = False
         self._thumbnail_pixmap: Optional[QPixmap] = None
+        self._compact_ui = False
+        self._ui_scale_factor = 1.0
 
         self.setMinimumHeight(28)
         self.setFrameShape(QFrame.Shape.StyledPanel)
@@ -1066,14 +1080,14 @@ class LayerRow(QFrame):
         self._row_layout = layout
 
         # Visibility checkbox (just the checkbox indicator, no text)
-        self.checkbox = QCheckBox()
+        self.checkbox = QCheckBox(self)
         self.checkbox.setChecked(layer.visible)
         self.checkbox.stateChanged.connect(self._on_visibility)
         self.checkbox.setToolTip("Toggle visibility")
         self.checkbox.setFixedWidth(20)
         layout.addWidget(self.checkbox)
 
-        self.thumbnail_label = QLabel()
+        self.thumbnail_label = QLabel(self)
         self.thumbnail_label.setFixedSize(24, 24)
         self.thumbnail_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.thumbnail_label.setStyleSheet(
@@ -1082,13 +1096,13 @@ class LayerRow(QFrame):
         layout.addWidget(self.thumbnail_label)
 
         # Layer name label (clickable for selection)
-        self.name_label = QLabel(layer.name)
+        self.name_label = QLabel(layer.name, self)
         self.name_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self.name_label.setCursor(Qt.CursorShape.PointingHandCursor)
         layout.addWidget(self.name_label, stretch=1)
 
         # Sprite variant button
-        self.sprite_button = QToolButton()
+        self.sprite_button = QToolButton(self)
         self.sprite_button.setText("Sprite")
         self.sprite_button.setToolTip("Assign sprites for this layer's keyframes")
         self.sprite_button.setAutoRaise(True)
@@ -1099,7 +1113,7 @@ class LayerRow(QFrame):
         layout.addWidget(self.sprite_button)
 
         # Constraints toggle
-        self.constraint_toggle = QToolButton()
+        self.constraint_toggle = QToolButton(self)
         self.constraint_toggle.setText("C")
         self.constraint_toggle.setToolTip("Enable constraints for this layer")
         self.constraint_toggle.setCheckable(True)
@@ -1110,7 +1124,7 @@ class LayerRow(QFrame):
         layout.addWidget(self.constraint_toggle)
 
         # Status indicator (for diagnostics)
-        self.status_indicator = QLabel()
+        self.status_indicator = QLabel(self)
         self.status_indicator.setFixedSize(8, 8)
         self.status_indicator.setStyleSheet("background: transparent; border-radius: 4px;")
         self.status_indicator.setVisible(False)
@@ -1120,23 +1134,39 @@ class LayerRow(QFrame):
         # Apply base style
         self._apply_style()
 
-    def set_compact_ui(self, enabled: bool, thumbnail_size: QSize):
+    def set_compact_ui(self, enabled: bool, thumbnail_size: QSize, ui_scale_factor: float = 1.0):
+        factor = clamp_ui_scale(ui_scale_factor)
+        self._compact_ui = bool(enabled)
+        self._ui_scale_factor = factor
         if enabled:
-            self.setMinimumHeight(22)
-            self._row_layout.setContentsMargins(4, 1, 4, 1)
-            self._row_layout.setSpacing(6)
-            self.checkbox.setFixedWidth(18)
-            self.sprite_button.setFixedWidth(46)
-            self.constraint_toggle.setFixedWidth(20)
-            self.name_label.setStyleSheet("font-size: 9pt;")
+            self.setMinimumHeight(scale_int(22, factor, minimum=16))
+            self._row_layout.setContentsMargins(
+                scale_int(4, factor),
+                scale_int(1, factor),
+                scale_int(4, factor),
+                scale_int(1, factor),
+            )
+            self._row_layout.setSpacing(scale_int(6, factor))
+            self.checkbox.setFixedWidth(scale_int(18, factor, minimum=12))
+            self.sprite_button.setFixedWidth(scale_int(46, factor, minimum=34))
+            self.constraint_toggle.setFixedWidth(scale_int(20, factor, minimum=14))
         else:
-            self.setMinimumHeight(28)
-            self._row_layout.setContentsMargins(6, 2, 6, 2)
-            self._row_layout.setSpacing(8)
-            self.checkbox.setFixedWidth(20)
-            self.sprite_button.setFixedWidth(52)
-            self.constraint_toggle.setFixedWidth(22)
-            self.name_label.setStyleSheet("")
+            self.setMinimumHeight(scale_int(28, factor, minimum=20))
+            self._row_layout.setContentsMargins(
+                scale_int(6, factor),
+                scale_int(2, factor),
+                scale_int(6, factor),
+                scale_int(2, factor),
+            )
+            self._row_layout.setSpacing(scale_int(8, factor))
+            self.checkbox.setFixedWidth(scale_int(20, factor, minimum=14))
+            self.sprite_button.setFixedWidth(scale_int(52, factor, minimum=38))
+            self.constraint_toggle.setFixedWidth(scale_int(22, factor, minimum=16))
+        self._update_visibility_style()
+        self.status_indicator.setFixedSize(
+            scale_int(8, factor, minimum=5),
+            scale_int(8, factor, minimum=5),
+        )
         self.thumbnail_label.setFixedSize(thumbnail_size)
         if self._thumbnail_pixmap is not None:
             self.set_thumbnail(self._thumbnail_pixmap, thumbnail_size)
@@ -1244,10 +1274,14 @@ class LayerRow(QFrame):
 
     def _update_visibility_style(self):
         """Update label style based on visibility."""
-        if self.checkbox.isChecked():
-            self.name_label.setStyleSheet("")
-        else:
-            self.name_label.setStyleSheet("QLabel { color: #888; }")
+        parts = []
+        if not self.checkbox.isChecked():
+            parts.append("color: #888;")
+        if getattr(self, "_compact_ui", False):
+            parts.append(
+                f"font-size: {scale_float(9, getattr(self, '_ui_scale_factor', 1.0), minimum=6.0):.2f}pt;"
+            )
+        self.name_label.setStyleSheet(" ".join(parts))
 
     def update_state(self, selected: bool, show_as_unselected: bool):
         """Update the visual state of the row.

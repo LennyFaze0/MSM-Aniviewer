@@ -411,17 +411,11 @@ class TextureAtlas:
                         else Image.BILINEAR
                     )
                     img = img.resize((new_w, new_h), resample=resample)
-            if self.force_unpremultiply and self._image_looks_premultiplied(img):
-                img = self._ensure_straight_alpha(img)
-            img_data = np.array(img, dtype=np.float32) / 255.0
-            
-            # Premultiply alpha: RGB = RGB * A
-            # This is required for proper blending with GL_ONE, GL_ONE_MINUS_SRC_ALPHA
-            alpha = img_data[:, :, 3:4]  # Keep as 3D array for broadcasting
-            img_data[:, :, 0:3] *= alpha
-            
-            # Convert back to uint8
-            img_data = (img_data * 255.0).astype(np.uint8)
+            img_data = self.prepare_premultiplied_upload_pixels(
+                img,
+                image_path=self.image_path,
+                force_unpremultiply=self.force_unpremultiply,
+            )
             
             # Generate OpenGL texture
             if self.texture_id:
@@ -460,20 +454,62 @@ class TextureAtlas:
         return Image.fromarray(arr.astype(np.uint8), "RGBA")
 
     @staticmethod
+    def _texture_extension(image_path: str) -> str:
+        suffix = os.path.splitext(str(image_path or ""))[1].lower()
+        if suffix == ".gz":
+            suffix = os.path.splitext(os.path.splitext(str(image_path or ""))[0])[1].lower()
+        return suffix
+
+    @classmethod
+    def _should_preserve_premultiplied_source(cls, image: Image.Image, image_path: str = "") -> bool:
+        """Return True when a decoded source already appears premultiplied."""
+        if cls._texture_extension(image_path) != ".png":
+            return False
+        return cls._image_looks_premultiplied(image)
+
+    @classmethod
+    def prepare_premultiplied_upload_pixels(
+        cls,
+        image: Image.Image,
+        image_path: str = "",
+        *,
+        force_unpremultiply: bool = False,
+    ) -> np.ndarray:
+        """Return RGBA uint8 pixels ready for GL_ONE/GL_ONE_MINUS_SRC_ALPHA blending."""
+        if image.mode != "RGBA":
+            image = image.convert("RGBA")
+
+        source_looks_premultiplied = cls._image_looks_premultiplied(image)
+        already_premultiplied = (
+            cls._texture_extension(image_path) == ".png"
+            and source_looks_premultiplied
+        )
+        if force_unpremultiply and source_looks_premultiplied:
+            image = cls._ensure_straight_alpha(image)
+            already_premultiplied = False
+
+        arr = np.array(image, dtype=np.float32)
+        alpha = arr[..., 3:4]
+        if already_premultiplied:
+            arr[..., :3] = np.minimum(arr[..., :3], alpha)
+        else:
+            arr[..., :3] *= alpha / 255.0
+        return np.clip(arr, 0.0, 255.0).astype(np.uint8)
+
+    @staticmethod
     def _image_looks_premultiplied(image: Image.Image) -> bool:
         """
-        Heuristically determine if an RGBA image is premultiplied by checking how
-        often RGB channels exceed their alpha. Modern PNG/AVIF atlases ship in
-        straight-alpha form (RGB frequently > alpha) while legacy premultiplied
-        textures keep RGB <= alpha for most texels.
+        Heuristically determine if an RGBA image is premultiplied by checking
+        translucent pixels only. Opaque pixels cannot distinguish straight from
+        premultiplied alpha because RGB is naturally <= 255.
         """
         if image.mode != "RGBA":
             return False
         arr = np.array(image, dtype=np.uint16)
         alpha = arr[..., 3]
-        mask = alpha > 0
+        mask = (alpha > 1) & (alpha < 254)
         total = int(np.count_nonzero(mask))
-        if total == 0:
+        if total < 16:
             return False
         alpha_3 = np.repeat(alpha[..., None], 3, axis=2)
         violations = np.count_nonzero(((arr[..., :3] > (alpha_3 + 1)) & mask[..., None]))

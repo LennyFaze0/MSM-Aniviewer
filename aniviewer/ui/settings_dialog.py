@@ -39,6 +39,21 @@ from utils.ffmpeg_installer import (
 )
 from utils.shader_registry import ShaderRegistry, ShaderPreset
 from utils.keybinds import keybind_actions, default_keybinds, normalize_keybind_sequence
+from utils.ui_scaling import (
+    UI_SCALE_MANUAL_MAX_PERCENT,
+    UI_SCALE_MANUAL_MIN_PERCENT,
+    UI_SCALE_SLIDER_MAX,
+    UI_SCALE_SLIDER_MIN,
+    clamp_ui_scale_percent,
+    clamp_ui_scale_slider_percent,
+    ui_scale_factor_to_percent,
+    ui_scale_percent_to_factor,
+)
+from utils.conversion_diagnostics import (
+    install_qmessagebox_diagnostics,
+    start_conversion_window_diagnostics,
+    stop_conversion_window_diagnostics,
+)
 from utils.bin_revision_detection import (
     build_auto_converter_order,
     collect_bin_detection_hints,
@@ -54,6 +69,8 @@ from utils.dof_bundle_remote import (
     normalize_dof_bundle_platform,
     normalize_dof_cdn_base_url,
 )
+
+install_qmessagebox_diagnostics(QMessageBox)
 
 
 class ExportSettings:
@@ -662,9 +679,11 @@ class SettingsDialog(QDialog):
         self._ui_theme_primary_default_hex: str = ""
         self._ui_theme_secondary_default_hex: str = ""
         self._ui_theme_tertiary_default_hex: str = ""
+        self._ui_theme_quaternary_default_hex: str = ""
         self._ui_theme_primary_hex: str = ""
         self._ui_theme_secondary_hex: str = ""
         self._ui_theme_tertiary_hex: str = ""
+        self._ui_theme_quaternary_hex: str = ""
         
         self.init_ui()
         self.load_current_settings()
@@ -686,19 +705,22 @@ class SettingsDialog(QDialog):
         elif role_norm == "tertiary":
             role_key = "tertiary"
             current_hex = self._ui_theme_tertiary_hex
+        elif role_norm == "quaternary":
+            role_key = "quaternary"
+            current_hex = self._ui_theme_quaternary_hex
         else:
             role_key = "primary"
             current_hex = self._ui_theme_primary_hex
+        title_map = {
+            "primary": "Choose Primary UI Color",
+            "secondary": "Choose Secondary UI Color",
+            "tertiary": "Choose Tertiary UI Color",
+            "quaternary": "Choose Quaternary UI Color",
+        }
         selected = QColorDialog.getColor(
             QColor(current_hex),
             self,
-            (
-                "Choose Secondary UI Color"
-                if role_key == "secondary"
-                else "Choose Tertiary UI Color"
-                if role_key == "tertiary"
-                else "Choose Primary UI Color"
-            ),
+            title_map.get(role_key, "Choose UI Color"),
         )
         if not selected.isValid():
             return
@@ -707,6 +729,8 @@ class SettingsDialog(QDialog):
             self._ui_theme_secondary_hex = normalized
         elif role_key == "tertiary":
             self._ui_theme_tertiary_hex = normalized
+        elif role_key == "quaternary":
+            self._ui_theme_quaternary_hex = normalized
         else:
             self._ui_theme_primary_hex = normalized
         self._update_ui_theme_color_controls()
@@ -717,12 +741,16 @@ class SettingsDialog(QDialog):
             role_key = "secondary"
         elif role_norm == "tertiary":
             role_key = "tertiary"
+        elif role_norm == "quaternary":
+            role_key = "quaternary"
         else:
             role_key = "primary"
         if role_key == "secondary":
             self._ui_theme_secondary_hex = self._ui_theme_secondary_default_hex
         elif role_key == "tertiary":
             self._ui_theme_tertiary_hex = self._ui_theme_tertiary_default_hex
+        elif role_key == "quaternary":
+            self._ui_theme_quaternary_hex = self._ui_theme_quaternary_default_hex
         else:
             self._ui_theme_primary_hex = self._ui_theme_primary_default_hex
         self._update_ui_theme_color_controls()
@@ -756,6 +784,15 @@ class SettingsDialog(QDialog):
                 getattr(self, "ui_theme_tertiary_value_label", None),
                 self._ui_theme_tertiary_hex,
             ),
+            (
+                "quaternary",
+                getattr(self, "ui_theme_quaternary_enabled_check", None),
+                getattr(self, "ui_theme_quaternary_pick_btn", None),
+                getattr(self, "ui_theme_quaternary_reset_btn", None),
+                getattr(self, "ui_theme_quaternary_swatch", None),
+                getattr(self, "ui_theme_quaternary_value_label", None),
+                self._ui_theme_quaternary_hex,
+            ),
         )
         for _role, enabled_check, pick_btn, reset_btn, swatch, value_label, hex_value in role_specs:
             if enabled_check is None:
@@ -775,6 +812,32 @@ class SettingsDialog(QDialog):
                 )
                 swatch.setEnabled(enabled)
 
+    def _set_ui_scale_percent(self, value: object) -> None:
+        percent = clamp_ui_scale_percent(value)
+        slider_percent = clamp_ui_scale_slider_percent(percent)
+        if hasattr(self, "ui_scale_slider"):
+            self.ui_scale_slider.blockSignals(True)
+            self.ui_scale_slider.setValue(slider_percent)
+            self.ui_scale_slider.blockSignals(False)
+        if hasattr(self, "ui_scale_spin"):
+            self.ui_scale_spin.blockSignals(True)
+            self.ui_scale_spin.setValue(percent)
+            self.ui_scale_spin.blockSignals(False)
+
+    def _on_ui_scale_slider_changed(self, value: int) -> None:
+        self._set_ui_scale_percent(value)
+
+    def _on_ui_scale_spin_changed(self, value: int) -> None:
+        self._set_ui_scale_percent(value)
+
+    def _update_spatial3d_mode_controls(self) -> None:
+        enabled = bool(
+            getattr(self, "spatial3d_support_check", None)
+            and self.spatial3d_support_check.isChecked()
+        )
+        if hasattr(self, "spatial3d_mode_combo"):
+            self.spatial3d_mode_combo.setEnabled(enabled)
+
     @staticmethod
     def _sanitize_path_value(value: Any) -> str:
         if value is None:
@@ -786,10 +849,23 @@ class SettingsDialog(QDialog):
         target = str(label or "").strip().lower()
         if not target or not hasattr(self, "tab_widget"):
             return False
-        for index in range(self.tab_widget.count()):
-            if self.tab_widget.tabText(index).strip().lower() == target:
-                self.tab_widget.setCurrentIndex(index)
+        return self._set_active_tab_recursive(self.tab_widget, target)
+
+    def _set_active_tab_recursive(self, tabs: QTabWidget, target: str) -> bool:
+        for index in range(tabs.count()):
+            if tabs.tabText(index).strip().lower() == target:
+                tabs.setCurrentIndex(index)
                 return True
+
+        for index in range(tabs.count()):
+            page = tabs.widget(index)
+            if page is None:
+                continue
+            child_tabs = page.findChildren(QTabWidget)
+            for child in child_tabs:
+                if self._set_active_tab_recursive(child, target):
+                    tabs.setCurrentIndex(index)
+                    return True
         return False
 
     def focus_dof_asset_grabber(self) -> None:
@@ -1277,6 +1353,25 @@ class SettingsDialog(QDialog):
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         return scroll
+
+    @staticmethod
+    def _make_nested_tab_page() -> Tuple[QWidget, QTabWidget]:
+        page = QWidget()
+        page_layout = QVBoxLayout(page)
+        page_layout.setContentsMargins(0, 0, 0, 0)
+        page_layout.setSpacing(0)
+        tabs = QTabWidget()
+        tabs.setDocumentMode(True)
+        page_layout.addWidget(tabs)
+        return page, tabs
+
+    @staticmethod
+    def _make_settings_section() -> Tuple[QWidget, QVBoxLayout]:
+        page = QWidget()
+        page_layout = QVBoxLayout(page)
+        page_layout.setContentsMargins(8, 8, 8, 8)
+        page_layout.setSpacing(10)
+        return page, page_layout
     
     def init_ui(self):
         """Initialize the UI"""
@@ -1284,6 +1379,13 @@ class SettingsDialog(QDialog):
         
         # Tab widget for different settings categories
         self.tab_widget = QTabWidget()
+
+        export_tab, export_tabs = self._make_nested_tab_page()
+        self.tab_widget.addTab(export_tab, "Export")
+        export_general_tab, export_general_layout = self._make_settings_section()
+
+        tools_tab, tools_tabs = self._make_nested_tab_page()
+        self.tab_widget.addTab(tools_tab, "Tools")
         
         # PNG Settings
         png_group = QGroupBox("PNG Export Settings")
@@ -1321,7 +1423,7 @@ class SettingsDialog(QDialog):
         png_tab_layout = QVBoxLayout(png_tab)
         png_tab_layout.addWidget(png_group)
         png_tab_layout.addStretch()
-        self.tab_widget.addTab(self._wrap_scrollable_tab(png_tab), "PNG")
+        export_tabs.addTab(self._wrap_scrollable_tab(png_tab), "PNG")
 
         # GIF Settings
         gif_group = QGroupBox("GIF Export Settings")
@@ -1383,7 +1485,7 @@ class SettingsDialog(QDialog):
         gif_tab_layout = QVBoxLayout(gif_tab)
         gif_tab_layout.addWidget(gif_group)
         gif_tab_layout.addStretch()
-        self.tab_widget.addTab(self._wrap_scrollable_tab(gif_tab), "GIF")
+        export_tabs.addTab(self._wrap_scrollable_tab(gif_tab), "GIF")
 
         # MOV Settings
         mov_group = QGroupBox("MOV/Video Export Settings")
@@ -1456,7 +1558,7 @@ class SettingsDialog(QDialog):
         mov_tab_layout = QVBoxLayout(mov_tab)
         mov_tab_layout.addWidget(mov_group)
         mov_tab_layout.addStretch()
-        self.tab_widget.addTab(self._wrap_scrollable_tab(mov_tab), "MOV")
+        export_tabs.addTab(self._wrap_scrollable_tab(mov_tab), "MOV")
 
         # WEBM Settings
         webm_group = QGroupBox("WEBM Export Settings")
@@ -1528,7 +1630,7 @@ class SettingsDialog(QDialog):
         webm_tab_layout = QVBoxLayout(webm_tab)
         webm_tab_layout.addWidget(webm_group)
         webm_tab_layout.addStretch()
-        self.tab_widget.addTab(self._wrap_scrollable_tab(webm_tab), "WEBM")
+        export_tabs.addTab(self._wrap_scrollable_tab(webm_tab), "WEBM")
 
         # MP4 Settings
         mp4_group = QGroupBox("MP4 Export Settings")
@@ -1619,7 +1721,7 @@ class SettingsDialog(QDialog):
         mp4_tab_layout = QVBoxLayout(mp4_tab)
         mp4_tab_layout.addWidget(mp4_group)
         mp4_tab_layout.addStretch()
-        self.tab_widget.addTab(self._wrap_scrollable_tab(mp4_tab), "MP4")
+        export_tabs.addTab(self._wrap_scrollable_tab(mp4_tab), "MP4")
 
         # PSD Settings
         psd_group = QGroupBox("PSD Export Settings")
@@ -1685,7 +1787,7 @@ class SettingsDialog(QDialog):
         psd_tab_layout = QVBoxLayout(psd_tab)
         psd_tab_layout.addWidget(psd_group)
         psd_tab_layout.addStretch()
-        self.tab_widget.addTab(self._wrap_scrollable_tab(psd_tab), "PSD")
+        export_tabs.addTab(self._wrap_scrollable_tab(psd_tab), "PSD")
 
         # AE Rig Settings
         ae_group = QGroupBox("After Effects Rig Export")
@@ -1768,7 +1870,8 @@ class SettingsDialog(QDialog):
         ae_tab_layout = QVBoxLayout(ae_tab)
         ae_tab_layout.addWidget(ae_group)
         ae_tab_layout.addStretch()
-        self.tab_widget.addTab(self._wrap_scrollable_tab(ae_tab), "AE Rig")
+        export_tabs.addTab(self._wrap_scrollable_tab(ae_tab), "AE Rig")
+        export_tabs.addTab(self._wrap_scrollable_tab(export_general_tab), "Framing")
 
         # Shader settings tab
         shader_game_path = str(self.game_path) if self.game_path else self._game_path_str
@@ -1776,7 +1879,7 @@ class SettingsDialog(QDialog):
             self.shader_registry,
             shader_game_path,
         )
-        self.tab_widget.addTab(self._wrap_scrollable_tab(self.shader_tab), "Shaders")
+        shader_tools_tab = self._wrap_scrollable_tab(self.shader_tab)
 
         # BIN converter tab
         bin_tab = QWidget()
@@ -1983,7 +2086,7 @@ class SettingsDialog(QDialog):
         status_group.setLayout(status_layout)
         bin_layout.addWidget(status_group)
         bin_layout.addStretch()
-        self.tab_widget.addTab(self._wrap_scrollable_tab(bin_tab), "BIN Converter")
+        tools_tabs.addTab(self._wrap_scrollable_tab(bin_tab), "BIN Converter")
 
         # Animation transfer tab
         anim_tab = QWidget()
@@ -2281,7 +2384,8 @@ class SettingsDialog(QDialog):
         anim_layout.addWidget(transfer_log_group)
 
         anim_layout.addStretch()
-        self.tab_widget.addTab(self._wrap_scrollable_tab(anim_tab), "Anim Transfer")
+        tools_tabs.addTab(self._wrap_scrollable_tab(anim_tab), "Anim Transfer")
+        tools_tabs.addTab(shader_tools_tab, "Shaders")
 
         paths_tab = self._build_paths_tab()
         self.tab_widget.addTab(self._wrap_scrollable_tab(paths_tab), "Paths")
@@ -2292,6 +2396,24 @@ class SettingsDialog(QDialog):
         # Application settings tab
         app_tab = QWidget()
         app_layout = QVBoxLayout(app_tab)
+        app_layout.setContentsMargins(0, 0, 0, 0)
+        app_layout.setSpacing(0)
+        app_sections = QTabWidget()
+        app_sections.setDocumentMode(True)
+        app_layout.addWidget(app_sections)
+
+        app_interface_tab, app_interface_layout = self._make_settings_section()
+        app_viewport_tab, app_viewport_layout = self._make_settings_section()
+        app_conversion_tab, app_conversion_layout = self._make_settings_section()
+        app_playback_tab, app_playback_layout = self._make_settings_section()
+        app_system_tab, app_system_layout = self._make_settings_section()
+        app_diagnostics_tab, app_diagnostics_layout = self._make_settings_section()
+        app_sections.addTab(self._wrap_scrollable_tab(app_interface_tab), "Interface")
+        app_sections.addTab(self._wrap_scrollable_tab(app_viewport_tab), "Viewport")
+        app_sections.addTab(self._wrap_scrollable_tab(app_conversion_tab), "Conversion")
+        app_sections.addTab(self._wrap_scrollable_tab(app_playback_tab), "Playback")
+        app_sections.addTab(self._wrap_scrollable_tab(app_system_tab), "System")
+        app_sections.addTab(self._wrap_scrollable_tab(app_diagnostics_tab), "Diagnostics")
 
         camera_group = QGroupBox("Camera & View Settings")
         camera_form = QFormLayout()
@@ -2300,8 +2422,79 @@ class SettingsDialog(QDialog):
         self.camera_zoom_cursor_check.setToolTip("When enabled, scroll zooms around the cursor position instead of the animation center")
         camera_form.addRow(self.camera_zoom_cursor_check)
 
+        self.spatial3d_support_check = QCheckBox("Stereoscopic 3D support")
+        self.spatial3d_support_check.setToolTip("Show live viewport controls for stereoscopic 3D output.")
+        self.spatial3d_support_check.toggled.connect(self._update_spatial3d_mode_controls)
+        camera_form.addRow(self.spatial3d_support_check)
+
+        self.spatial3d_mode_combo = QComboBox()
+        self.spatial3d_mode_combo.addItem("Acer SpatialLabs", "spatiallabs")
+        self.spatial3d_mode_combo.addItem("Side-by-Side", "side_by_side")
+        self.spatial3d_mode_combo.addItem("Anaglyph", "anaglyph")
+        self.spatial3d_mode_combo.setToolTip("Choose the viewport stereoscopic output mode.")
+        camera_form.addRow("3D Mode:", self.spatial3d_mode_combo)
+
         camera_group.setLayout(camera_form)
-        app_layout.addWidget(camera_group)
+        app_viewport_layout.addWidget(camera_group)
+
+        bin_conversion_group = QGroupBox("BIN Conversion")
+        bin_conversion_layout = QVBoxLayout()
+        self.automatic_revision_grabber_check = QCheckBox("Automatic revision grabber")
+        self.automatic_revision_grabber_check.setToolTip(
+            "When enabled, BIN conversion probes available parsers to identify the file revision. "
+            "When disabled, use the toolbar revision selector to choose the parser manually."
+        )
+        bin_conversion_layout.addWidget(self.automatic_revision_grabber_check)
+        bin_conversion_hint = QLabel(
+            "Disable this when you already know the BIN revision and want to skip automatic parser probing."
+        )
+        bin_conversion_hint.setWordWrap(True)
+        bin_conversion_hint.setStyleSheet("color: gray; font-size: 9pt;")
+        bin_conversion_layout.addWidget(bin_conversion_hint)
+        bin_conversion_group.setLayout(bin_conversion_layout)
+        app_conversion_layout.addWidget(bin_conversion_group)
+
+        ui_scale_group = QGroupBox("Interface Scale")
+        ui_scale_form = QFormLayout()
+        ui_scale_row = QWidget()
+        ui_scale_layout = QHBoxLayout(ui_scale_row)
+        ui_scale_layout.setContentsMargins(0, 0, 0, 0)
+        ui_scale_layout.setSpacing(8)
+
+        self.ui_scale_slider = QSlider(Qt.Orientation.Horizontal)
+        self.ui_scale_slider.setRange(int(UI_SCALE_SLIDER_MIN * 100), int(UI_SCALE_SLIDER_MAX * 100))
+        self.ui_scale_slider.setSingleStep(5)
+        self.ui_scale_slider.setPageStep(10)
+        self.ui_scale_slider.setTickInterval(25)
+        self.ui_scale_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self.ui_scale_slider.valueChanged.connect(self._on_ui_scale_slider_changed)
+        ui_scale_layout.addWidget(self.ui_scale_slider, 1)
+
+        self.ui_scale_spin = QSpinBox()
+        self.ui_scale_spin.setRange(UI_SCALE_MANUAL_MIN_PERCENT, UI_SCALE_MANUAL_MAX_PERCENT)
+        self.ui_scale_spin.setSingleStep(5)
+        self.ui_scale_spin.setSuffix("%")
+        self.ui_scale_spin.setToolTip(
+            "Type a custom value here to override the slider range."
+        )
+        self.ui_scale_spin.valueChanged.connect(self._on_ui_scale_spin_changed)
+        ui_scale_layout.addWidget(self.ui_scale_spin)
+
+        self.ui_scale_reset_btn = QPushButton("Reset")
+        self.ui_scale_reset_btn.clicked.connect(lambda: self._set_ui_scale_percent(100))
+        ui_scale_layout.addWidget(self.ui_scale_reset_btn)
+        ui_scale_form.addRow("UI Scale:", ui_scale_row)
+
+        ui_scale_hint = QLabel(
+            "Scales viewer text, controls, buttons, icons, timelines, and side-panel chrome. "
+            "The number field can override the slider range."
+        )
+        ui_scale_hint.setWordWrap(True)
+        ui_scale_hint.setStyleSheet("color: gray; font-size: 9pt;")
+        ui_scale_form.addRow("", ui_scale_hint)
+
+        ui_scale_group.setLayout(ui_scale_form)
+        app_interface_layout.addWidget(ui_scale_group)
 
         theme_group = QGroupBox("UI Theme Colors")
         theme_form = QFormLayout()
@@ -2381,15 +2574,40 @@ class SettingsDialog(QDialog):
         tertiary_layout.addStretch(1)
         theme_form.addRow("Tertiary (Markers/Tool State):", tertiary_row)
 
+        quaternary_row = QWidget()
+        quaternary_layout = QHBoxLayout(quaternary_row)
+        quaternary_layout.setContentsMargins(0, 0, 0, 0)
+        quaternary_layout.setSpacing(6)
+        self.ui_theme_quaternary_enabled_check = QCheckBox("Override")
+        self.ui_theme_quaternary_enabled_check.toggled.connect(self._update_ui_theme_color_controls)
+        self.ui_theme_quaternary_pick_btn = QPushButton("Choose...")
+        self.ui_theme_quaternary_pick_btn.clicked.connect(
+            lambda: self._pick_ui_theme_color("quaternary")
+        )
+        self.ui_theme_quaternary_reset_btn = QPushButton("Reset")
+        self.ui_theme_quaternary_reset_btn.clicked.connect(
+            lambda: self._reset_ui_theme_color("quaternary")
+        )
+        self.ui_theme_quaternary_swatch = QFrame()
+        self.ui_theme_quaternary_swatch.setFixedSize(28, 18)
+        self.ui_theme_quaternary_value_label = QLabel("")
+        quaternary_layout.addWidget(self.ui_theme_quaternary_enabled_check)
+        quaternary_layout.addWidget(self.ui_theme_quaternary_pick_btn)
+        quaternary_layout.addWidget(self.ui_theme_quaternary_reset_btn)
+        quaternary_layout.addWidget(self.ui_theme_quaternary_swatch)
+        quaternary_layout.addWidget(self.ui_theme_quaternary_value_label)
+        quaternary_layout.addStretch(1)
+        theme_form.addRow("Quaternary (Timeline Slider):", quaternary_row)
+
         theme_hint = QLabel(
-            "Overrides global neutral/accent colors plus tertiary highlights for marker/tool states. Dark/light mode behavior is preserved."
+            "Overrides global neutral/accent colors, marker/tool-state highlights, and the timeline slider tint. Dark/light mode behavior is preserved."
         )
         theme_hint.setWordWrap(True)
         theme_hint.setStyleSheet("color: gray; font-size: 9pt;")
         theme_form.addRow("", theme_hint)
 
         theme_group.setLayout(theme_form)
-        app_layout.addWidget(theme_group)
+        app_interface_layout.addWidget(theme_group)
 
         export_group = QGroupBox("Universal Export Framing")
         export_form = QFormLayout()
@@ -2464,7 +2682,7 @@ class SettingsDialog(QDialog):
         export_hint.setStyleSheet("color: gray; font-size: 9pt;")
         export_form.addRow("", export_hint)
         export_group.setLayout(export_form)
-        app_layout.addWidget(export_group)
+        export_general_layout.addWidget(export_group)
 
         viewport_group = QGroupBox("Viewport Rendering")
         viewport_form = QFormLayout()
@@ -2804,7 +3022,7 @@ class SettingsDialog(QDialog):
         )
         viewport_form.addRow("DOF Sprite Shader:", self.dof_sprite_shader_mode_combo)
         viewport_group.setLayout(viewport_form)
-        app_layout.addWidget(viewport_group)
+        app_viewport_layout.addWidget(viewport_group)
 
         particle_group = QGroupBox("DOF Particles")
         particle_form = QFormLayout()
@@ -2864,7 +3082,7 @@ class SettingsDialog(QDialog):
         particle_sensitivity_row.addWidget(self.dof_particle_sensitivity_spin, 0)
         particle_form.addRow("Distance Sensitivity:", particle_sensitivity_row)
         particle_group.setLayout(particle_form)
-        app_layout.addWidget(particle_group)
+        app_viewport_layout.addWidget(particle_group)
 
         playback_group = QGroupBox("Playback && Metronome")
         playback_layout = QVBoxLayout()
@@ -2901,21 +3119,7 @@ class SettingsDialog(QDialog):
         self.beat_edit_check.setToolTip("Permit beat lines in the timeline to be dragged to create custom timing.")
         playback_layout.addWidget(self.beat_edit_check)
         playback_group.setLayout(playback_layout)
-        app_layout.addWidget(playback_group)
-
-        file_browser_group = QGroupBox("File Browsing")
-        file_browser_layout = QVBoxLayout()
-        self.barebones_browser_check = QCheckBox("Barebones search for BIN/JSON files")
-        self.barebones_browser_check.setToolTip(
-            "Enable to keep the classic text list. Disable to use the Monster Browser grid with portraits."
-        )
-        file_browser_layout.addWidget(self.barebones_browser_check)
-        browser_hint = QLabel("Monster Browser loads portraits from data/gfx/book and supports auto conversion.")
-        browser_hint.setWordWrap(True)
-        browser_hint.setStyleSheet("color: gray; font-size: 9pt;")
-        file_browser_layout.addWidget(browser_hint)
-        file_browser_group.setLayout(file_browser_layout)
-        app_layout.addWidget(file_browser_group)
+        app_playback_layout.addWidget(playback_group)
 
         monster_name_group = QGroupBox("Monster Name Library")
         monster_name_layout = QVBoxLayout()
@@ -2952,7 +3156,7 @@ class SettingsDialog(QDialog):
         monster_name_layout.addWidget(self.monster_name_status_label)
 
         monster_name_group.setLayout(monster_name_layout)
-        app_layout.addWidget(monster_name_group)
+        app_conversion_layout.addWidget(monster_name_group)
 
         bin_group = QGroupBox("BIN Export")
         bin_layout = QVBoxLayout()
@@ -2967,7 +3171,7 @@ class SettingsDialog(QDialog):
         bin_hint.setStyleSheet("color: gray; font-size: 9pt;")
         bin_layout.addWidget(bin_hint)
         bin_group.setLayout(bin_layout)
-        app_layout.addWidget(bin_group)
+        app_conversion_layout.addWidget(bin_group)
 
         ffmpeg_group = QGroupBox("FFmpeg Tools")
         ffmpeg_layout = QVBoxLayout()
@@ -2999,14 +3203,23 @@ class SettingsDialog(QDialog):
         ffmpeg_layout.addWidget(install_dir_label)
 
         ffmpeg_group.setLayout(ffmpeg_layout)
-        app_layout.addWidget(ffmpeg_group)
+        app_system_layout.addWidget(ffmpeg_group)
 
         diag_group = self._build_diagnostics_group()
-        app_layout.addWidget(diag_group)
+        app_diagnostics_layout.addWidget(diag_group)
 
-        app_layout.addStretch()
+        for section_layout in (
+            app_interface_layout,
+            app_viewport_layout,
+            app_conversion_layout,
+            app_playback_layout,
+            app_system_layout,
+            app_diagnostics_layout,
+            export_general_layout,
+        ):
+            section_layout.addStretch()
         
-        self.tab_widget.addTab(self._wrap_scrollable_tab(app_tab), "Application")
+        self.tab_widget.addTab(app_tab, "Application")
 
         self._update_bin_convert_controls()
 
@@ -3196,6 +3409,40 @@ class SettingsDialog(QDialog):
         self.diag_throttle_check = QCheckBox("Throttle layer status updates")
         layout.addRow(self.diag_throttle_check)
 
+        self.diag_window_logger_check = QCheckBox("Live window logging")
+        self.diag_window_logger_check.setToolTip(
+            "Log live Qt and Windows window activity to the command line "
+            "and live_window_diagnostics.log."
+        )
+        layout.addRow(self.diag_window_logger_check)
+
+        self.performance_profiler_check = QCheckBox("Performance logging")
+        self.performance_profiler_check.setToolTip(
+            "Collect coarse timing data for load, timeline, conversion, and viewport hot paths."
+        )
+        self.performance_profiler_check.toggled.connect(self._update_performance_profiler_controls)
+        layout.addRow(self.performance_profiler_check)
+
+        self.performance_profiler_threshold_spin = QDoubleSpinBox()
+        self.performance_profiler_threshold_spin.setRange(1.0, 5000.0)
+        self.performance_profiler_threshold_spin.setDecimals(1)
+        self.performance_profiler_threshold_spin.setSingleStep(5.0)
+        self.performance_profiler_threshold_spin.setSuffix(" ms")
+        self.performance_profiler_threshold_spin.setToolTip(
+            "Samples at or above this time count as slow in profiler summaries."
+        )
+        layout.addRow("Performance Slow Sample:", self.performance_profiler_threshold_spin)
+
+        self.performance_profiler_interval_spin = QDoubleSpinBox()
+        self.performance_profiler_interval_spin.setRange(2.0, 120.0)
+        self.performance_profiler_interval_spin.setDecimals(1)
+        self.performance_profiler_interval_spin.setSingleStep(1.0)
+        self.performance_profiler_interval_spin.setSuffix(" sec")
+        self.performance_profiler_interval_spin.setToolTip(
+            "How often profiler summaries are written to the app log while enabled."
+        )
+        layout.addRow("Performance Report Every:", self.performance_profiler_interval_spin)
+
         self.diag_clone_check = QCheckBox("Log costume clone operations")
         layout.addRow(self.diag_clone_check)
 
@@ -3377,6 +3624,13 @@ class SettingsDialog(QDialog):
         self._update_universal_export_controls()
         self._on_universal_export_resolution_changed()
 
+        if hasattr(self, "ui_scale_slider"):
+            self._set_ui_scale_percent(
+                ui_scale_factor_to_percent(
+                    self.app_settings.value("ui/scale_factor", 1.0, type=float)
+                )
+            )
+
         app_palette = self.palette()
         self._ui_theme_primary_default_hex = self._normalize_theme_hex(
             app_palette.color(app_palette.ColorRole.Button).name(),
@@ -3390,6 +3644,10 @@ class SettingsDialog(QDialog):
             app_palette.color(app_palette.ColorRole.Mid).name(),
             "#B4B4B4",
         )
+        self._ui_theme_quaternary_default_hex = self._normalize_theme_hex(
+            app_palette.color(app_palette.ColorRole.Highlight).name(),
+            "#4DA3FF",
+        )
         self._ui_theme_primary_hex = self._normalize_theme_hex(
             self.app_settings.value("ui/theme/primary_color", self._ui_theme_primary_default_hex, type=str),
             self._ui_theme_primary_default_hex,
@@ -3401,6 +3659,10 @@ class SettingsDialog(QDialog):
         self._ui_theme_tertiary_hex = self._normalize_theme_hex(
             self.app_settings.value("ui/theme/tertiary_color", self._ui_theme_tertiary_default_hex, type=str),
             self._ui_theme_tertiary_default_hex,
+        )
+        self._ui_theme_quaternary_hex = self._normalize_theme_hex(
+            self.app_settings.value("ui/theme/quaternary_color", self._ui_theme_quaternary_default_hex, type=str),
+            self._ui_theme_quaternary_default_hex,
         )
         if hasattr(self, "ui_theme_primary_enabled_check"):
             self.ui_theme_primary_enabled_check.setChecked(
@@ -3414,10 +3676,54 @@ class SettingsDialog(QDialog):
             self.ui_theme_tertiary_enabled_check.setChecked(
                 self.app_settings.value("ui/theme/tertiary_enabled", False, type=bool)
             )
+        if hasattr(self, "ui_theme_quaternary_enabled_check"):
+            self.ui_theme_quaternary_enabled_check.setChecked(
+                self.app_settings.value("ui/theme/quaternary_enabled", False, type=bool)
+            )
         self._update_ui_theme_color_controls()
 
         # Camera
         self.camera_zoom_cursor_check.setChecked(self.export_settings.camera_zoom_to_cursor)
+        if hasattr(self, "automatic_revision_grabber_check"):
+            self.automatic_revision_grabber_check.setChecked(
+                self.app_settings.value("ui/automatic_revision_grabber", True, type=bool)
+            )
+        if hasattr(self, "spatial3d_support_check"):
+            self.spatial3d_support_check.setChecked(
+                self.app_settings.value("spatial3d/support_enabled", False, type=bool)
+            )
+        if hasattr(self, "spatial3d_mode_combo"):
+            mode = self.app_settings.value("spatial3d/mode", "spatiallabs", type=str)
+            mode = str(mode or "spatiallabs").strip().lower()
+            idx = self.spatial3d_mode_combo.findData(mode)
+            if idx < 0 and mode in {"sbs", "side-by-side"}:
+                idx = self.spatial3d_mode_combo.findData("side_by_side")
+            if idx < 0:
+                idx = self.spatial3d_mode_combo.findData("spatiallabs")
+            if idx >= 0:
+                self.spatial3d_mode_combo.setCurrentIndex(idx)
+        self._update_spatial3d_mode_controls()
+        if hasattr(self, "performance_profiler_check"):
+            self.performance_profiler_check.setChecked(
+                self.app_settings.value("performance/profiler_enabled", False, type=bool)
+            )
+        if hasattr(self, "performance_profiler_threshold_spin"):
+            try:
+                threshold_ms = float(
+                    self.app_settings.value("performance/profiler_slow_threshold_ms", 50.0, type=float)
+                )
+            except (TypeError, ValueError):
+                threshold_ms = 50.0
+            self.performance_profiler_threshold_spin.setValue(max(1.0, min(5000.0, threshold_ms)))
+        if hasattr(self, "performance_profiler_interval_spin"):
+            try:
+                interval_sec = float(
+                    self.app_settings.value("performance/profiler_report_interval_sec", 8.0, type=float)
+                )
+            except (TypeError, ValueError):
+                interval_sec = 8.0
+            self.performance_profiler_interval_spin.setValue(max(2.0, min(120.0, interval_sec)))
+        self._update_performance_profiler_controls()
         if hasattr(self, "sprite_filter_combo"):
             sprite_filter = self.app_settings.value(
                 "viewport/sprite_filter", "bilinear", type=str
@@ -3630,7 +3936,6 @@ class SettingsDialog(QDialog):
             particle_sensitivity_value = max(0.0, min(100.0, particle_sensitivity_value))
             self.dof_particle_sensitivity_spin.setValue(particle_sensitivity_value)
             self._sync_dof_particle_sensitivity_slider(particle_sensitivity_value)
-        self.barebones_browser_check.setChecked(self.export_settings.use_barebones_file_browser)
         if hasattr(self, "monster_name_auto_refresh_check"):
             self.monster_name_auto_refresh_check.setChecked(
                 self.app_settings.value("monster_name/auto_refresh_from_dat", True, type=bool)
@@ -3847,6 +4152,7 @@ class SettingsDialog(QDialog):
         self.diag_enable_check.setChecked(get_bool("enabled", False))
         self.diag_highlight_check.setChecked(get_bool("highlight_layers", True))
         self.diag_throttle_check.setChecked(get_bool("throttle_updates", True))
+        self.diag_window_logger_check.setChecked(get_bool("window_logger_enabled", True))
         self.diag_clone_check.setChecked(get_bool("log_clone_events", True))
         self.diag_canonical_check.setChecked(get_bool("log_canonical_events", True))
         self.diag_remap_check.setChecked(get_bool("log_remap_events", False))
@@ -3956,6 +4262,19 @@ class SettingsDialog(QDialog):
             widget.setEnabled(enabled)
         self._update_diag_export_controls()
 
+    def _update_performance_profiler_controls(self):
+        enabled = bool(
+            hasattr(self, "performance_profiler_check")
+            and self.performance_profiler_check.isChecked()
+        )
+        for widget_name in (
+            "performance_profiler_threshold_spin",
+            "performance_profiler_interval_spin",
+        ):
+            widget = getattr(self, widget_name, None)
+            if widget is not None:
+                widget.setEnabled(enabled)
+
     def _update_diag_export_controls(self):
         enabled = (
             self.diag_enable_check.isChecked() and
@@ -3980,6 +4299,7 @@ class SettingsDialog(QDialog):
         s.setValue("diagnostics/enabled", self.diag_enable_check.isChecked())
         s.setValue("diagnostics/highlight_layers", self.diag_highlight_check.isChecked())
         s.setValue("diagnostics/throttle_updates", self.diag_throttle_check.isChecked())
+        s.setValue("diagnostics/window_logger_enabled", self.diag_window_logger_check.isChecked())
         s.setValue("diagnostics/log_clone_events", self.diag_clone_check.isChecked())
         s.setValue("diagnostics/log_canonical_events", self.diag_canonical_check.isChecked())
         s.setValue("diagnostics/log_remap_events", self.diag_remap_check.isChecked())
@@ -4207,6 +4527,28 @@ class SettingsDialog(QDialog):
         self._on_universal_export_resolution_changed()
 
         self.camera_zoom_cursor_check.setChecked(True)
+        if hasattr(self, "automatic_revision_grabber_check"):
+            self.automatic_revision_grabber_check.setChecked(True)
+        if hasattr(self, "ui_scale_slider"):
+            self._set_ui_scale_percent(100)
+        if hasattr(self, "spatial3d_support_check"):
+            self.spatial3d_support_check.setChecked(False)
+        if hasattr(self, "spatial3d_mode_combo"):
+            idx = self.spatial3d_mode_combo.findData("spatiallabs")
+            if idx >= 0:
+                self.spatial3d_mode_combo.setCurrentIndex(idx)
+        self._update_spatial3d_mode_controls()
+        if hasattr(self, "performance_profiler_check"):
+            self.performance_profiler_check.setChecked(False)
+        if hasattr(self, "performance_profiler_threshold_spin"):
+            self.performance_profiler_threshold_spin.setValue(50.0)
+        if hasattr(self, "performance_profiler_interval_spin"):
+            self.performance_profiler_interval_spin.setValue(8.0)
+        self._update_performance_profiler_controls()
+        if hasattr(self, "ui_theme_quaternary_enabled_check"):
+            self.ui_theme_quaternary_enabled_check.setChecked(False)
+            self._ui_theme_quaternary_hex = self._ui_theme_quaternary_default_hex
+        self._update_ui_theme_color_controls()
         if hasattr(self, "sprite_filter_combo"):
             idx = self.sprite_filter_combo.findData("bilinear")
             if idx >= 0:
@@ -4258,7 +4600,6 @@ class SettingsDialog(QDialog):
             idx = self.dof_sprite_shader_mode_combo.findData("auto")
             if idx >= 0:
                 self.dof_sprite_shader_mode_combo.setCurrentIndex(idx)
-        self.barebones_browser_check.setChecked(False)
         if hasattr(self, "monster_name_auto_refresh_check"):
             self.monster_name_auto_refresh_check.setChecked(True)
             self.monster_name_rosetta_regenerate_requested = False
@@ -4435,6 +4776,41 @@ class SettingsDialog(QDialog):
         self.export_settings.universal_export_padding = self.universal_export_padding_spin.value()
 
         self.export_settings.camera_zoom_to_cursor = self.camera_zoom_cursor_check.isChecked()
+        if hasattr(self, "automatic_revision_grabber_check"):
+            self.app_settings.setValue(
+                "ui/automatic_revision_grabber",
+                self.automatic_revision_grabber_check.isChecked(),
+            )
+        if hasattr(self, "spatial3d_support_check"):
+            self.app_settings.setValue(
+                "spatial3d/support_enabled",
+                self.spatial3d_support_check.isChecked(),
+            )
+        if hasattr(self, "spatial3d_mode_combo"):
+            self.app_settings.setValue(
+                "spatial3d/mode",
+                self.spatial3d_mode_combo.currentData() or "spatiallabs",
+            )
+        if hasattr(self, "ui_scale_spin"):
+            self.app_settings.setValue(
+                "ui/scale_factor",
+                ui_scale_percent_to_factor(self.ui_scale_spin.value()),
+            )
+        if hasattr(self, "performance_profiler_check"):
+            self.app_settings.setValue(
+                "performance/profiler_enabled",
+                self.performance_profiler_check.isChecked(),
+            )
+        if hasattr(self, "performance_profiler_threshold_spin"):
+            self.app_settings.setValue(
+                "performance/profiler_slow_threshold_ms",
+                self.performance_profiler_threshold_spin.value(),
+            )
+        if hasattr(self, "performance_profiler_interval_spin"):
+            self.app_settings.setValue(
+                "performance/profiler_report_interval_sec",
+                self.performance_profiler_interval_spin.value(),
+            )
         if hasattr(self, "ui_theme_primary_enabled_check"):
             self.app_settings.setValue(
                 "ui/theme/primary_enabled",
@@ -4469,6 +4845,18 @@ class SettingsDialog(QDialog):
                 self._normalize_theme_hex(
                     self._ui_theme_tertiary_hex,
                     self._ui_theme_tertiary_default_hex,
+                ),
+            )
+        if hasattr(self, "ui_theme_quaternary_enabled_check"):
+            self.app_settings.setValue(
+                "ui/theme/quaternary_enabled",
+                self.ui_theme_quaternary_enabled_check.isChecked(),
+            )
+            self.app_settings.setValue(
+                "ui/theme/quaternary_color",
+                self._normalize_theme_hex(
+                    self._ui_theme_quaternary_hex,
+                    self._ui_theme_quaternary_default_hex,
                 ),
             )
         if hasattr(self, "sprite_filter_combo"):
@@ -4585,7 +4973,6 @@ class SettingsDialog(QDialog):
                 "dof/particle_distance_sensitivity",
                 float(self.dof_particle_sensitivity_spin.value()),
             )
-        self.export_settings.use_barebones_file_browser = self.barebones_browser_check.isChecked()
         if hasattr(self, "monster_name_auto_refresh_check"):
             self.app_settings.setValue(
                 "monster_name/auto_refresh_from_dat",
@@ -5349,6 +5736,18 @@ class SettingsDialog(QDialog):
                         self.bin_convert_output_edit.setText(suggestion)
 
     def _run_bin_revision_conversion(self) -> None:
+        with self._conversion_diagnostic_scope():
+            self._run_bin_revision_conversion_impl()
+
+    @contextlib.contextmanager
+    def _conversion_diagnostic_scope(self):
+        start_conversion_window_diagnostics("settings converter")
+        try:
+            yield
+        finally:
+            stop_conversion_window_diagnostics("settings converter")
+
+    def _run_bin_revision_conversion_impl(self) -> None:
         mode = self.bin_convert_mode_combo.currentData()
         input_path = self.bin_convert_input_edit.text().strip()
         output_path = self.bin_convert_output_edit.text().strip()
@@ -5578,6 +5977,7 @@ class SettingsDialog(QDialog):
         ]
         if bundle_anim:
             cmd += ["--bundle-root", str(bundle_root)]
+            cmd += ["--assets-root", dof_root]
         else:
             cmd += ["--assets-root", dof_root]
 
@@ -6590,9 +6990,92 @@ class SettingsDialog(QDialog):
             return [sys.executable, "--run-script", script_path]
         return [sys.executable, script_path]
 
+    @staticmethod
+    def _script_command_payload(cmd: List[str]) -> Optional[Tuple[str, List[str]]]:
+        """Return the target script/args for app-owned Python helper commands."""
+        if not cmd:
+            return None
+
+        def _same_executable(left: str, right: str) -> bool:
+            try:
+                return os.path.samefile(left, right)
+            except (OSError, ValueError):
+                return os.path.normcase(os.path.abspath(left)) == os.path.normcase(os.path.abspath(right))
+
+        if len(cmd) >= 3 and _same_executable(cmd[0], sys.executable) and cmd[1] == "--run-script":
+            return cmd[2], list(cmd[3:])
+        if len(cmd) >= 2 and _same_executable(cmd[0], sys.executable) and cmd[1].lower().endswith(".py"):
+            return cmd[1], list(cmd[2:])
+        return None
+
+    @staticmethod
+    def _run_python_script_in_process(
+        script_path: str,
+        args: List[str],
+        working_dir: Optional[str] = None,
+    ) -> subprocess.CompletedProcess:
+        """Execute a converter script without spawning a new Python/app window."""
+        if not os.path.isabs(script_path):
+            local_candidate = os.path.abspath(script_path)
+            cwd_candidate = (
+                os.path.abspath(os.path.join(working_dir, script_path))
+                if working_dir
+                else ""
+            )
+            if os.path.exists(local_candidate):
+                script_path = local_candidate
+            elif cwd_candidate and os.path.exists(cwd_candidate):
+                script_path = cwd_candidate
+            else:
+                script_path = local_candidate
+        buf_out = io.StringIO()
+        buf_err = io.StringIO()
+        previous_cwd = os.getcwd()
+        previous_argv = sys.argv[:]
+        return_code = 0
+        script_dir = os.path.dirname(script_path)
+        inserted_path = False
+        try:
+            if working_dir:
+                os.chdir(working_dir)
+            sys.argv = [script_path] + list(args)
+            if script_dir and script_dir not in sys.path:
+                sys.path.insert(0, script_dir)
+                inserted_path = True
+            with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+                try:
+                    runpy.run_path(script_path, run_name="__main__")
+                except SystemExit as exc:
+                    code = exc.code
+                    if isinstance(code, int):
+                        return_code = code
+                    elif code:
+                        buf_err.write(str(code))
+                        return_code = 1
+        except Exception as exc:
+            buf_err.write(str(exc))
+            return_code = 1
+        finally:
+            sys.argv = previous_argv
+            os.chdir(previous_cwd)
+            if inserted_path:
+                with contextlib.suppress(ValueError):
+                    sys.path.remove(script_dir)
+        return subprocess.CompletedProcess(
+            args=[script_path] + list(args),
+            returncode=return_code,
+            stdout=buf_out.getvalue(),
+            stderr=buf_err.getvalue(),
+        )
+
     def _run_converter_command(self, cmd: List[str], cwd: Optional[str]) -> subprocess.CompletedProcess:
         if not cmd:
             return subprocess.CompletedProcess(args=cmd, returncode=1, stdout="", stderr="Empty converter command.")
+
+        script_payload = self._script_command_payload(cmd)
+        if script_payload is not None:
+            script_path, args = script_payload
+            return self._run_python_script_in_process(script_path, args, cwd)
 
         process = QProcess(self)
         process.setProgram(cmd[0])
@@ -6648,45 +7131,7 @@ class SettingsDialog(QDialog):
         args: List[str],
         working_dir: Optional[str] = None,
     ) -> subprocess.CompletedProcess:
-        buf_out = io.StringIO()
-        buf_err = io.StringIO()
-        previous_cwd = os.getcwd()
-        previous_argv = sys.argv[:]
-        return_code = 0
-        try:
-            if working_dir:
-                os.chdir(working_dir)
-            sys.argv = [script_path] + list(args)
-            script_dir = os.path.dirname(script_path)
-            inserted_path = False
-            if script_dir and script_dir not in sys.path:
-                sys.path.insert(0, script_dir)
-                inserted_path = True
-            with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
-                try:
-                    runpy.run_path(script_path, run_name="__main__")
-                except SystemExit as exc:
-                    code = exc.code
-                    if isinstance(code, int):
-                        return_code = code
-                    else:
-                        buf_err.write(str(code))
-                        return_code = 1
-        except Exception as exc:
-            buf_err.write(str(exc))
-            return_code = 1
-        finally:
-            sys.argv = previous_argv
-            os.chdir(previous_cwd)
-            if inserted_path:
-                with contextlib.suppress(ValueError):
-                    sys.path.remove(script_dir)
-        return subprocess.CompletedProcess(
-            args=[script_path] + list(args),
-            returncode=return_code,
-            stdout=buf_out.getvalue(),
-            stderr=buf_err.getvalue(),
-        )
+        return self._run_python_script_in_process(script_path, args, working_dir)
 
     # ------------------------------------------------------------------
     # Anim transfer helpers
