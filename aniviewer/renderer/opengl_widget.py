@@ -1303,12 +1303,12 @@ class OpenGLAnimationWidget(QOpenGLWidget):
 
     def _ensure_spatiallabs_gl_weaver(
         self,
-        view_w: int,
-        view_h: int,
+        input_w: int,
+        input_h: int,
     ) -> Optional[SpatialLabsGLWeaver]:
         if self._spatiallabs_gl_weaver_failed:
             return None
-        target_size = (max(1, int(view_w)), max(1, int(view_h)))
+        target_size = (max(1, int(input_w)), max(1, int(input_h)))
         if (
             self._spatiallabs_gl_weaver is not None
             and self._spatiallabs_gl_weaver_size == target_size
@@ -1745,7 +1745,13 @@ class OpenGLAnimationWidget(QOpenGLWidget):
             return False
         view_w = max(1, int(view_w))
         view_h = max(1, int(view_h))
-        weaver = self._ensure_spatiallabs_gl_weaver(view_w, view_h)
+        # This path renders anamorphic side-by-side stereo into the SDK input FBO
+        # and asks the weaver to draw back into Qt's current viewport FBO. The
+        # input must therefore track the live viewport size. The SDK's
+        # recommended view texture size is for full display/view textures and can
+        # produce a valid but black/unmapped output inside QOpenGLWidget.
+        input_size = (view_w, view_h)
+        weaver = self._ensure_spatiallabs_gl_weaver(input_size[0], input_size[1])
         if weaver is None:
             return False
         target_fbo = int(framebuffer_binding_hint or self.defaultFramebufferObject())
@@ -1765,21 +1771,8 @@ class OpenGLAnimationWidget(QOpenGLWidget):
 
         input_w, input_h = self._framebuffer_color_texture_size(
             input_fbo,
-            sdk.recommended_view_size((view_w, view_h)),
+            input_size,
         )
-        try:
-            self._drain_gl_errors()
-            if not weaver.can_weave(input_w, input_h):
-                self._drain_gl_errors()
-                self._spatiallabs_gl_weaver_failed = True
-                self._set_spatial3d_status(
-                    f"SpatialLabs weaver cannot use {input_w}x{input_h}; using preview stereo"
-                )
-                return False
-            self._drain_gl_errors()
-        except Exception:
-            self._drain_gl_errors()
-            pass
 
         prev_fbo = 0
         prev_viewport = None

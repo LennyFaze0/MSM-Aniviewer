@@ -13989,18 +13989,19 @@ class MSMAnimationViewer(QMainWindow):
                 if basic_fast_load:
                     self._schedule_basic_costume_list_refresh(previous_costume_key)
             with profile_scope("load.animation.audio_setup"):
+                allow_dof_audio_scan = bool(self._is_active_dof_audio_context())
                 if batch_fast_switch:
                     if self._batch_export_needs_audio and self.current_animation_name:
                         self.load_audio_for_animation(
                             self.current_animation_name,
-                            allow_dof_bundle_scan=False,
+                            allow_dof_bundle_scan=allow_dof_audio_scan,
                         )
                 elif basic_fast_load:
                     self._schedule_basic_audio_load(self.current_animation_name)
                 elif self.current_animation_name:
                     self.load_audio_for_animation(
                         self.current_animation_name,
-                        allow_dof_bundle_scan=False,
+                        allow_dof_bundle_scan=allow_dof_audio_scan,
                     )
                 if not basic_fast_load:
                     self._configure_animation_bpm()
