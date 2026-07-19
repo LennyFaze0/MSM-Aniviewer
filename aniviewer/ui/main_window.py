@@ -235,6 +235,15 @@ class CostumeEntry:
         return self.json_path or self.bin_path
 
 
+@dataclass
+class ClubBuddyAudioClip:
+    """Audio clip reference from a club buddy manifest."""
+    clip_stem: str
+    audio_path: str
+    midi_track_name: str
+    midi_note: int
+
+
 class BinConversionWorker(QObject):
     """Run BIN->JSON conversion off the UI thread."""
 
@@ -1808,6 +1817,8 @@ class MSMAnimationViewer(QMainWindow):
         self._hang_watchdog_active: bool = False
         self.buddy_audio_tracks: Dict[str, str] = {}
         self.buddy_audio_tracks_normalized: Dict[str, str] = {}
+        self.club_buddy_audio_tracks: Dict[str, List[ClubBuddyAudioClip]] = {}
+        self.club_buddy_audio_tracks_normalized: Dict[str, List[ClubBuddyAudioClip]] = {}
         self.buddy_audio_blocked_tracks: Set[str] = set()
         self.buddy_audio_blocked_tracks_normalized: Set[str] = set()
         self.build_version: str = "b0.6"
@@ -4632,6 +4643,8 @@ class MSMAnimationViewer(QMainWindow):
         """Parse buddy manifests (001_*.bin) to map animations directly to audio files."""
         self.buddy_audio_tracks.clear()
         self.buddy_audio_tracks_normalized.clear()
+        self.club_buddy_audio_tracks.clear()
+        self.club_buddy_audio_tracks_normalized.clear()
         self.buddy_audio_blocked_tracks.clear()
         self.buddy_audio_blocked_tracks_normalized.clear()
         if not self.game_path and not self.downloads_path:
@@ -4690,10 +4703,15 @@ class MSMAnimationViewer(QMainWindow):
             if not os.path.isdir(xml_bin_dir):
                 continue
             data_root = str(Path(xml_bin_dir).parent)
+            club_manifest_candidates = [
+                path for path in glob(os.path.join(xml_bin_dir, "club*_act*-*.bin"))
+                if self._is_likely_club_monster_buddy_manifest_path(path)
+            ]
             manifest_paths = sorted(
                 set(
                     glob(os.path.join(xml_bin_dir, "[0-9][0-9][0-9]_*.bin"))
                     + glob(os.path.join(xml_bin_dir, "[0-9][0-9][0-9]-*.bin"))
+                    + club_manifest_candidates
                 )
             )
             manifest_paths = [path for path in manifest_paths if is_buddy_manifest(path)]
@@ -4722,6 +4740,10 @@ class MSMAnimationViewer(QMainWindow):
                 continue
 
             parsed_files += 1
+            is_club_manifest = self._is_club_buddy_manifest_path(manifest_path)
+            if is_club_manifest:
+                total_tracks += self._index_club_buddy_manifest(manifest_path, manifest, data_root)
+                continue
             for track_name, rel_audio in manifest.iter_audio_links():
                 normalized_name = self._normalize_audio_key(track_name)
                 if not rel_audio:
@@ -4748,6 +4770,156 @@ class MSMAnimationViewer(QMainWindow):
                 f"Loaded {total_tracks} buddy audio links from {parsed_files} manifests",
                 "INFO"
             )
+
+    @staticmethod
+    def _is_club_buddy_manifest_path(path: str) -> bool:
+        """Return True for club track buddy manifests such as club01_act04-ABCDN_A.bin."""
+        stem = Path(path or "").stem
+        return bool(re.match(r"^club\d+_act\d+-", stem, re.IGNORECASE))
+
+    @staticmethod
+    def _is_likely_club_monster_buddy_manifest_path(path: str) -> bool:
+        """Filter club track candidates down to monster-like manifests."""
+        stem = Path(path or "").stem
+        match = re.match(r"^club\d+_act\d+-(.+)$", stem, re.IGNORECASE)
+        if not match:
+            return False
+        subject = match.group(1).strip("_")
+        if not subject:
+            return False
+        lowered = subject.lower()
+        if lowered.startswith("prop_") or lowered.startswith("fx_") or lowered.startswith("backing"):
+            return False
+        first = subject.split("_", 1)[0]
+        return bool(re.fullmatch(r"[A-Za-z0-9]+", first or ""))
+
+    def _index_club_buddy_manifest(
+        self,
+        manifest_path: str,
+        manifest: BuddyManifest,
+        data_root: str,
+    ) -> int:
+        """Index every note-addressed sample in a club buddy manifest."""
+        track_names = [
+            str(track.name or "").strip()
+            for track in getattr(manifest, "tracks", []) or []
+            if str(track.name or "").strip()
+        ]
+        if not track_names:
+            track_names = ["Dance_01"]
+
+        midi_track_name = ""
+        for label in getattr(manifest, "labels", []) or []:
+            label_text = str(label or "").strip()
+            if re.search(r"_monster(?:_[A-Za-z0-9]+)?$", label_text, re.IGNORECASE):
+                midi_track_name = label_text
+                break
+        if not midi_track_name and getattr(manifest, "labels", None):
+            midi_track_name = str((manifest.labels or [""])[0] or "").strip()
+        if not midi_track_name:
+            midi_track_name = Path(manifest_path or "").stem
+
+        added_paths: Set[str] = set()
+        for track_name in track_names:
+            aliases = self._club_buddy_audio_aliases(manifest_path, manifest, track_name)
+            for sample in getattr(manifest, "samples", []) or []:
+                rel_audio = str(getattr(sample, "relative_path", "") or "").strip()
+                if not rel_audio:
+                    continue
+                abs_path = os.path.normpath(os.path.join(data_root, rel_audio.replace("/", os.sep)))
+                clip_stem = Path(abs_path).stem
+                if not clip_stem:
+                    continue
+                note = int(getattr(sample, "sample_id", 0) or 0) & 0xFF
+                clip = ClubBuddyAudioClip(
+                    clip_stem=clip_stem,
+                    audio_path=abs_path,
+                    midi_track_name=midi_track_name,
+                    midi_note=note,
+                )
+                for alias_name in aliases:
+                    alias = (alias_name or "").strip()
+                    if not alias:
+                        continue
+                    bucket = self.club_buddy_audio_tracks.setdefault(alias, [])
+                    if not any(
+                        os.path.normcase(existing.audio_path) == os.path.normcase(abs_path)
+                        for existing in bucket
+                    ):
+                        bucket.append(clip)
+                    normalized_alias = self._normalize_audio_key(alias)
+                    if normalized_alias:
+                        normalized_bucket = self.club_buddy_audio_tracks_normalized.setdefault(normalized_alias, [])
+                        if not any(
+                            os.path.normcase(existing.audio_path) == os.path.normcase(abs_path)
+                            for existing in normalized_bucket
+                        ):
+                            normalized_bucket.append(clip)
+                added_paths.add(os.path.normcase(abs_path))
+        return len(added_paths)
+
+    def _club_buddy_audio_aliases(
+        self,
+        manifest_path: str,
+        manifest: BuddyManifest,
+        track_name: str,
+    ) -> List[str]:
+        """Build contextual aliases for club buddy tracks with globally generic names."""
+        aliases: List[str] = []
+        seen: Set[str] = set()
+
+        def add(value: Optional[str]) -> None:
+            text = (value or "").strip()
+            if not text:
+                return
+            key = text.lower()
+            if key in seen:
+                return
+            seen.add(key)
+            aliases.append(text)
+
+        stem = Path(manifest_path or "").stem
+        add(stem)
+        add(f"{stem}_{track_name}")
+
+        club_prefix = ""
+        subject = ""
+        stem_match = re.match(r"^(club\d+_act\d+)-(.+)$", stem, re.IGNORECASE)
+        if stem_match:
+            club_prefix = stem_match.group(1)
+            subject = stem_match.group(2)
+            add(f"{club_prefix}_{track_name}")
+            add(f"{subject}_{track_name}")
+
+        labels = [
+            str(label or "").strip()
+            for label in getattr(manifest, "labels", []) or []
+            if str(label or "").strip()
+        ]
+        token_candidates: List[str] = []
+        for label in labels:
+            add(label)
+            add(f"{label}_{track_name}")
+            monster_match = re.match(r"^(.+?)_monster(?:_[A-Za-z0-9]+)?$", label, re.IGNORECASE)
+            if monster_match:
+                token_candidates.append(monster_match.group(1))
+
+        if subject:
+            subject_parts = [part for part in subject.split("_") if part]
+            if len(subject_parts) > 1 and re.fullmatch(r"[A-Za-z][A-Za-z0-9]?", subject_parts[-1] or ""):
+                token_candidates.append("_".join(subject_parts[:-1]))
+            token_candidates.append(subject)
+
+        for token in token_candidates:
+            normalized_token = self._normalize_audio_key(token)
+            if not normalized_token:
+                continue
+            add(f"{normalized_token}_{track_name}")
+            add(f"{normalized_token}_monster_{track_name}")
+            if club_prefix:
+                add(f"{club_prefix}_{normalized_token}_{track_name}")
+
+        return aliases
 
     @staticmethod
     def _sanitize_path_setting_value(value: Any) -> str:
@@ -6732,9 +6904,24 @@ class MSMAnimationViewer(QMainWindow):
         stem = Path(self.current_json_path).stem
         if not stem:
             return None
+        club_match = self._parse_club_monster_stem(stem)
+        if club_match:
+            _club_prefix, token = club_match
+            return token or None
         if stem.lower().startswith("monster_"):
             stem = stem[8:]
         return stem or None
+
+    @staticmethod
+    def _parse_club_monster_stem(stem: str) -> Optional[Tuple[str, str]]:
+        """Return (club prefix, monster token) for club monster asset stems."""
+        match = re.match(r"^(club\d+-\d+)_monster_([A-Za-z0-9_]+)$", stem or "", re.IGNORECASE)
+        if not match:
+            return None
+        token = match.group(2).strip("_")
+        if not token:
+            return None
+        return match.group(1), token
 
     def _scan_costume_entries(self) -> List[CostumeEntry]:
         """Return all costume files that match the current monster token."""
@@ -6744,7 +6931,7 @@ class MSMAnimationViewer(QMainWindow):
         if not token:
             return []
 
-        prefix_lower = f"costume_{token.lower()}_"
+        prefix_lowers = self._costume_entry_prefixes_for_token(token)
         entries: Dict[str, CostumeEntry] = {}
 
         costume_roots: List[str] = []
@@ -6760,7 +6947,7 @@ class MSMAnimationViewer(QMainWindow):
 
         for priority, xml_bin_dir in enumerate(costume_roots):
             self._collect_costumes_in_dir(
-                xml_bin_dir, prefix_lower, entries,
+                xml_bin_dir, prefix_lowers, entries,
                 priority=priority,
                 allow_bins=True, allow_json=True
             )
@@ -6780,7 +6967,7 @@ class MSMAnimationViewer(QMainWindow):
             if directory_norm in seen_roots:
                 continue
             self._collect_costumes_in_dir(
-                directory, prefix_lower, entries,
+                directory, prefix_lowers, entries,
                 priority=priority_counter,
                 allow_bins=False, allow_json=True
             )
@@ -6791,6 +6978,20 @@ class MSMAnimationViewer(QMainWindow):
             if entry.source_path
         ]
         return sorted_entries
+
+    def _costume_entry_prefixes_for_token(self, token: str) -> List[str]:
+        """Build accepted costume filename prefixes for the current monster token."""
+        normalized = (token or "").strip().lower()
+        if not normalized:
+            return []
+        prefixes = [f"costume_{normalized}_"]
+        stem = Path(self.current_json_path).stem if self.current_json_path else ""
+        club_match = self._parse_club_monster_stem(stem)
+        if club_match:
+            club_prefix, club_token = club_match
+            if club_token and club_token.lower() == normalized:
+                prefixes.insert(0, f"{club_prefix.lower()}_costume_{normalized}_")
+        return prefixes
 
     def _scan_legacy_sheet_entries(self) -> List[CostumeEntry]:
         """Discover legacy VIP spritesheet variants for the active animation."""
@@ -7149,20 +7350,20 @@ class MSMAnimationViewer(QMainWindow):
     def _collect_costumes_in_dir(
         self,
         directory: str,
-        prefix_lower: str,
+        prefix_lowers: List[str],
         entries: Dict[str, CostumeEntry],
         priority: int,
         allow_bins: bool,
         allow_json: bool
     ):
         """Populate entries with costume files from a directory."""
-        if not directory or not os.path.isdir(directory):
+        if not directory or not os.path.isdir(directory) or not prefix_lowers:
             return
         try:
             for name in os.listdir(directory):
                 stem, ext = os.path.splitext(name)
                 lower_stem = stem.lower()
-                if not lower_stem.startswith(prefix_lower):
+                if not any(lower_stem.startswith(prefix) for prefix in prefix_lowers):
                     continue
                 ext_lower = ext.lower()
                 if ext_lower == '.bin' and not allow_bins:
@@ -13643,6 +13844,12 @@ class MSMAnimationViewer(QMainWindow):
         candidate_dirs = [d for d in candidate_dirs if os.path.isdir(d)]
         if not candidate_dirs:
             return None
+        if self.current_json_path:
+            club_match = self._parse_club_monster_stem(Path(self.current_json_path).stem)
+            if club_match:
+                club_midi_path = self._resolve_club_midi_path(club_match[0])
+                if club_midi_path:
+                    return club_midi_path
         for code in self._build_island_code_candidates():
             if code is None:
                 continue
@@ -14498,6 +14705,7 @@ class MSMAnimationViewer(QMainWindow):
 
         is_dof = self._is_active_dof_audio_context() if force_dof is None else bool(force_dof)
         is_muppet = self._is_muppet_payload() and not is_dof
+        monster_token = self._current_monster_token()
 
         if not is_dof:
             if self._should_use_monster_f_activate_sfx(animation_name):
@@ -14521,6 +14729,13 @@ class MSMAnimationViewer(QMainWindow):
             if x18_scope:
                 return None, False, x18_scope, x18_tracks
 
+            club_audio, club_scope, club_tracks = self._resolve_club_buddy_audio(
+                animation_name,
+                monster_token,
+            )
+            if club_audio or club_scope:
+                return club_audio, True, club_scope, club_tracks
+
             if self._should_skip_non_dof_audio(animation_name):
                 return None, False, None, []
 
@@ -14529,7 +14744,6 @@ class MSMAnimationViewer(QMainWindow):
             return buddy_override, True, None, []
         buddy_blocked = self._is_buddy_audio_blocked(animation_name) and not is_dof
 
-        monster_token = self._current_monster_token()
         dof_asset_name: Optional[str] = None
         if is_dof and self.current_json_path:
             dof_asset_name = self._dof_anim_name_from_path(self.current_json_path)
@@ -14710,6 +14924,416 @@ class MSMAnimationViewer(QMainWindow):
         if paths:
             return paths[0]
         return None
+
+    def _resolve_club_buddy_audio(
+        self,
+        animation_name: str,
+        monster_token: Optional[str],
+    ) -> Tuple[Optional[str], Optional[str], List[Tuple[str, str]]]:
+        """Resolve clubbox monster audio from contextual club buddy manifests."""
+        if not animation_name or not monster_token or not self.club_buddy_audio_tracks_normalized:
+            return None, None, []
+        if not self.current_json_path:
+            return None, None, []
+
+        stem = Path(self.current_json_path).stem
+        club_match = self._parse_club_monster_stem(stem)
+        if not club_match:
+            return None, None, []
+
+        club_prefix, club_token = club_match
+        token_norm = self._normalize_audio_key(monster_token)
+        club_token_norm = self._normalize_audio_key(club_token)
+        animation_norm = self._normalize_audio_key(animation_name)
+        if not token_norm or token_norm != club_token_norm or not animation_norm:
+            return None, None, []
+
+        club_act_prefix = club_prefix.replace("-", "_act")
+        raw_keys: List[str] = []
+        for lookup_token in self._club_audio_token_variants(token_norm):
+            raw_keys.extend(
+                [
+                    f"{lookup_token}_{animation_name}",
+                    f"{lookup_token}_{animation_norm}",
+                    f"{lookup_token}_monster_{animation_name}",
+                    f"{lookup_token}_monster_{animation_norm}",
+                    f"{club_act_prefix}_{lookup_token}_{animation_name}",
+                    f"{club_act_prefix}_{lookup_token}_{animation_norm}",
+                ]
+            )
+
+        entries: List[ClubBuddyAudioClip] = []
+        seen_paths: Set[str] = set()
+        for raw_key in raw_keys:
+            normalized = self._normalize_audio_key(raw_key)
+            if not normalized:
+                continue
+            for clip in self.club_buddy_audio_tracks_normalized.get(normalized, []):
+                if not clip.audio_path or not os.path.exists(clip.audio_path):
+                    continue
+                norm_path = os.path.normcase(os.path.normpath(clip.audio_path))
+                if norm_path in seen_paths:
+                    continue
+                seen_paths.add(norm_path)
+                entries.append(clip)
+
+        if not entries:
+            return None, None, []
+
+        scope = f"{club_prefix}_{token_norm}_{animation_norm}"
+        tracks = [
+            (clip.clip_stem, self._format_audio_track_label(clip.clip_stem))
+            for clip in entries
+        ]
+        muted = self._get_muted_tracks_for_scope(scope)
+        active_entries = [
+            clip for clip in entries
+            if self._normalize_audio_track_id(clip.clip_stem) not in muted
+        ]
+        if not active_entries:
+            return None, scope, tracks
+
+        midi_path = self._resolve_club_midi_path(club_prefix)
+        if midi_path:
+            mix_path = self._build_club_timed_mix_audio(
+                cache_prefix=f"club_{token_norm}_{animation_norm}",
+                midi_path=midi_path,
+                clip_entries=active_entries,
+                muted_stems=muted,
+            )
+            return mix_path, scope, tracks
+
+        fallback_entries = [(clip.clip_stem, clip.audio_path) for clip in active_entries]
+        mix_path = self._build_layered_clip_path_mix_audio(
+            cache_prefix=f"club_{token_norm}_{animation_norm}",
+            clip_entries=fallback_entries,
+            muted_stems=muted,
+        )
+        return mix_path, scope, tracks
+
+    def _club_audio_token_variants(self, token: str) -> List[str]:
+        """Return club audio lookup tokens, including descriptor-stripped variants."""
+        normalized = self._normalize_audio_key(token)
+        if not normalized:
+            return []
+        variants = [normalized]
+        parts = [part for part in normalized.split("_") if part]
+        descriptor_suffixes = {"rare", "epic", "maj", "major", "min", "minor"}
+        while len(parts) > 1 and parts[-1] in descriptor_suffixes:
+            parts = parts[:-1]
+            stripped = "_".join(parts)
+            if stripped and stripped not in variants:
+                variants.append(stripped)
+        return variants
+
+    def _resolve_club_midi_path(self, club_prefix: str) -> Optional[str]:
+        """Resolve club MIDI names such as club01-04 -> club01_act04.mid."""
+        prefix = (club_prefix or "").strip()
+        if not prefix:
+            return None
+        filename_candidates: List[str] = []
+        converted = prefix.replace("-", "_act")
+        if converted:
+            filename_candidates.append(f"{converted}.mid")
+        match = re.match(r"^club(\d+)-(\d+)$", prefix, re.IGNORECASE)
+        if match:
+            club_num, act_num = match.groups()
+            filename_candidates.append(f"club{club_num}_act{act_num}.mid")
+            try:
+                filename_candidates.append(f"club{int(club_num):02d}_act{int(act_num):02d}.mid")
+            except ValueError:
+                pass
+
+        names: List[str] = []
+        for name in filename_candidates:
+            if name not in names:
+                names.append(name)
+        for music_dir in self._resolve_special_music_dirs():
+            for filename in names:
+                candidate = os.path.normpath(os.path.join(music_dir, filename))
+                if os.path.exists(candidate):
+                    return candidate
+        return None
+
+    def _build_club_timed_mix_audio(
+        self,
+        *,
+        cache_prefix: str,
+        midi_path: str,
+        clip_entries: List[ClubBuddyAudioClip],
+        muted_stems: Optional[Set[str]] = None,
+    ) -> Optional[str]:
+        """Build a timed mix for club monster clips using the club MIDI note tracks."""
+        if not midi_path or not os.path.exists(midi_path) or not clip_entries:
+            return None
+
+        muted = {self._normalize_audio_track_id(stem) for stem in (muted_stems or set()) if stem}
+        active_entries = [
+            clip for clip in clip_entries
+            if self._normalize_audio_track_id(clip.clip_stem) not in muted
+        ]
+        if not active_entries:
+            return None
+
+        try:
+            midi = read_midi_file(midi_path)
+        except Exception as exc:
+            self.log_widget.log(f"Club audio: failed to parse {os.path.basename(midi_path)} ({exc})", "WARNING")
+            return None
+
+        tracks_by_name = {
+            (track.name or "").strip().lower(): track
+            for track in midi.tracks
+            if (track.name or "").strip()
+        }
+
+        control_track_names: Set[str] = set()
+        for clip in active_entries:
+            candidate = re.sub(
+                r"_monster(?:_[A-Za-z0-9]+)?$",
+                "_Animation",
+                clip.midi_track_name or "",
+                flags=re.IGNORECASE,
+            )
+            if candidate and candidate != clip.midi_track_name:
+                control_track_names.add(candidate.lower())
+
+        control_notes = []
+        for track_name in control_track_names:
+            track = tracks_by_name.get(track_name)
+            if track and track.notes:
+                control_notes.extend(track.notes)
+
+        event_specs: List[Tuple[int, ClubBuddyAudioClip]] = []
+        for clip in active_entries:
+            track = tracks_by_name.get((clip.midi_track_name or "").strip().lower())
+            if not track or not track.notes:
+                continue
+            for note in track.notes:
+                if int(note.note) == int(clip.midi_note):
+                    event_specs.append((int(note.start_tick), clip))
+
+        if not event_specs:
+            self.log_widget.log(
+                f"Club audio: no MIDI events matched {len(active_entries)} clip sample(s) in {os.path.basename(midi_path)}.",
+                "WARNING",
+            )
+            return None
+
+        if control_notes:
+            window_start_tick = min(int(note.start_tick) for note in control_notes)
+            window_end_tick = max(int(note.end_tick) for note in control_notes)
+        else:
+            window_start_tick = min(start_tick for start_tick, _clip in event_specs)
+            window_end_tick = max(start_tick for start_tick, _clip in event_specs)
+
+        tempo_points: List[Tuple[int, int]] = []
+        for track in midi.tracks:
+            for event in track.events:
+                if event.kind == "meta" and int(event.status) == 0x51 and len(event.data) == 3:
+                    tempo_micro = int.from_bytes(event.data, "big")
+                    if tempo_micro > 0:
+                        tempo_points.append((int(event.tick), tempo_micro))
+        if not tempo_points:
+            tempo_points = [(0, 500000)]
+
+        window_start_sec = self._midi_tick_to_seconds(window_start_tick, midi.ticks_per_beat, tempo_points)
+        window_end_sec = self._midi_tick_to_seconds(window_end_tick, midi.ticks_per_beat, tempo_points)
+        base_duration = max(0.0, window_end_sec - window_start_sec)
+
+        cache_sig_parts: List[str] = [
+            cache_prefix,
+            os.path.normcase(os.path.normpath(midi_path)),
+            str(os.path.getmtime(midi_path)),
+            str(window_start_tick),
+            str(window_end_tick),
+            "muted:" + ",".join(sorted(muted)),
+        ]
+        for clip in sorted(active_entries, key=lambda item: (item.midi_track_name.lower(), item.midi_note, item.clip_stem.lower())):
+            cache_sig_parts.append(clip.midi_track_name)
+            cache_sig_parts.append(str(int(clip.midi_note)))
+            cache_sig_parts.append(clip.clip_stem)
+            cache_sig_parts.append(os.path.normcase(os.path.normpath(clip.audio_path)))
+            try:
+                cache_sig_parts.append(str(os.path.getmtime(clip.audio_path)))
+            except OSError:
+                cache_sig_parts.append("0")
+
+        cache_key_raw = "|".join(cache_sig_parts)
+        cache_key = hashlib.md5(cache_key_raw.encode("utf-8", errors="ignore")).hexdigest()  # nosec B324
+        cache_hit = self._special_audio_mix_cache.get(cache_key)
+        if cache_hit and os.path.exists(cache_hit):
+            return cache_hit
+
+        clip_data_cache: Dict[str, Tuple[np.ndarray, int]] = {}
+        target_rate: Optional[int] = None
+        target_channels = 1
+        for clip in active_entries:
+            if clip.audio_path in clip_data_cache:
+                continue
+            try:
+                audio, sample_rate = sf.read(clip.audio_path, always_2d=True, dtype="float32")
+            except Exception as exc:
+                self.log_widget.log(
+                    f"Club audio: failed reading '{os.path.basename(clip.audio_path)}' ({exc})",
+                    "WARNING",
+                )
+                continue
+            if target_rate is None:
+                target_rate = int(sample_rate)
+            elif int(sample_rate) != int(target_rate):
+                audio = self._resample_audio_linear(audio, int(sample_rate), int(target_rate))
+            target_channels = max(target_channels, int(audio.shape[1]))
+            clip_data_cache[clip.audio_path] = (np.ascontiguousarray(audio, dtype=np.float32), int(target_rate))
+
+        if target_rate is None or not clip_data_cache:
+            return None
+
+        total_frames = max(1, int(math.ceil(base_duration * float(target_rate))))
+        events_resolved: List[Tuple[int, np.ndarray]] = []
+        for start_tick, clip in event_specs:
+            payload = clip_data_cache.get(clip.audio_path)
+            if not payload:
+                continue
+            clip_audio, _rate = payload
+            start_sec = self._midi_tick_to_seconds(start_tick, midi.ticks_per_beat, tempo_points)
+            rel_time = max(0.0, start_sec - window_start_sec)
+            start_frame = max(0, int(round(rel_time * float(target_rate))))
+            clip_buffer = clip_audio
+            if clip_buffer.shape[1] < target_channels:
+                if clip_buffer.shape[1] == 1:
+                    clip_buffer = np.repeat(clip_buffer, target_channels, axis=1)
+                else:
+                    pad = np.zeros((clip_buffer.shape[0], target_channels), dtype=np.float32)
+                    pad[:, :clip_buffer.shape[1]] = clip_buffer
+                    clip_buffer = pad
+            events_resolved.append((start_frame, clip_buffer))
+            total_frames = max(total_frames, start_frame + int(clip_buffer.shape[0]))
+
+        if not events_resolved:
+            return None
+
+        mix = np.zeros((total_frames, target_channels), dtype=np.float32)
+        for start_frame, clip_buffer in events_resolved:
+            end_frame = min(total_frames, start_frame + clip_buffer.shape[0])
+            if end_frame <= start_frame:
+                continue
+            length = end_frame - start_frame
+            mix[start_frame:end_frame, :] += clip_buffer[:length, :]
+
+        peak = float(np.max(np.abs(mix))) if mix.size else 0.0
+        if peak > 1.0:
+            mix /= peak
+
+        cache_dir = os.path.join(tempfile.gettempdir(), "MSMAnimationViewer", "audio_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        out_path = os.path.normpath(os.path.join(cache_dir, f"{cache_prefix}_{cache_key}.wav"))
+        try:
+            sf.write(out_path, mix, int(target_rate), subtype="PCM_16")
+        except Exception as exc:
+            self.log_widget.log(f"Club audio: failed writing cache clip ({exc})", "WARNING")
+            return None
+
+        self._special_audio_mix_cache[cache_key] = out_path
+        self.log_widget.log(
+            (
+                f"Club audio: built timed mix from {len(events_resolved)} MIDI event(s), "
+                f"{len(clip_data_cache)} clip(s) ({os.path.basename(out_path)})"
+            ),
+            "INFO",
+        )
+        return out_path
+
+    def _build_layered_clip_path_mix_audio(
+        self,
+        *,
+        cache_prefix: str,
+        clip_entries: List[Tuple[str, str]],
+        muted_stems: Optional[Set[str]] = None,
+    ) -> Optional[str]:
+        """Layer exact audio paths into one cache clip for contextual manifests."""
+        muted = {self._normalize_audio_track_id(stem) for stem in (muted_stems or set()) if stem}
+        active_entries = [
+            (stem, path)
+            for stem, path in clip_entries
+            if path and os.path.exists(path) and self._normalize_audio_track_id(stem) not in muted
+        ]
+        if not active_entries:
+            return None
+
+        cache_sig_parts: List[str] = [
+            cache_prefix,
+            "muted:" + ",".join(sorted(muted)),
+        ]
+        for stem, path in sorted(active_entries, key=lambda item: item[0].lower()):
+            cache_sig_parts.append(stem)
+            cache_sig_parts.append(os.path.normcase(os.path.normpath(path)))
+            try:
+                cache_sig_parts.append(str(os.path.getmtime(path)))
+            except OSError:
+                cache_sig_parts.append("0")
+
+        cache_key_raw = "|".join(cache_sig_parts)
+        cache_key = hashlib.md5(cache_key_raw.encode("utf-8", errors="ignore")).hexdigest()  # nosec B324
+        cache_hit = self._special_audio_mix_cache.get(cache_key)
+        if cache_hit and os.path.exists(cache_hit):
+            return cache_hit
+
+        clip_data_cache: Dict[str, Tuple[np.ndarray, int]] = {}
+        target_rate: Optional[int] = None
+        target_channels = 1
+        max_frames = 0
+        for stem, path in active_entries:
+            try:
+                audio, sample_rate = sf.read(path, always_2d=True, dtype="float32")
+            except Exception as exc:
+                self.log_widget.log(
+                    f"Audio mix: failed reading '{os.path.basename(path)}' ({exc})",
+                    "WARNING",
+                )
+                continue
+            if target_rate is None:
+                target_rate = int(sample_rate)
+            elif int(sample_rate) != int(target_rate):
+                audio = self._resample_audio_linear(audio, int(sample_rate), int(target_rate))
+            target_channels = max(target_channels, int(audio.shape[1]))
+            clip_buffer = np.ascontiguousarray(audio, dtype=np.float32)
+            clip_data_cache[stem] = (clip_buffer, int(target_rate))
+            max_frames = max(max_frames, int(clip_buffer.shape[0]))
+
+        if target_rate is None or not clip_data_cache or max_frames <= 0:
+            return None
+
+        mix = np.zeros((max_frames, target_channels), dtype=np.float32)
+        for _stem, (clip_buffer, _sample_rate) in clip_data_cache.items():
+            if clip_buffer.shape[1] < target_channels:
+                if clip_buffer.shape[1] == 1:
+                    clip_buffer = np.repeat(clip_buffer, target_channels, axis=1)
+                else:
+                    pad = np.zeros((clip_buffer.shape[0], target_channels), dtype=np.float32)
+                    pad[:, :clip_buffer.shape[1]] = clip_buffer
+                    clip_buffer = pad
+            mix[:clip_buffer.shape[0], :] += clip_buffer
+
+        peak = float(np.max(np.abs(mix))) if mix.size else 0.0
+        if peak > 1.0:
+            mix /= peak
+
+        cache_dir = os.path.join(tempfile.gettempdir(), "MSMAnimationViewer", "audio_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        out_path = os.path.normpath(os.path.join(cache_dir, f"{cache_prefix}_{cache_key}.wav"))
+        try:
+            sf.write(out_path, mix, int(target_rate), subtype="PCM_16")
+        except Exception as exc:
+            self.log_widget.log(f"Audio mix: failed writing cache clip ({exc})", "WARNING")
+            return None
+
+        self._special_audio_mix_cache[cache_key] = out_path
+        self.log_widget.log(
+            f"Audio mix: built club layered clip with {len(clip_data_cache)} track(s) ({os.path.basename(out_path)})",
+            "INFO",
+        )
+        return out_path
 
     def _resolve_world_midi_path(self, world_number: int, music_dirs: List[str]) -> Optional[str]:
         filename = f"world{int(world_number)}.mid"
@@ -31461,8 +32085,10 @@ All game assets and content are owned by Big Blue Bubble Inc.
         for data_root in self._candidate_data_roots():
             root = Path(data_root)
             add_dir(root / "gfx" / "costumes")
+            add_dir(root / "gfx" / "clubbox" / "costumes")
             if root.name.lower() != "data":
                 add_dir(root / "data" / "gfx" / "costumes")
+                add_dir(root / "data" / "gfx" / "clubbox" / "costumes")
 
         for ext in (".avif", ".png", ".dds", ".jpg", ".jpeg", ".tga", ".bmp"):
             for costume_dir in costume_dirs:
@@ -31512,9 +32138,16 @@ All game assets and content are owned by Big Blue Bubble Inc.
 
     @staticmethod
     def _costume_texture_prefix(entry_key: str) -> Optional[str]:
-        if not entry_key.startswith("costume_"):
+        key = (entry_key or "").strip()
+        club_match = re.match(r"^(club\d+-\d+)_costume_(.+)$", key, re.IGNORECASE)
+        club_prefix: Optional[str] = None
+        if club_match:
+            club_prefix = club_match.group(1)
+            key = f"costume_{club_match.group(2)}"
+
+        if not key.startswith("costume_"):
             return None
-        parts = entry_key.split("_")[1:]
+        parts = key.split("_")[1:]
         if len(parts) < 2:
             return None
         index_pos: Optional[int] = None
@@ -31528,4 +32161,6 @@ All game assets and content are owned by Big Blue Bubble Inc.
         token = "_".join(parts[:index_pos]).upper()
         if not token or not index:
             return None
+        if club_prefix:
+            return f"{club_prefix}_monster_{token}_costume_{index}"
         return f"monster_{token}_costume_{index}"
