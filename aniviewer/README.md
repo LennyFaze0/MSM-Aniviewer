@@ -1,3 +1,4 @@
+-This software is provided as-is, if anything breaks outside of what I've developed for the viewer, that will fall outside of support for the project (external binary conversion scripts etc.)-
 # My Singing Monsters Animation Viewer
 
 A comprehensive animation viewer for My Singing Monsters with OpenGL rendering, timeline scrubbing, and export features.
