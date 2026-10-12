@@ -1,0 +1,19 @@
+.asset-retention {
+  display: grid;
+  gap: 8px;
+  margin: 12px 0;
+  padding: 10px;
+  border: 1px solid var(--line-soft);
+  background: var(--surface-sunken);
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+.asset-retention-toggle { display: flex; align-items: start; gap: 7px; }
+.asset-retention-toggle input { flex: none; }
+.asset-retention p { margin: 0; font-size: 11px; line-height: 1.5; }
+.asset-retention small { color: var(--text-muted); line-height: 1.4; }
+.asset-retention-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.asset-retention-actions .button { flex: 1; }
+.asset-retention-folders { display: grid; gap: 6px; }
+.asset-retention-folders > div { display: flex; align-items: center; gap: 6px; }
+.asset-retention-folders span { flex: 1; min-width: 0; font-size: 11px; }

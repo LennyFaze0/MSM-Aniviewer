@@ -1,0 +1,36 @@
+{
+  "name": "msm-aniviewer-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "engines": {
+    "node": ">=24 <27",
+    "npm": ">=11"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "test": "vitest run src",
+    "test:bin": "vitest run src/core/bin-parser.formats.test.ts src/core/bin-parser.parity.test.ts src/core/muppets-parser.test.ts src/core/muppets-parser.parity.test.ts",
+    "test:bin:corpus": "vitest run src/core/revision-corpus.parity.test.ts",
+    "test:e2e": "playwright test",
+    "test:production": "playwright test --config=playwright.production.config.ts"
+  },
+  "dependencies": {
+    "@mediabunny/aac-encoder": "^1.56.0",
+    "@zip.js/zip.js": "^2.8.53",
+    "gifenc": "^1.0.3",
+    "lucide": "^1.33.0",
+    "mediabunny": "^1.56.0",
+    "pixi.js": "^8.19.0",
+    "texture2ddecoder-wasm": "^1.2.2",
+    "unityfs-js": "^0.2.6"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.62.1",
+    "typescript": "^7.0.2",
+    "vite": "^8.2.1",
+    "vitest": "^4.1.11"
+  }
+}

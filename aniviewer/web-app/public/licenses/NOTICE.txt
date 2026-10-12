@@ -1,0 +1,19 @@
+Fast video export uses Mediabunny 1.56.0, Copyright (c) Vanilagy,
+under the Mozilla Public License 2.0 (see mediabunny-MPL-2.0.txt).
+Mediabunny's library sources are used without modification.
+Source: https://github.com/Vanilagy/mediabunny/tree/v1.56.0
+Published source package: https://registry.npmjs.org/mediabunny/-/mediabunny-1.56.0.tgz
+
+AAC fallback uses @mediabunny/aac-encoder 1.56.0, Copyright (c) Vanilagy and contributors,
+under MPL-2.0 (mediabunny-aac-MPL-2.0.txt), without local source modifications.
+Source and build instructions:
+https://github.com/Vanilagy/mediabunny/tree/v1.56.0/packages/aac-encoder
+Published source package:
+https://registry.npmjs.org/@mediabunny/aac-encoder/-/aac-encoder-1.56.0.tgz
+This extension incorporates a WebAssembly build of FFmpeg's AAC encoder.
+FFmpeg source: https://github.com/FFmpeg/FFmpeg
+FFmpeg is licensed under LGPL 2.1 or later (FFmpeg-LGPL-2.1.txt).
+
+GIF encoding uses gifenc 1.0.3, Copyright (c) Matt DesLauriers,
+under the MIT license (gifenc-MIT.txt), without local source modifications.
+Source: https://github.com/mattdesl/gifenc

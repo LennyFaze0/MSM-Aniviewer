@@ -13,6 +13,19 @@ but hosted locally via unsloth to prevent AI companies from misusing their resou
 All graphics, UI elements, and reverse engineering efforts pertaining to the Aniviewer 
 are done by me, and will always be done by me. (Aside from collaboration with other reverse engineers or artists)
 
+## Web Viewer
+
+**[Open MSM Aniviewer in your browser](https://lennyfaze0.github.io/MSM-Aniviewer/)**
+
+The browser version works on desktop and mobile without installing the desktop
+application. Open your own animation files, game folder, or asset ZIP; files are
+processed locally in your browser, not uploaded to GitHub. Game assets are not
+included. Browser edits and export support differ from the desktop version;
+see [web viewer capabilities and limitations](web-app/README.md).
+
+Developers: see [local setup](web-app/README.md) and the
+[deployment guide](docs/WEB_DEPLOYMENT.md). The desktop version remains available below.
+
 ## Features
 
 - **OpenGL Rendering**: Accurate animation rendering using raw OpenGL, similar to the actual game

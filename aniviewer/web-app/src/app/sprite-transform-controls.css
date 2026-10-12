@@ -1,0 +1,31 @@
+.viewport-panel { touch-action: none; }
+.viewport-panel[data-transform-tool='move'] { cursor: move; }
+.viewport-panel[data-transform-tool='pan'] { cursor: grab; }
+.viewport-panel[data-transform-tool='rotate'],
+.viewport-panel[data-transform-tool='scale'] { cursor: crosshair; }
+.transform-overlay { position: absolute; inset: 0; width: 100%; height: 100%; z-index: 2; pointer-events: none; overflow: hidden; }
+.transform-outline { fill: none; stroke: var(--accent-strong); stroke-width: 1.5; filter: drop-shadow(0 1px 1px #000); }
+.transform-pivot, .transform-handle { fill: var(--surface-deep); stroke: var(--accent-strong); stroke-width: 2; }
+.transform-guide { stroke: var(--accent-strong); stroke-width: 1; stroke-dasharray: 3 3; }
+.transform-handle-hit { fill: transparent; pointer-events: all; cursor: grab; }
+.transform-dock { position: absolute; z-index: 3; inset: auto 0 0; padding: 4px; border-top: 1px solid var(--line-strong); background: var(--surface); cursor: default; touch-action: manipulation; }
+.transform-dock[hidden], .transform-steps[hidden] { display: none; }
+.transform-tools, .transform-options, .transform-steps { display: flex; gap: 4px; justify-content: center; }
+.transform-options, .transform-steps { margin-top: 4px; }
+.transform-dock .button { min-width: 0; min-height: 32px; padding: 4px 7px; flex: 1 1 0; gap: 4px; justify-content: center; max-width: 112px; font-size: 11px; }
+.transform-tools .button svg, .transform-steps .button svg { width: 17px; height: 17px; flex: 0 0 auto; }
+.transform-dock button[aria-pressed='true'] { background: var(--selection); border-color: var(--accent-strong); color: #fff; }
+.transform-dock select { flex: 1 1 0; min-width: 0; max-width: 112px; border: 1px solid var(--line-strong); background: var(--surface-sunken); color: var(--text); }
+.transform-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.transform-fields label { min-width: 0; display: grid; gap: 4px; font-size: 11px; color: var(--text-muted); }
+.transform-fields input { width: 100%; min-width: 0; min-height: 34px; padding: 4px 6px; color: var(--text); background: var(--surface-sunken); border: 1px solid var(--line-strong); border-radius: 2px; }
+.transform-inspector .control-command-grid { margin-top: 12px; }
+.transform-help { font-size: 12px; }
+.transform-help summary { cursor: pointer; padding-block: 8px; }
+#transformSelection { margin: 6px 0 10px; font-size: 12px; overflow-wrap: anywhere; }
+@media (pointer: coarse), (max-width: 760px) {
+  .transform-dock .button, .transform-dock select { min-height: 44px; }
+  .transform-fields input { min-height: 44px; font-size: 16px; }
+  .transform-inspector .button { min-height: 44px; }
+  .transform-tools .button { flex-direction: column; padding: 3px; gap: 1px; }
+}

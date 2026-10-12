@@ -17,7 +17,19 @@ build_exe.bat
 .venv/
 venv/
 env/
+web-app/node_modules/
+web-app/dist/
+web-app/.vite/
+web-app/test-results/
+web-app/playwright-report/
 
 # OS/editor
 .DS_Store
 Thumbs.db
+NUL
+
+# GitHub workflows belong at the repository root, not inside this app folder.
+/.github/
+
+# Read-only Windows import retained locally while the browser app is rebuilt.
+/web/

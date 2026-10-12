@@ -1,0 +1,20 @@
+.ik-controls { min-width: 0; }
+.ik-controls .link-field { display: grid; gap: 6px; margin-block: 12px; min-width: 0; }
+.ik-controls select { width: 100%; min-width: 0; min-height: 38px; color: var(--text); background: var(--surface-sunken); border: 1px solid var(--line-strong); }
+.ik-controls .ik-enable { display: flex; gap: 8px; align-items: center; min-height: 40px; }
+.ik-controls .link-members { max-height: 210px; overflow-y: auto; border: 1px solid var(--line-strong); background: var(--surface-sunken); }
+.ik-controls .link-members label { display: flex; gap: 8px; align-items: center; min-height: 40px; padding: 5px 8px; cursor: pointer; }
+.ik-controls .link-members span { overflow-wrap: anywhere; min-width: 0; }
+.ik-controls input[type='checkbox'] { flex: 0 0 auto; }
+.ik-controls details { margin-block: 10px; font-size: 12px; }
+.ik-controls summary { cursor: pointer; padding-block: 8px; }
+.ik-controls .control-command-grid { margin-block: 10px; }
+.ik-controls [hidden] { display: none !important; }
+.ik-chain { fill: none; stroke: var(--accent-strong); stroke-width: 2; filter: drop-shadow(0 1px 1px #000); }
+.ik-disabled { opacity: .45; stroke-dasharray: 4 4; }
+.ik-joint, .ik-target { fill: var(--surface-deep); stroke: var(--accent-strong); stroke-width: 2; }
+#ikError { color: var(--text); font-weight: bold; }
+@media (pointer: coarse), (max-width: 760px) {
+  .ik-controls .button, .ik-controls select, .ik-controls .link-members label, .ik-controls .ik-enable { min-height: 44px; }
+  .ik-controls select { font-size: 16px; }
+}

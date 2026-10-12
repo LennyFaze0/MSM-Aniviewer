@@ -1,0 +1,107 @@
+name: Deploy web viewer to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "aniviewer/web-app/**"
+      - "aniviewer/assets/**"
+      - "aniviewer/build_assets/**"
+      - "aniviewer/docs/WEB_VIEWER_ROADMAP.md"
+      - ".github/workflows/deploy-pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: aniviewer/web-app/package-lock.json
+
+      - name: Install dependencies
+        working-directory: aniviewer/web-app
+        run: npm ci
+
+      - name: Test web viewer
+        working-directory: aniviewer/web-app
+        run: npm test
+
+      - name: Install browser
+        working-directory: aniviewer/web-app
+        run: npx playwright install --with-deps chromium
+
+      - name: Test responsive viewer
+        working-directory: aniviewer/web-app
+        run: npm run test:e2e -- --workers=2
+
+      - name: Build web viewer
+        working-directory: aniviewer/web-app
+        run: npm run build
+
+      - name: Test production website
+        working-directory: aniviewer/web-app
+        run: npm run test:production -- --workers=2
+
+      - name: Stamp deployed revision
+        working-directory: aniviewer/web-app
+        run: node -e 'require("node:fs").writeFileSync("dist/build-info.json", JSON.stringify({commit:process.env.GITHUB_SHA,run:process.env.GITHUB_RUN_ID}) + "\n")'
+
+      - name: Preserve browser test failures
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-test-results
+          path: aniviewer/web-app/test-results
+          retention-days: 7
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: aniviewer/web-app/dist
+
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: build
+    steps:
+      - name: Deploy GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+      - name: Verify published revision
+        env:
+          PAGE_URL: ${{ steps.deployment.outputs.page_url }}
+        run: |
+          for attempt in $(seq 1 15); do
+            if curl --fail --silent --show-error --location "${PAGE_URL%/}/build-info.json?revision=$GITHUB_SHA" -o /tmp/build-info.json &&
+              node -e 'const info=JSON.parse(require("node:fs").readFileSync("/tmp/build-info.json","utf8")); if(info.commit !== process.env.GITHUB_SHA) process.exit(1)'; then
+              echo "Published and verified: $PAGE_URL" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "The deployed revision could not be verified." >&2
+          exit 1

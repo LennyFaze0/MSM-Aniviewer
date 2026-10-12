@@ -1,0 +1,17 @@
+.edit-links .link-field { display: grid; gap: 6px; margin-block: 12px; min-width: 0; }
+.transform-linked-outline { stroke-dasharray: 5 3; opacity: .8; }
+.edit-links select { width: 100%; min-width: 0; min-height: 38px; color: var(--text); background: var(--surface-sunken); border: 1px solid var(--line-strong); }
+.edit-links .link-members { max-height: 210px; overflow-y: auto; border: 1px solid var(--line-strong); background: var(--surface-sunken); }
+.edit-links .link-members label, .edit-links .link-channels label { display: flex; align-items: center; gap: 8px; min-height: 40px; padding: 5px 8px; cursor: pointer; }
+.edit-links .link-members span { overflow-wrap: anywhere; min-width: 0; }
+.edit-links input[type='checkbox'] { flex: 0 0 auto; }
+.edit-links #editLinkError { color: var(--text); font-weight: 600; }
+.edit-links .link-rules { display: grid; gap: 6px; margin-top: 12px; }
+.edit-links .link-rules .button { white-space: normal; text-align: left; overflow-wrap: anywhere; }
+.edit-links details { font-size: 12px; }
+.edit-links summary { cursor: pointer; padding-block: 8px; }
+.edit-links .link-channels[hidden] { display: none; }
+@media (pointer: coarse), (max-width: 760px) {
+  .edit-links .button, .edit-links select, .edit-links .link-members label, .edit-links .link-channels label { min-height: 44px; }
+  .edit-links select { font-size: 16px; }
+}
