@@ -54,7 +54,7 @@ self.addEventListener('fetch', (event) => {
   if (url.origin !== self.location.origin) return;
 
   const applicationCode = ['script', 'style', 'worker'].includes(request.destination);
-  if (request.mode === 'navigate' || applicationCode || url.pathname.includes('/dof-manifests/')) {
+  if (request.mode === 'navigate' || applicationCode || request.destination === 'manifest' || url.pathname.includes('/dof-manifests/')) {
     event.respondWith(networkFirst(request));
     return;
   }

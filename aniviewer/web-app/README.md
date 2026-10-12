@@ -11,6 +11,13 @@ For release steps and live-site verification, see the
 build, not a Jekyll site. Existing local-preview asset caches are separate from
 the public website; import your assets once at the public address.
 
+Adding the viewer to an iOS or Android home screen uses the viewer's existing
+program icon. iOS receives a 180px touch icon; Android receives 192px/512px icons
+and a padded maskable variant. All are derived from `build_assets/aniviewer program
+icon.ico`, not separate artwork. Maintainers can regenerate them with
+`bash scripts/generate-home-icons.sh` (ImageMagick required). Existing home-screen
+shortcuts may need to be removed and added again to pick up the new icon.
+
 ## Local development
 
 Node.js 24 LTS with npm 11 or newer is recommended. Dependencies must be installed
