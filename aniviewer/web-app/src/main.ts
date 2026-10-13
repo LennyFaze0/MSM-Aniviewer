@@ -1,6 +1,5 @@
 import {
   ArrowLeftRight,
-  BookOpen,
   Check,
   ChevronLeft,
   ChevronRight,
@@ -121,9 +120,6 @@ appRoot.innerHTML = `
       </div>
       <div class="header-file" id="headerFile">No animation loaded</div>
       <div class="header-actions">
-        <a class="button header-tool-button manual-link" id="manualButton" href="${import.meta.env.BASE_URL}manual.html" target="_blank" rel="noopener" title="Viewer manual (opens in a new tab)" aria-label="Viewer manual (opens in a new tab)">
-          <i data-lucide="book-open"></i><span>Manual</span>
-        </a>
         <button class="button header-tool-button" id="fitButton" type="button" title="Fit animation to viewport" aria-label="Fit animation to viewport">
           <i data-lucide="rotate-ccw"></i><span>Fit View</span>
         </button>
@@ -179,7 +175,6 @@ appRoot.innerHTML = `
                 </button>
               </div>
               <div id="assetRetentionPanel"></div>
-              <a class="button control-wide-button manual-link" href="${import.meta.env.BASE_URL}manual.html" target="_blank" rel="noopener"><i data-lucide="book-open"></i>Viewer Manual (new tab)</a>
               <label class="field-label" for="animationFileSelect">Animation file</label>
               <select id="animationFileSelect" disabled>
                 <option>No animation BIN or JSON indexed</option>
@@ -486,7 +481,6 @@ appRoot.innerHTML = `
 
 const icons = {
   ArrowLeftRight,
-  BookOpen,
   Check,
   ChevronLeft,
   ChevronRight,

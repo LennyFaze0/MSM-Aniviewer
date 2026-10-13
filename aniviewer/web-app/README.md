@@ -6,12 +6,6 @@ Pages. It accepts user-supplied raw assets and does not upload them to a server.
 
 **[Open the web viewer](https://lennyfaze0.github.io/MSM-Aniviewer/)**
 
-**[Read the viewer manual](https://lennyfaze0.github.io/MSM-Aniviewer/manual.html)**
-for importing assets, desktop/touch controls, costumes, edit links, IK, audio,
-exporting and troubleshooting. The same manual is linked from the top bar and
-Files panel. It is searchable, printable, and opens separately from an active
-editing session. Its source is `public/manual.html`.
-
 Color and costume compatibility details and regression checks are documented in
 [Web Animation Color](../docs/WEB_ANIMATION_COLOR.md) and
 [Web Costume Compatibility](../docs/WEB_COSTUME_PARITY.md).

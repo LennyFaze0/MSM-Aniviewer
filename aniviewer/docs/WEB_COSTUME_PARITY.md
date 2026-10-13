@@ -55,9 +55,3 @@ For every track, it compares layer order, parents, anchors, visibility, sprite
 remaps, opacity and mixed-pivot anchor maps. It does not compare screenshots from
 the game, every shader, or every attachment animation. It requires Python's
 standard library and the local game data; ordinary tests do not.
-
-## User Documentation
-
-The published manual is `web-app/public/manual.html`, linked from the viewer's
-top bar and Files panel. It explains supported features and the remaining desktop
-gaps, particularly session-only edits and unavailable keyframe/project saves.

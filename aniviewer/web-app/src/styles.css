@@ -1506,16 +1506,6 @@ input:focus-visible,
   height: 28px;
 }
 
-.manual-link {
-  color: var(--text);
-  text-decoration: none;
-}
-
-.manual-link:focus-visible {
-  outline: 2px solid var(--cyan);
-  outline-offset: 2px;
-}
-
 .button svg,
 .icon-button svg,
 .panel-heading svg,
