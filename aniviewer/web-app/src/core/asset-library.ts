@@ -22,6 +22,7 @@ import {
 } from './costume';
 import { dofChromaticColor, type DofChromaticColor, type DofChromaticGradient } from './dof-chromatic';
 import { costumeShaderBehavior } from './costume-shader';
+import { costumeAttachmentAlignment } from './costume-appearance';
 import { parseMuppetsAudioManifest } from './muppets-audio-manifest';
 import { decodeTextureImage } from './texture-alpha';
 import type { MonsterPortrait } from './monster-catalog';
@@ -825,7 +826,7 @@ export class AssetLibrary {
       if (imageFile.size > 512 * 1024 * 1024) {
         throw new Error(`${imageFile.name} exceeds the 512 MB browser texture limit.`);
       }
-      atlases.push({ sourceId: source.id, data: atlas, ...await decodeTextureImage(await imageFile.blob()) });
+      atlases.push({ sourceId: source.id, sourceName: xmlFile.path, data: atlas, ...await decodeTextureImage(await imageFile.blob()) });
     }
 
     this.atlasLoadReportValue = {
@@ -874,7 +875,7 @@ export class AssetLibrary {
     const atlas = parseTextureAtlas(await xmlFile.text());
     const imageFile = this.resolveImage(atlas.imagePath || clean.replace(/\.xml$/i, '.png'), xmlFile.path);
     if (!imageFile) return undefined;
-    return { sourceId, data: atlas, ...await decodeTextureImage(await imageFile.blob()) };
+    return { sourceId, sourceName: xmlFile.path, data: atlas, ...await decodeTextureImage(await imageFile.blob()) };
   }
 
   async loadCostumeAppearance(
@@ -903,6 +904,9 @@ export class AssetLibrary {
     });
     costume.definition.sheet_remaps.forEach((remap) => {
       if (remap.to) sheetNames.add(remap.to);
+    });
+    costume.definition.clone_layers?.forEach((clone) => {
+      if (/\.xml$/i.test(clone.sheet)) sheetNames.add(clone.sheet);
     });
     let sourceId = Math.max(-1, ...baseAtlases.map((atlas) => atlas.sourceId)) + 1;
     const costumeAtlases: LoadedAtlasInput[] = [];
@@ -973,7 +977,8 @@ export class AssetLibrary {
       attachments.push({
         name: animationName || targetLayer,
         targetLayer,
-        track,
+        track: { ...track, layers: track.layers.map((layer) => ({ ...layer, costume_pivot_context: true })) },
+        blendVersion: loaded.document.blend_version,
         atlases: loaded.atlases,
         timeOffset: Number.isFinite(rawOffset) ? rawOffset : 0,
         tempoMultiplier: Number.isFinite(rawTempo) ? Math.max(0.1, rawTempo) : 1,
@@ -981,8 +986,11 @@ export class AssetLibrary {
         rootLayer: String(raw.root_layer ?? raw.root_socket ?? '').trim() || undefined,
       });
     }
+    for (const attachment of attachments) {
+      attachment.alignmentMode = costumeAttachmentAlignment(attachment, costume.definition.remaps, costumeAtlases);
+    }
     return {
-      document: applyCostumeDefinition(baseDocument, costume.definition, ids),
+      document: applyCostumeDefinition(baseDocument, costume.definition, ids, costumeAtlases),
       atlases: [...costumeAtlases, ...baseAtlases],
       shaderTextures,
       attachments,

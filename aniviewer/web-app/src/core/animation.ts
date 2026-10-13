@@ -113,6 +113,14 @@ function evaluateSprite(frames: AnimationFrame[], time: number): string {
 
 export function evaluateLayer(layer: AnimationLayer, time: number): LayerState {
   const frames = layer.frames ?? [];
+  // Rev 4/5 store static recolors on the layer, while Rev 6 uses RGB keys.
+  // Active keys take precedence; inactive placeholder keys must not erase the tint.
+  const color = (channel: 'red' | 'green' | 'blue'): number => {
+    const fallback = finiteNumber(layer.rgb?.[channel], 255);
+    return Math.round(evaluateNumber(
+      frames, time, 'rgb', (frame) => finiteNumber(frame.rgb?.[channel], 255), fallback,
+    ));
+  };
   return {
     posX: evaluateNumber(frames, time, 'pos', (frame) => finiteNumber(frame.pos?.x), 0),
     posY: evaluateNumber(frames, time, 'pos', (frame) => finiteNumber(frame.pos?.y), 0),
@@ -122,9 +130,9 @@ export function evaluateLayer(layer: AnimationLayer, time: number): LayerState {
     opacity: evaluateNumber(frames, time, 'opacity', (frame) => finiteNumber(frame.opacity?.value, 100), 100),
     depth: evaluateNumber(frames, time, 'depth', (frame) => finiteNumber(frame.depth?.value), 0),
     spriteName: evaluateSprite(frames, time),
-    red: Math.round(evaluateNumber(frames, time, 'rgb', (frame) => finiteNumber(frame.rgb?.red, 255), 255)),
-    green: Math.round(evaluateNumber(frames, time, 'rgb', (frame) => finiteNumber(frame.rgb?.green, 255), 255)),
-    blue: Math.round(evaluateNumber(frames, time, 'rgb', (frame) => finiteNumber(frame.rgb?.blue, 255), 255)),
+    red: color('red'),
+    green: color('green'),
+    blue: color('blue'),
     alpha: Math.round(evaluateNumber(frames, time, 'rgb', (frame) => finiteNumber(frame.rgb?.alpha, 255), 255)),
   };
 }

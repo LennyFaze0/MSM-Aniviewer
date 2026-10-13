@@ -1,4 +1,7 @@
 import { costumeLayerColor } from './layer-color';
+import { animationBlendVersion } from './animation-blend';
+import { applyCostumeClones } from './costume-clones';
+import { applyCostumeAtlasContext, type CostumeAtlas } from './costume-appearance';
 import type { AnimationDocument, AnimationLayer } from './types';
 
 export interface CostumeRemap {
@@ -242,49 +245,42 @@ export function applyCostumeDefinition(
   base: AnimationDocument,
   costume: CostumeDefinition,
   atlasIds: number[],
+  atlases?: CostumeAtlas[],
 ): AnimationDocument {
   const document = structuredClone(base);
+  document.render_blend_version = base.render_blend_version ?? animationBlendVersion(base);
   for (const track of document.anims) {
+    const clones = applyCostumeClones(track, costume);
     const lookup = layerLookup(track.layers);
-    for (const clone of costume.clone_layers ?? []) {
-      const source = lookup.get(clone.source_layer.toLowerCase());
-      if (!source) continue;
-      const copy = structuredClone(source);
-      copy.name = clone.new_layer || clone.name;
-      copy.id = Math.max(-1, ...track.layers.map((layer) => layer.id)) + 1;
-      const referenceIndex = track.layers.findIndex(
-        (layer) => layer.name.toLowerCase() === clone.reference_layer.toLowerCase(),
-      );
-      const insertAt = referenceIndex < 0
-        ? track.layers.length
-        : referenceIndex + (clone.insert_mode > 0 ? 0 : 1);
-      track.layers.splice(insertAt, 0, copy);
-      lookup.set(copy.name.toLowerCase(), copy);
-    }
 
-    for (const remap of costume.remaps ?? []) {
-      const layer = matchingLayer(lookup, remap.display_name);
-      if (!layer) continue;
-      const exact = new Map(remap.frame_mappings.map((mapping) => [mapping.from, mapping.to]));
-      const folded = new Map(remap.frame_mappings.map((mapping) => [mapping.from.toLowerCase(), mapping.to]));
+    for (const layer of track.layers) {
+      const remap = clones.remaps.get(layer.id);
+      if (!remap) continue;
+      const exact = new Map((remap.frame_mappings ?? []).map((mapping) => [mapping.from, mapping.to]));
+      const folded = new Map((remap.frame_mappings ?? []).map((mapping) => [mapping.from.toLowerCase(), mapping.to]));
       const hasExistingColor = Boolean(layer.color_tint || layer.color_gradient || layer.color_animator);
       for (const frame of layer.frames) {
         const sprite = frame.sprite?.string ?? '';
         const replacement = exact.get(sprite) ?? folded.get(sprite.toLowerCase()) ?? remap.resource;
-        if (!replacement || replacement === sprite) continue;
+        if (!replacement) continue;
         if (frame.sprite) frame.sprite.string = replacement;
         else frame.sprite = { immediate: -1, string: replacement };
         if (!hasExistingColor) {
+          // Replacement artwork is already colored, including on static-tint BIN revisions.
+          layer.rgb = { red: 255, green: 255, blue: 255 };
           frame.rgb = {
             ...frame.rgb,
-            immediate: frame.rgb?.immediate ?? 0,
+            immediate: Math.max(0, frame.rgb?.immediate ?? 0),
             red: 255,
             green: 255,
             blue: 255,
           };
         }
+        if (clones.opaque.has(layer.id)) frame.opacity = { immediate: Math.max(0, frame.opacity?.immediate ?? 0), value: 100 };
       }
-      if (atlasIds.length) layer.atlas_override_ids = [...atlasIds];
+      if (atlases) applyCostumeAtlasContext(layer, remap, atlases, costume.sheet_remaps ?? []);
+      else if (atlasIds.length) layer.atlas_override_ids = [...atlasIds];
+      if (remap.sheet.toLowerCase().includes('costume') && (clones.opaque.has(layer.id) || clones.overlay.has(layer.id))) layer.blend = 0;
     }
 
     for (const override of costume.set_blend_layers ?? []) {

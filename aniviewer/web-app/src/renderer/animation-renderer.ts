@@ -17,10 +17,13 @@ import {
   costumeShaderBehavior,
   costumeShaderColor,
   costumeShaderFrame,
+  costumeShaderUV,
   type CostumeShaderBehavior,
 } from '../core/costume-shader';
 import { resolveLayerColor } from '../core/layer-color';
+import { animationBlendVersion, layerAnimationBlend } from '../core/animation-blend';
 import { spriteMeshAnchor } from '../core/sprite-geometry';
+import { costumeAlignmentPoint, costumeDrawOffset } from '../core/costume-appearance';
 import { applyWorldLayerEdits, layerAnchor, pointHitsQuad, type LayerTransformEdit, type ViewPoint } from '../core/layer-transform';
 import { applyTransformOperations, cloneOperations, type TransformOperation } from '../core/edit-constraints';
 import { applyIKRigs, cloneIKRigs, jointOffset, jointWorld, type IKRig, type IKPose } from '../core/ik-constraints';
@@ -52,6 +55,7 @@ interface RuntimeAtlas {
 interface ResolvedSpriteTexture {
   sprite: AtlasSprite;
   texture: Texture;
+  atlas: TextureAtlasData;
 }
 
 interface RuntimeShaderTexture {
@@ -319,6 +323,7 @@ export class AnimationRenderer {
   private readonly particlePrefabs = new Map<string, RuntimeParticlePrefab>();
   private particleSprites: Sprite[] = [];
   private document?: AnimationDocument;
+  private blendVersion = 1;
   private track?: AnimationTrack;
   private currentTime = 0;
   private duration = 0;
@@ -398,6 +403,7 @@ export class AnimationRenderer {
   ): void {
     this.destroySceneAssets();
     this.document = document;
+    this.blendVersion = document.render_blend_version ?? animationBlendVersion(document);
     runtimeAtlases(atlasInputs, this.spriteScaleMode).forEach((atlas, sourceId) => this.atlases.set(sourceId, atlas));
     for (const input of shaderInputs) {
       const behavior = costumeShaderBehavior(input.shaderName);
@@ -472,10 +478,10 @@ export class AnimationRenderer {
     for (const layer of next.layers) {
       const sprite = new Sprite(Texture.EMPTY);
       sprite.label = layer.name;
-      sprite.blendMode = blendMode(layer.blend);
+      sprite.blendMode = blendMode(layerAnimationBlend(layer, this.blendVersion));
       this.scene.addChild(sprite);
       this.layerSprites.set(layer.id, sprite);
-      this.visibleLayers.set(layer.id, true);
+      this.visibleLayers.set(layer.id, layer.visible !== false);
     }
     const layerByName = new Map(next.layers.map((layer) => [normalizedLayerName(layer.name), layer]));
     this.attachments.forEach((attachment) => {
@@ -484,7 +490,7 @@ export class AnimationRenderer {
       for (const layer of attachment.input.track.layers) {
         const sprite = new Sprite(Texture.EMPTY);
         sprite.label = `${attachment.input.name}: ${layer.name}`;
-        sprite.blendMode = blendMode(layer.blend);
+        sprite.blendMode = blendMode(layerAnimationBlend(layer, attachment.input.blendVersion ?? this.blendVersion));
         this.scene.addChild(sprite);
         attachment.sprites.set(layer.id, sprite);
       }
@@ -833,13 +839,30 @@ export class AnimationRenderer {
       if (visited.has(atlas.sourceId)) continue;
       visited.add(atlas.sourceId);
       const sprite = atlas.data.sprites.get(key);
-      if (sprite) return { sprite, texture: textureForSprite(atlas, sprite) };
+      if (sprite) return { sprite, atlas: atlas.data, texture: textureForSprite(atlas, sprite) };
     }
     return undefined;
   }
 
   private findTexture(layer: AnimationLayer, spriteName: string): ResolvedSpriteTexture | undefined {
     return this.findTextureIn(this.atlases, layer, spriteName);
+  }
+
+  private setSpriteAnchor(sprite: Sprite, layer: AnimationLayer, resolved: ResolvedSpriteTexture): void {
+    const mesh = spriteMeshAnchor(resolved.sprite);
+    const offset = costumeDrawOffset(layer, resolved.sprite, resolved.atlas);
+    sprite.anchor.set(
+      mesh[0] - offset[0] / Math.max(1e-6, sprite.texture.orig.width),
+      mesh[1] - offset[1] / Math.max(1e-6, sprite.texture.orig.height),
+    );
+  }
+
+  private attachmentAlignmentPoint(
+    layer: AnimationLayer, state: WorldState, atlases: Map<number, RuntimeAtlas>,
+    mode: CostumeAttachmentInput['alignmentMode'],
+  ): [number, number] {
+    const resolved = this.findTextureIn(atlases, layer, state.spriteName || layer.name);
+    return costumeAlignmentPoint(layer, state, resolved?.sprite, resolved?.atlas, mode);
   }
 
   private shaderTexture(
@@ -854,33 +877,27 @@ export class AnimationRenderer {
     const slot = Math.max(0, Math.min(frameCount - 1, Math.round(costumeShaderFrame(runtime.behavior, this.currentTime))));
     const baseFrame = baseTexture.frame;
     const cacheKey = [
-      spriteName.toLowerCase(), slot,
+      spriteName.toLowerCase(), slot, baseTexture.uid,
       baseFrame.x, baseFrame.y, baseFrame.width, baseFrame.height,
     ].join('|');
     const cached = runtime.textures.get(cacheKey);
     if (cached) return cached;
 
-    let frame: Rectangle;
-    if (frameCount > 1) {
-      frame = runtime.behavior.frameAxis === 'v'
-        ? new Rectangle(0, slot * runtime.height / frameCount, runtime.width, runtime.height / frameCount)
-        : new Rectangle(slot * runtime.width / frameCount, 0, runtime.width / frameCount, runtime.height);
-    } else {
-      const baseWidth = Math.max(1, baseTexture.source.width);
-      const baseHeight = Math.max(1, baseTexture.source.height);
-      frame = new Rectangle(
-        baseFrame.x / baseWidth * runtime.width,
-        baseFrame.y / baseHeight * runtime.height,
-        baseFrame.width / baseWidth * runtime.width,
-        baseFrame.height / baseHeight * runtime.height,
-      );
-    }
     const texture = new Texture({
       source: runtime.source,
-      frame,
+      frame: new Rectangle(0, 0, runtime.width, runtime.height),
       orig: baseTexture.orig.clone(),
       trim: baseTexture.trim?.clone(),
     });
+    // Preserve the packed sprite's corner ordering, including rotated frames.
+    // Per-corner clamping also handles UVs at the edge without stretching its geometry.
+    for (const index of [0, 1, 2, 3] as const) {
+      const x = `x${index}` as const, y = `y${index}` as const;
+      const uv = costumeShaderUV(runtime.behavior, slot, [baseTexture.uvs[x], baseTexture.uvs[y]],
+        baseFrame, [baseTexture.source.width, baseTexture.source.height], Boolean(baseTexture.rotate));
+      texture.uvs[x] = uv[0];
+      texture.uvs[y] = uv[1];
+    }
     runtime.textures.set(cacheKey, texture);
     return texture;
   }
@@ -931,7 +948,7 @@ export class AnimationRenderer {
       const resolved = requestedSprite ? this.findTexture(layer, requestedSprite) : undefined;
       if (resolved) {
         sprite.texture = this.shaderTexture(layer, requestedSprite, resolved.texture) ?? resolved.texture;
-        sprite.anchor.set(...spriteMeshAnchor(resolved.sprite));
+        this.setSpriteAnchor(sprite, layer, resolved);
       }
       sprite.renderable = Boolean(resolved);
       sprite.visible = this.layerVisible(layer.id);
@@ -994,7 +1011,9 @@ export class AnimationRenderer {
       ?? roots[0]
       ?? attachment.input.track.layers[0];
     const state = layer ? states.get(layer.id) : undefined;
-    return layer && state ? { layer, anchor: this.layerAnchor(layer, state) } : undefined;
+    return layer && state ? { layer, anchor: this.attachmentAlignmentPoint(
+      layer, state, attachment.atlases, attachment.input.alignmentMode,
+    ) } : undefined;
   }
 
   private renderAttachment(
@@ -1013,7 +1032,7 @@ export class AnimationRenderer {
     const states = calculateWorldStates(attachment.input.track, localTime);
     const root = this.attachmentRoot(attachment, states);
     if (!root) return [];
-    const targetAnchor = this.layerAnchor(targetLayer, targetState);
+    const targetAnchor = this.attachmentAlignmentPoint(targetLayer, targetState, this.atlases, attachment.input.alignmentMode);
     const renderLayers = animationRenderOrder(attachment.input.track, states, attachment.usesDepth);
     const rendered: Array<{ layerId: number; sprite: Sprite }> = [];
     for (const layer of renderLayers) {
@@ -1026,7 +1045,7 @@ export class AnimationRenderer {
         : undefined;
       if (resolved) {
         sprite.texture = resolved.texture;
-        sprite.anchor.set(...spriteMeshAnchor(resolved.sprite));
+        this.setSpriteAnchor(sprite, layer, resolved);
       }
       const m00 = targetState.m00 * state.m00 + targetState.m01 * state.m10;
       const m01 = targetState.m00 * state.m01 + targetState.m01 * state.m11;
@@ -1038,7 +1057,7 @@ export class AnimationRenderer {
       const ty = targetState.m10 * childX + targetState.m11 * childY + targetAnchor[1];
       const color = resolveLayerColor(layer, localTime, attachment.duration);
       sprite.renderable = Boolean(resolved);
-      sprite.visible = Boolean(resolved);
+      sprite.visible = Boolean(resolved) && layer.visible !== false;
       sprite.alpha = Math.max(0, Math.min(1, (state.opacity / 100) * (state.alpha / 255) * color[3]));
       sprite.tint =
         (Math.round(Math.max(0, Math.min(255, state.red * color[0]))) << 16) |

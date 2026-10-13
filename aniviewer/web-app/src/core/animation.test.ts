@@ -22,6 +22,25 @@ function layer(overrides: Partial<AnimationLayer> = {}): AnimationLayer {
 }
 
 describe('animation evaluation', () => {
+  it('uses static Rev 4/5 recolors when RGB keys are absent or inactive', () => {
+    const subject = layer({ rgb: { red: 246, green: 253, blue: 41 } });
+    expect(evaluateLayer(subject, 0)).toMatchObject({ red: 246, green: 253, blue: 41, alpha: 255 });
+    subject.frames = [{ time: 0, rgb: { immediate: -1, red: 255, green: 255, blue: 255 } }];
+    expect(evaluateLayer(subject, 1)).toMatchObject({ red: 246, green: 253, blue: 41 });
+  });
+
+  it('lets animated RGB replace, rather than multiply, a static recolor', () => {
+    const subject = layer({
+      rgb: { red: 246, green: 253, blue: 41 },
+      frames: [
+        { time: 0, rgb: { immediate: 0, red: 100, green: 200, blue: 20 } },
+        { time: 2, rgb: { immediate: 1, red: 200, green: 100, blue: 80 } },
+      ],
+    });
+    expect(evaluateLayer(subject, 1)).toMatchObject({ red: 150, green: 150, blue: 50 });
+    expect(evaluateLayer(layer(), 0)).toMatchObject({ red: 255, green: 255, blue: 255 });
+  });
+
   it('interpolates linear channels and preserves stepped channels', () => {
     const subject = layer({
       frames: [
@@ -97,6 +116,7 @@ describe('animation evaluation', () => {
           time: 0,
           pos: { immediate: 0, x: 10, y: 20 },
           opacity: { immediate: 1, value: 0 },
+          rgb: { immediate: 1, red: 20, green: 40, blue: 80 },
         },
       ],
     });
@@ -124,6 +144,7 @@ describe('animation evaluation', () => {
     expect(state?.tx).toBe(15);
     expect(state?.ty).toBe(26);
     expect(state?.opacity).toBe(100);
+    expect(state).toMatchObject({ red: 255, green: 255, blue: 255 });
   });
 
   it('derives duration from the latest frame across all layers', () => {

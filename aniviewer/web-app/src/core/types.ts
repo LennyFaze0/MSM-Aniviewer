@@ -74,6 +74,10 @@ export interface AnimationLayer {
   rgb?: Omit<InterpolatedColor, 'immediate' | 'alpha'>;
   sprite_anchor_map?: Record<string, [number, number]> | null;
   atlas_override_ids?: number[];
+  visible?: boolean;
+  costume_pivot_context?: boolean;
+  // Draw-only anchors: unlike sprite_anchor_map, these must never move child transforms.
+  costume_sprite_anchors?: Record<string, [number, number]>;
   shader_name?: string;
   color_tint?: ColorTuple;
   color_tint_hdr?: ColorTuple;
@@ -190,6 +194,8 @@ export interface DofParticlePrefabInput {
 export interface AnimationDocument {
   rev: number;
   blend_version?: number;
+  /** Preserve the base document's interpretation while applying costume overrides. */
+  render_blend_version?: number;
   source_format?: string;
   source_revision?: number;
   legacy_format?: boolean;
@@ -245,6 +251,7 @@ export interface AtlasSprite {
 
 export interface TextureAtlasData {
   imagePath: string;
+  pivotMode?: string;
   width: number;
   height: number;
   hires: boolean;
@@ -263,6 +270,7 @@ export interface DecodedTextureImage {
 
 export interface LoadedAtlasInput extends DecodedTextureImage {
   sourceId: number;
+  sourceName?: string;
   data: TextureAtlasData;
 }
 
@@ -274,9 +282,11 @@ export interface CostumeAttachmentInput {
   name: string;
   targetLayer: string;
   track: AnimationTrack;
+  blendVersion?: number;
   atlases: LoadedAtlasInput[];
   timeOffset: number;
   tempoMultiplier: number;
   loop: boolean;
   rootLayer?: string;
+  alignmentMode?: 'rendered_anchor' | 'costume_canvas';
 }

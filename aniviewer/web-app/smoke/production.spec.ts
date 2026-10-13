@@ -4,6 +4,7 @@ import { nativeRev6Fixture } from '../tests/native-fixture';
 
 // Reuse real-sample audio checks without dev-server-only module imports.
 import '../tests/buffered-audio-playback.spec';
+import '../tests/manual.spec';
 
 test('home-screen metadata uses valid iOS and Android viewer icons under the deployed base', async ({ page, request }) => {
   await page.goto('.');

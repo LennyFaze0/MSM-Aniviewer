@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'vitest';
 import type { AnimationDocument } from './types';
 import { applyCostumeDefinition, type CostumeDefinition } from './costume';
+import { evaluateLayer } from './animation';
 
 function baseDocument(): AnimationDocument {
   return {
@@ -54,6 +55,30 @@ function costume(): CostumeDefinition {
 }
 
 describe('costume application', () => {
+  test('does not tint replacement costume art with a Rev 4/5 layer recolor', () => {
+    const base = baseDocument();
+    const head = base.anims[0]!.layers[0]!;
+    head.rgb = { red: 100, green: 200, blue: 50 };
+    head.frames[0]!.rgb = { immediate: -1, red: 255, green: 255, blue: 255 };
+    const result = applyCostumeDefinition(base, costume(), [4]);
+    expect(evaluateLayer(result.anims[0]!.layers[0]!, 0))
+      .toMatchObject({ red: 255, green: 255, blue: 255 });
+    expect(evaluateLayer(result.anims[0]!.layers[1]!, 0))
+      .toMatchObject({ red: 100, green: 200, blue: 50 });
+  });
+
+  test('keeps the base blend interpretation when a costume introduces a modern ID', () => {
+    const base = baseDocument();
+    base.blend_version = 2;
+    base.anims[0]!.layers[0]!.blend = 1;
+    const appearance = costume();
+    appearance.set_blend_layers = [{ name: 'hat', blend_value: 2 }];
+    const result = applyCostumeDefinition(base, appearance, []);
+    expect(result.render_blend_version).toBe(1);
+    expect(result.anims[0]!.layers.find((entry) => entry.name === 'head')!.blend).toBe(1);
+    expect(base.render_blend_version).toBeUndefined();
+  });
+
   test('uses a remap resource for cloned layers without frame mappings', () => {
     const result = applyCostumeDefinition(baseDocument(), costume(), [4]);
     const layers = result.anims[0]!.layers;

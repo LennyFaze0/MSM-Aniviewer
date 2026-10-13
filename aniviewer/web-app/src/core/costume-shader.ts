@@ -1,3 +1,5 @@
+import desktopPresets from '../../../Resources/shaders/costume_shader_behaviors.json';
+
 export interface ColorWaveChannel {
   channel: 'r' | 'g' | 'b' | 'a';
   min: number;
@@ -87,6 +89,33 @@ export function costumeShaderFrame(behavior: CostumeShaderBehavior, time: number
     if (cycleTime < behavior.frameThresholds[index]!) return behavior.frameValues[index] ?? 0;
   }
   return behavior.frameValues[behavior.frameThresholds.length] ?? 0;
+}
+
+/** Map each packed-atlas UV exactly as the desktop overlay renderer does. */
+export function costumeShaderUV(
+  behavior: CostumeShaderBehavior,
+  frame: number,
+  uv: [number, number],
+  spriteRect: { x: number; y: number; width: number; height: number },
+  atlasSize: [number, number],
+  rotated = false,
+): [number, number] {
+  const clamp = (value: number) => Math.max(0, Math.min(1, value));
+  if (behavior.mappingMode === 'strip' && !rotated) {
+    const count = Math.max(1, ...behavior.frameValues.map((value) => Math.round(value) + 1));
+    const slot = Math.max(0, Math.min(count - 1, Math.round(frame)));
+    const x = clamp((uv[0] * atlasSize[0] - spriteRect.x) / Math.max(1, spriteRect.width));
+    const y = clamp((uv[1] * atlasSize[1] - spriteRect.y) / Math.max(1, spriteRect.height));
+    return behavior.frameAxis === 'v' ? [x, (slot + y) / count] : [(slot + x) / count, y];
+  }
+  const preset = (desktopPresets as Record<string, Record<string, unknown>>)[behavior.name] ?? {};
+  const number = (key: string, fallback: number) => Number(preset[key] ?? fallback);
+  const divisor = number('uv_divisor', 1) || 1;
+  let u = (uv[0] * number('sheet_width', 1) - number('sheet_offset_x', 0)) / divisor;
+  let v = (uv[1] * number('sheet_height', 1) - number('sheet_offset_y', 0)) / divisor;
+  if (behavior.frameAxis === 'v') v += frame * number('frame_width', 1);
+  else u += frame * number('frame_width', 1);
+  return [clamp(u / number('strip_width', 1)), clamp(v / number('strip_height', 1))];
 }
 
 export function costumeShaderColor(

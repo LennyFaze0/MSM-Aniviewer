@@ -4,6 +4,18 @@ import { ViewerSession } from './viewer-session';
 import { ALL_EDIT_CHANNELS, applyTransformOperations, type EditConstraint } from '../core/edit-constraints';
 import { calculateWorldStates } from '../core/animation';
 
+it('starts costume replacements hidden in both the layer panel and renderer state', () => {
+  const session = new ViewerSession();
+  const document = animationDocument();
+  document.anims[0]!.layers[1]!.visible = false;
+  session.setDocument(document);
+  expect(session.isLayerVisible(2)).toBe(false);
+  expect(session.toggleLayerVisible(2)).toBe(true);
+  session.setTrack(1);
+  session.setTrack(0);
+  expect(session.isLayerVisible(2)).toBe(false);
+});
+
 function animationDocument(): AnimationDocument {
   return {
     rev: 6,

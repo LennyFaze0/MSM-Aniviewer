@@ -400,6 +400,9 @@ export class ViewerSession {
     this.isPlaying = false;
     this.selectedLayers.clear();
     this.hiddenLayers.clear();
+    for (const layer of this.track?.layers ?? []) {
+      if (layer.visible === false) this.hiddenLayers.add(layer.id);
+    }
     this.edits.clear();
   }
 

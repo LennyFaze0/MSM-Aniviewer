@@ -1,7 +1,9 @@
 import type { AtlasSprite, TextureAtlasData } from './types';
 
 function numericAttribute(element: Element, name: string, fallback = 0): number {
-  const value = Number(element.getAttribute(name));
+  const raw = element.getAttribute(name);
+  if (raw === null || raw.trim() === '') return fallback;
+  const value = Number(raw);
   return Number.isFinite(value) ? value : fallback;
 }
 
@@ -63,6 +65,7 @@ export function parseTextureAtlas(xml: string): TextureAtlasData {
 
   return {
     imagePath: root.getAttribute('imagePath') ?? root.getAttribute('imagepath') ?? '',
+    pivotMode: (root.getAttribute('pivotMode') || root.getAttribute('pivot_mode') || '').trim().toLowerCase() || undefined,
     width: numericAttribute(root, 'width'),
     height: numericAttribute(root, 'height'),
     hires: booleanAttribute(root, 'hires'),
