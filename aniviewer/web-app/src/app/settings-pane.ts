@@ -7,7 +7,7 @@ import {
   type ViewerSettings,
 } from './viewer-settings';
 
-type SettingsTab = 'export' | 'tools' | 'paths' | 'keybinds' | 'application';
+type SettingsTab = 'export' | 'paths' | 'keybinds' | 'application';
 
 export interface SettingsPaneOptions {
   trigger: HTMLButtonElement;
@@ -24,30 +24,24 @@ interface KeybindDefinition {
   label: string;
   group: string;
   description: string;
-  available: boolean;
 }
 
 const KEYBINDS: readonly KeybindDefinition[] = [
-  { key: 'toggle_playback', label: 'Play / Pause', group: 'Playback', description: 'Toggle animation playback.', available: true },
-  { key: 'toggle_loop', label: 'Toggle Loop', group: 'Playback', description: 'Toggle looping on the current animation.', available: true },
-  { key: 'record_pose', label: 'Record Pose', group: 'Keyframes', description: 'Record the current pose to the active keyframe lane.', available: false },
-  { key: 'undo', label: 'Undo', group: 'Edit', description: 'Undo the most recent transform action.', available: true },
-  { key: 'redo', label: 'Redo', group: 'Edit', description: 'Redo the most recently undone transform.', available: true },
-  { key: 'redo_alt', label: 'Redo (Alt)', group: 'Edit', description: 'Alternative redo shortcut.', available: true },
-  { key: 'copy_keyframes', label: 'Copy Keyframes', group: 'Edit', description: 'Copy selected keyframes.', available: false },
-  { key: 'paste_keyframes', label: 'Paste Keyframes', group: 'Edit', description: 'Paste copied keyframes.', available: false },
-  { key: 'move_tool', label: 'Move Tool', group: 'Tools', description: 'Activate sprite dragging.', available: true },
-  { key: 'select_tool', label: 'Select Tool', group: 'Tools', description: 'Select without moving sprites.', available: true },
-  { key: 'pan_tool', label: 'Pan Tool', group: 'Tools', description: 'Drag the camera without editing sprites.', available: true },
-  { key: 'free_transform', label: 'Free Transform', group: 'Tools', description: 'Activate the scale and rotation gizmos.', available: false },
-  { key: 'toggle_rotation_gizmo', label: 'Rotation Tool', group: 'Tools', description: 'Activate rotation controls.', available: true },
-  { key: 'toggle_scale_gizmo', label: 'Scale Tool', group: 'Tools', description: 'Activate scaling controls.', available: true },
-  { key: 'fullscreen', label: 'Fullscreen', group: 'View', description: 'Toggle browser fullscreen mode.', available: true },
-  { key: 'toggle_controls_panel', label: 'Toggle Controls Panel', group: 'Panels', description: 'Show or hide the controls panel.', available: true },
-  { key: 'toggle_layers_panel', label: 'Toggle Layer Panel', group: 'Panels', description: 'Show or hide the layer list.', available: true },
-  { key: 'toggle_timeline_panel', label: 'Toggle Timeline', group: 'Panels', description: 'Show or hide the timeline panel.', available: true },
-  { key: 'toggle_log_panel', label: 'Toggle Log', group: 'Panels', description: 'Show or hide the log panel.', available: false },
-  { key: 'toggle_focus_mode', label: 'Toggle Focus Mode', group: 'Panels', description: 'Hide or restore both side panels.', available: true },
+  { key: 'toggle_playback', label: 'Play / Pause', group: 'Playback', description: 'Toggle animation playback.' },
+  { key: 'toggle_loop', label: 'Toggle Loop', group: 'Playback', description: 'Toggle looping on the current animation.' },
+  { key: 'undo', label: 'Undo', group: 'Edit', description: 'Undo the most recent transform action.' },
+  { key: 'redo', label: 'Redo', group: 'Edit', description: 'Redo the most recently undone transform.' },
+  { key: 'redo_alt', label: 'Redo (Alt)', group: 'Edit', description: 'Alternative redo shortcut.' },
+  { key: 'move_tool', label: 'Move Tool', group: 'Tools', description: 'Activate sprite dragging.' },
+  { key: 'select_tool', label: 'Select Tool', group: 'Tools', description: 'Select without moving sprites.' },
+  { key: 'pan_tool', label: 'Pan Tool', group: 'Tools', description: 'Drag the camera without editing sprites.' },
+  { key: 'toggle_rotation_gizmo', label: 'Rotation Tool', group: 'Tools', description: 'Activate rotation controls.' },
+  { key: 'toggle_scale_gizmo', label: 'Scale Tool', group: 'Tools', description: 'Activate scaling controls.' },
+  { key: 'fullscreen', label: 'Fullscreen', group: 'View', description: 'Toggle browser fullscreen mode.' },
+  { key: 'toggle_controls_panel', label: 'Toggle Controls Panel', group: 'Panels', description: 'Show or hide the controls panel.' },
+  { key: 'toggle_layers_panel', label: 'Toggle Layer Panel', group: 'Panels', description: 'Show or hide the layer list.' },
+  { key: 'toggle_timeline_panel', label: 'Toggle Timeline', group: 'Panels', description: 'Show or hide the timeline panel.' },
+  { key: 'toggle_focus_mode', label: 'Toggle Focus Mode', group: 'Panels', description: 'Hide or restore both side panels.' },
 ];
 
 const escapeHtml = (value: unknown): string => String(value)
@@ -78,21 +72,20 @@ function options(values: readonly (readonly [string, string | number])[], select
   )).join('');
 }
 
-function availability(kind: 'active' | 'partial' | 'future', label?: string): string {
-  const text = label ?? (kind === 'active' ? 'Web active' : kind === 'partial' ? 'Browser mapped' : 'Port pending');
-  return `<span class="settings-availability ${kind}">${escapeHtml(text)}</span>`;
+function availability(): string {
+  return '<span class="settings-availability active">Web active</span>';
 }
 
-function field(label: string, control: string, hint = '', state: 'active' | 'partial' | 'future' = 'active'): string {
+function field(label: string, control: string, hint = ''): string {
   return `
     <label class="settings-field">
       <span class="settings-field-copy"><strong>${escapeHtml(label)}</strong>${hint ? `<small>${escapeHtml(hint)}</small>` : ''}</span>
-      <span class="settings-field-control">${control}${availability(state)}</span>
+      <span class="settings-field-control">${control}${availability()}</span>
     </label>`;
 }
 
-function checkbox(settings: ViewerSettings, path: string, label: string, hint = '', disabled = false, state: 'active' | 'partial' | 'future' = 'active'): string {
-  return field(label, `<input type="checkbox" data-setting="${path}" ${valueAt(settings, path) ? 'checked' : ''} ${disabled ? 'disabled' : ''} />`, hint, state);
+function checkbox(settings: ViewerSettings, path: string, label: string, hint = '', disabled = false): string {
+  return field(label, `<input type="checkbox" data-setting="${path}" ${valueAt(settings, path) ? 'checked' : ''} ${disabled ? 'disabled' : ''} />`, hint);
 }
 
 function numberInput(
@@ -104,9 +97,8 @@ function numberInput(
   step: number,
   hint = '',
   disabled = false,
-  state: 'active' | 'partial' | 'future' = 'active',
 ): string {
-  return field(label, `<input type="number" data-setting="${path}" min="${minimum}" max="${maximum}" step="${step}" value="${escapeHtml(valueAt(settings, path))}" ${disabled ? 'disabled' : ''} />`, hint, state);
+  return field(label, `<input type="number" data-setting="${path}" min="${minimum}" max="${maximum}" step="${step}" value="${escapeHtml(valueAt(settings, path))}" ${disabled ? 'disabled' : ''} />`, hint);
 }
 
 function selectInput(
@@ -116,17 +108,12 @@ function selectInput(
   choices: readonly (readonly [string, string | number])[],
   hint = '',
   disabled = false,
-  state: 'active' | 'partial' | 'future' = 'active',
 ): string {
-  return field(label, `<select data-setting="${path}" ${disabled ? 'disabled' : ''}>${options(choices, valueAt(settings, path))}</select>`, hint, state);
+  return field(label, `<select data-setting="${path}" ${disabled ? 'disabled' : ''}>${options(choices, valueAt(settings, path))}</select>`, hint);
 }
 
 function group(title: string, content: string, note = ''): string {
   return `<fieldset class="settings-group"><legend>${escapeHtml(title)}</legend>${note ? `<p class="settings-group-note">${escapeHtml(note)}</p>` : ''}${content}</fieldset>`;
-}
-
-function pendingFeature(title: string, message: string): string {
-  return `<article class="settings-pending"><div>${availability('future')}</div><h3>${escapeHtml(title)}</h3><p>${escapeHtml(message)}</p></article>`;
 }
 
 function colorSetting(settings: ViewerSettings, key: 'primary' | 'secondary' | 'tertiary' | 'quaternary', label: string, hint: string): string {
@@ -147,7 +134,6 @@ export class SettingsPane {
   private activeTab: SettingsTab = 'application';
   private activeSections: Record<string, string> = {
     export: 'png',
-    tools: 'animation-transfer',
     application: 'interface',
   };
   private closeTimer?: number;
@@ -224,7 +210,6 @@ export class SettingsPane {
   private render(): void {
     const tabs: readonly [SettingsTab, string][] = [
       ['export', 'Export'],
-      ['tools', 'Tools'],
       ['paths', 'Paths'],
       ['keybinds', 'Keybinds'],
       ['application', 'Application'],
@@ -236,22 +221,20 @@ export class SettingsPane {
 
   private renderContent(): void {
     if (this.activeTab === 'export') this.content.innerHTML = this.renderExport();
-    if (this.activeTab === 'tools') this.content.innerHTML = this.renderTools();
     if (this.activeTab === 'paths') this.content.innerHTML = this.renderPaths();
     if (this.activeTab === 'keybinds') this.content.innerHTML = this.renderKeybinds();
     if (this.activeTab === 'application') this.content.innerHTML = this.renderApplication();
     this.syncDependencies();
   }
 
-  private sectionTabs(owner: 'export' | 'tools' | 'application', entries: readonly (readonly [string, string])[]): string {
+  private sectionTabs(owner: 'export' | 'application', entries: readonly (readonly [string, string])[]): string {
     const active = this.activeSections[owner];
     return `<nav class="settings-section-tabs" aria-label="${owner} settings">${entries.map(([key, label]) => `<button type="button" data-settings-section-owner="${owner}" data-settings-section="${key}" class="${active === key ? 'active' : ''}">${escapeHtml(label)}</button>`).join('')}</nav>`;
   }
 
   private renderExport(): string {
     const sections = [
-      ['png', 'PNG'], ['video', 'Fast Video'], ['gif', 'GIF'], ['mov', 'MOV'], ['webm', 'WebM'],
-      ['mp4', 'MP4'], ['psd', 'PSD'], ['ae', 'AE Rig'], ['framing', 'Framing'],
+      ['png', 'PNG'], ['video', 'Fast Video'], ['gif', 'GIF'], ['framing', 'Framing'],
     ] as const;
     const active = this.activeSections.export;
     let body = '';
@@ -260,10 +243,8 @@ export class SettingsPane {
       selectInput(this.draft, 'export.video.mode', 'Processing', [['Auto', 'auto'], ['Fast (WebCodecs)', 'fast'], ['Compatibility (real-time)', 'compatibility']]),
       numberInput(this.draft, 'export.video.bitrateMbps', 'Bitrate (Mbps)', 1, 100, 1),
       checkbox(this.draft, 'export.video.includeAudio', 'Include matched audio', 'Independent of playback mute. Idle tracks without matched audio remain silent.'),
-    ].join(''), 'Fast mode uses WebCodecs in a worker (HTTPS/localhost). Compatibility uses the real-time browser recorder, including on HTTP where supported; keep the tab visible. Both use PNG frame rate, framing, scale, and background settings. Opaque video only. The separate desktop presets below are not used by this browser path.');
+    ].join(''), 'Fast mode uses WebCodecs in a worker (HTTPS/localhost). Compatibility uses the real-time browser recorder, including on HTTP where supported; keep the tab visible. Both use PNG frame rate, framing, scale, and background settings. Opaque video only.');
     if (active === 'png') body = group('PNG and PNG Sequence', [
-      numberInput(this.draft, 'export.png.compression', 'Compression', 0, 9, 1, 'Canvas PNG compression is selected by the browser.', true, 'partial'),
-      checkbox(this.draft, 'export.png.fullResolution', 'Full-resolution output', 'Use the source canvas resolution rather than the current viewport size.'),
       numberInput(this.draft, 'export.png.scaleMultiplier', 'Full-resolution multiplier', 1, 8, 1, 'Scales exported pixels from 1x through 8x.'),
       numberInput(this.draft, 'export.png.sequenceFps', 'Sequence frame rate', 1, 120, 1),
       selectInput(this.draft, 'export.png.framing', 'Framing', [['Animation canvas', 'animation'], ['Stable content bounds', 'content']]),
@@ -273,72 +254,12 @@ export class SettingsPane {
     if (active === 'gif') body = group('Animated GIF', [
       numberInput(this.draft, 'export.gif.fps', 'Frame rate', 1, 50, 1, 'GIF delay precision is 10 ms. Browser playback caps this path at 50 fps.'),
       selectInput(this.draft, 'export.gif.colors', 'Palette colors', [['16', 16], ['32', 32], ['64', 64], ['128', 128], ['256', 256]]),
-      numberInput(this.draft, 'export.gif.scale', 'Output scale (%)', 10, 200, 1, '', false, 'future'),
-      checkbox(this.draft, 'export.gif.dither', 'Dither colors', '', false, 'future'),
-      checkbox(this.draft, 'export.gif.optimize', 'Optimize frames', '', false, 'future'),
       numberInput(this.draft, 'export.gif.loop', 'Loop count', 0, 100, 1, '0 means infinite.'),
-    ].join(''), 'Worker-based GIF export is active. It uses the shared frame framing/resolution/background controls. Dithering and frame optimization remain future options. GIF has no audio and only 1-bit transparency.');
-    if (active === 'mov') body = group('QuickTime MOV', [
-      selectInput(this.draft, 'export.mov.codec', 'Codec', [['Apple ProRes', 'prores_ks'], ['PNG', 'png'], ['Animation / QTRLE', 'qtrle'], ['H.264', 'libx264'], ['NVIDIA H.264', 'h264_nvenc'], ['NVIDIA HEVC', 'hevc_nvenc']], '', false, 'future'),
-      selectInput(this.draft, 'export.mov.quality', 'Quality', [['Low', 'low'], ['Medium', 'medium'], ['High', 'high'], ['Lossless', 'lossless']], '', false, 'future'),
-      checkbox(this.draft, 'export.mov.includeAudio', 'Embed audio', '', false, 'future'),
-      checkbox(this.draft, 'export.mov.fullResolution', 'Full-resolution output', '', false, 'future'),
-      numberInput(this.draft, 'export.mov.scaleMultiplier', 'Resolution multiplier', 1, 8, 1, '', false, 'future'),
-    ].join(''), 'Opaque H.264 MOV is available through Fast Video settings. These desktop presets, including ProRes and alpha codecs, are not connected yet.');
-    if (active === 'webm') body = group('WebM', [
-      selectInput(this.draft, 'export.webm.codec', 'Codec', [['VP9', 'libvpx-vp9'], ['AV1', 'libaom-av1'], ['VP8', 'libvpx']], '', false, 'future'),
-      numberInput(this.draft, 'export.webm.crf', 'Constant quality (CRF)', 0, 63, 1, '', false, 'future'),
-      numberInput(this.draft, 'export.webm.speed', 'Encoder speed', 0, 8, 1, '', false, 'future'),
-      checkbox(this.draft, 'export.webm.includeAudio', 'Embed audio', '', false, 'future'),
-      checkbox(this.draft, 'export.webm.fullResolution', 'Full-resolution output', '', false, 'future'),
-      numberInput(this.draft, 'export.webm.scaleMultiplier', 'Resolution multiplier', 1, 8, 1, '', false, 'future'),
-    ].join(''), 'This preset will feed WebCodecs where the browser supports it.');
-    if (active === 'mp4') body = group('MP4', [
-      selectInput(this.draft, 'export.mp4.codec', 'Codec', [['H.264', 'libx264'], ['HEVC', 'libx265'], ['NVIDIA H.264', 'h264_nvenc'], ['NVIDIA HEVC', 'hevc_nvenc']], '', false, 'future'),
-      numberInput(this.draft, 'export.mp4.crf', 'Constant quality (CRF)', 0, 51, 1, '', false, 'future'),
-      selectInput(this.draft, 'export.mp4.preset', 'Preset', ['ultrafast', 'superfast', 'veryfast', 'faster', 'fast', 'medium', 'slow', 'slower', 'veryslow'].map((value) => [value, value] as const), '', false, 'future'),
-      numberInput(this.draft, 'export.mp4.bitrateKbps', 'Bitrate (kbps)', 0, 200000, 100, '0 selects automatic bitrate.', false, 'future'),
-      checkbox(this.draft, 'export.mp4.includeAudio', 'Embed audio', '', false, 'future'),
-      selectInput(this.draft, 'export.mp4.pixelFormat', 'Pixel format', [['YUV 4:2:0', 'yuv420p'], ['YUV 4:4:4', 'yuv444p']], '', false, 'future'),
-      checkbox(this.draft, 'export.mp4.faststart', 'Web fast-start metadata', '', false, 'future'),
-      checkbox(this.draft, 'export.mp4.fullResolution', 'Full-resolution output', '', false, 'future'),
-      numberInput(this.draft, 'export.mp4.scaleMultiplier', 'Resolution multiplier', 1, 8, 1, '', false, 'future'),
-    ].join(''), 'Desktop codec names are retained as migration-friendly presets; the browser encoder will map supported codecs later.');
-    if (active === 'psd') body = group('Layered Photoshop', [
-      checkbox(this.draft, 'export.psd.includeHidden', 'Include hidden layers', '', false, 'future'),
-      checkbox(this.draft, 'export.psd.preserveResolution', 'Preserve full resolution', '', false, 'future'),
-      numberInput(this.draft, 'export.psd.fullResolutionMultiplier', 'Resolution multiplier', 1, 8, 1, '', false, 'future'),
-      numberInput(this.draft, 'export.psd.scale', 'Output scale (%)', 25, 400, 1, '', false, 'future'),
-      selectInput(this.draft, 'export.psd.quality', 'Resampling quality', [['Fast', 'fast'], ['Balanced', 'balanced'], ['High', 'high'], ['Maximum', 'maximum']], '', false, 'future'),
-      selectInput(this.draft, 'export.psd.compression', 'Layer compression', [['Raw', 'raw'], ['RLE', 'rle']], '', false, 'future'),
-      checkbox(this.draft, 'export.psd.cropCanvas', 'Crop canvas to content', '', false, 'future'),
-      checkbox(this.draft, 'export.psd.matchViewport', 'Match viewer zoom and pan', '', false, 'future'),
-    ].join(''), 'Layered PSD writing is not yet available in the browser build.');
-    if (active === 'ae') body = group('After Effects Rig', [
-      selectInput(this.draft, 'export.afterEffects.rigMode', 'Rig mode', [['Automatic', 'auto'], ['Layered', 'layered'], ['Mesh', 'mesh'], ['Composite', 'composite']], '', false, 'future'),
-      checkbox(this.draft, 'export.afterEffects.preserveResolution', 'Preserve full resolution', '', false, 'future'),
-      numberInput(this.draft, 'export.afterEffects.fullResolutionMultiplier', 'Resolution multiplier', 1, 8, 1, '', false, 'future'),
-      numberInput(this.draft, 'export.afterEffects.scale', 'Output scale (%)', 25, 400, 1, '', false, 'future'),
-      selectInput(this.draft, 'export.afterEffects.quality', 'Resampling quality', [['Fast', 'fast'], ['Balanced', 'balanced'], ['High', 'high'], ['Maximum', 'maximum']], '', false, 'future'),
-      selectInput(this.draft, 'export.afterEffects.compression', 'Image compression', [['Raw', 'raw'], ['RLE', 'rle']], '', false, 'future'),
-      checkbox(this.draft, 'export.afterEffects.matchViewport', 'Match viewer zoom and pan', '', false, 'future'),
-    ].join(''), 'After Effects project and rig generation is scheduled after editing parity.');
+    ].join(''), 'Worker-based GIF export is active. It uses the shared frame framing/resolution/background controls. GIF has no audio and only 1-bit transparency.');
     if (active === 'framing') body = group('Universal Export Framing', [
-      selectInput(this.draft, 'export.framing.boundsScope', 'Bounds scope', [['Current animation', 'current'], ['All loaded animations', 'all']], 'All-loaded scope is saved but currently falls back to the active animation.', false, 'partial'),
-      checkbox(this.draft, 'export.framing.explicitResolution', 'Force explicit output resolution', 'Fits output into the exact dimensions while preserving aspect ratio.', true, 'future'),
-      numberInput(this.draft, 'export.framing.width', 'Output width', 16, 16384, 1, '', true, 'future'),
-      numberInput(this.draft, 'export.framing.height', 'Output height', 16, 16384, 1, '', true, 'future'),
-      numberInput(this.draft, 'export.framing.padding', 'Bounds padding (px)', 0, 256, 1, 'Applied to stable content bounds.', false, 'active'),
-    ].join(''), 'Stable bounds and padding are active. Exact output dimensions will arrive with the generalized export compositor.');
+      numberInput(this.draft, 'export.framing.padding', 'Bounds padding (px)', 0, 256, 1, 'Applied to stable content bounds.'),
+    ].join(''), 'Padding applies to stable content bounds for the current animation.');
     return `${this.sectionTabs('export', sections)}<div class="settings-section-body">${body}</div>`;
-  }
-
-  private renderTools(): string {
-    const sections = [['animation-transfer', 'Anim Transfer'], ['shaders', 'Shaders']] as const;
-    const body = this.activeSections.tools === 'shaders'
-      ? pendingFeature('Shader Overrides', 'Custom fragment shaders, vertex shaders, LUT textures, color scaling, blend overrides, and reusable shader presets require the web shader-authoring stage.')
-      : pendingFeature('Animation Transfer', 'Source and destination animation mapping, transform transfer, and transfer logs will return after browser editing and keyframe recording are stable.');
-    return `${this.sectionTabs('tools', sections)}<div class="settings-section-body settings-pending-grid">${body}</div>`;
   }
 
   private renderPaths(): string {
@@ -363,12 +284,12 @@ export class SettingsPane {
   private renderKeybinds(): string {
     const groups = [...new Set(KEYBINDS.map((entry) => entry.group))];
     return `<div class="settings-single-page settings-keybind-page">
-      <p class="settings-explanation">Select a shortcut field and press the desired key combination. Backspace or Delete clears it. Shortcuts for tools not yet present are shown for desktop parity but remain disabled.</p>
+      <p class="settings-explanation">Select a shortcut field and press the desired key combination. Backspace or Delete clears it.</p>
       ${groups.map((groupName) => group(groupName, KEYBINDS.filter((entry) => entry.group === groupName).map((entry) => `
         <label class="settings-keybind-row">
           <span><strong>${escapeHtml(entry.label)}</strong><small>${escapeHtml(entry.description)}</small></span>
-          <input type="text" readonly data-keybind="${entry.key}" value="${escapeHtml(this.draft.keybinds[entry.key] ?? '')}" placeholder="None" ${entry.available ? '' : 'disabled'} />
-          ${availability(entry.available ? 'active' : 'future')}
+          <input type="text" readonly data-keybind="${entry.key}" value="${escapeHtml(this.draft.keybinds[entry.key] ?? '')}" placeholder="None" />
+          ${availability()}
         </label>`).join(''))).join('')}
       <button class="button" type="button" data-settings-action="reset-keybinds">Reset Keybinds to Defaults</button>
     </div>`;
@@ -377,7 +298,7 @@ export class SettingsPane {
   private renderApplication(): string {
     const sections = [
       ['interface', 'Interface'], ['viewport', 'Viewport'], ['conversion', 'Conversion'],
-      ['playback', 'Playback'], ['system', 'System'], ['diagnostics', 'Diagnostics'],
+      ['playback', 'Playback'], ['system', 'System'],
     ] as const;
     const active = this.activeSections.application;
     let body = '';
@@ -394,41 +315,15 @@ export class SettingsPane {
     if (active === 'viewport') body = [
       group('Camera and View', [
         checkbox(this.draft, 'viewport.zoomToCursor', 'Zoom towards mouse cursor', 'When disabled, wheel zoom remains centered in the viewport.'),
-        checkbox(this.draft, 'viewport.spatial3dEnabled', 'Stereoscopic 3D support', 'The control is retained for parity but stereoscopic rendering is not ported.', true, 'future'),
-        selectInput(this.draft, 'viewport.spatial3dMode', '3D mode', [['Acer SpatialLabs', 'spatiallabs'], ['Side-by-Side', 'side_by_side'], ['Anaglyph', 'anaglyph']], '', true, 'future'),
       ].join('')),
       group('Viewport Rendering', [
-        selectInput(this.draft, 'viewport.spriteFilter', 'Sprite resampling', [
+        field('Sprite resampling', `<select data-setting="viewport.spriteFilter">${options([
           ['Nearest (Pixel)', 'nearest'], ['Bilinear (Smooth)', 'bilinear'],
-          ['Nearest Mipmap Nearest', 'nearest_mipmap_nearest'], ['Linear Mipmap Nearest', 'linear_mipmap_nearest'],
-          ['Nearest Mipmap Linear', 'nearest_mipmap_linear'], ['Trilinear (Mipmapped)', 'trilinear'],
-          ['Bicubic (Mitchell)', 'bicubic'], ['Lanczos (Approx)', 'lanczos'],
-          ['Anisotropic 2x', 'anisotropic_2x'], ['Anisotropic 4x', 'anisotropic_4x'],
-          ['Anisotropic 8x', 'anisotropic_8x'], ['Anisotropic 16x', 'anisotropic_16x'],
-        ], 'Nearest is exact; other desktop filters currently map to browser linear sampling.', false, 'partial'),
-        numberInput(this.draft, 'viewport.spriteFilterStrength', 'Filter strength', 0, 1, 0.05, 'Stored for parity; browser texture sampling currently applies at full strength.', true, 'partial'),
-        checkbox(this.draft, 'viewport.dofAlphaSmoothing', 'DOF alpha edge smoothing', 'Pending a renderer filter implementation.', true, 'future'),
-        selectInput(this.draft, 'viewport.dofAlphaSmoothingMode', 'DOF smoothing mode', [['Normal', 'normal'], ['Strong', 'strong']], '', true, 'future'),
-        numberInput(this.draft, 'viewport.dofAlphaSmoothingStrength', 'DOF edge strength', 0, 1, 0.05, '', true, 'future'),
-        selectInput(this.draft, 'viewport.dofSpriteShader', 'DOF sprite shader', [
-          ['Auto (From Animation Data)', 'auto'], ['Anim2D/Normal+Alpha', 'anim2d'],
-          ['DawnOfFire/UnlitShader', 'dawnoffire_unlit'], ['Sprites/Default', 'sprites_default'],
-          ['Unlit/Transparent', 'unlit_transparent'], ['Unlit/Transparent Masked', 'unlit_transparent_masked'],
-        ], 'The web renderer currently follows imported animation and material data.', true, 'partial'),
+        ], this.draft.viewport.spriteFilter === 'nearest' ? 'nearest' : 'bilinear')}</select>`, 'Choose crisp pixels or smooth texture sampling.'),
       ].join('')),
-      group('Post Processing', [
-        checkbox(this.draft, 'viewport.postAaEnabled', 'Post-process antialiasing', '', true, 'future'),
-        selectInput(this.draft, 'viewport.postAaMode', 'AA mode', [['FinalPass FXAA', 'fxaa'], ['SMAA Approximation', 'smaa']], '', true, 'future'),
-        checkbox(this.draft, 'viewport.motionBlurEnabled', 'Motion blur', '', true, 'future'),
-        checkbox(this.draft, 'viewport.bloomEnabled', 'Bloom', '', true, 'future'),
-        checkbox(this.draft, 'viewport.vignetteEnabled', 'Vignette', '', true, 'future'),
-        checkbox(this.draft, 'viewport.grainEnabled', 'Grain', '', true, 'future'),
-        checkbox(this.draft, 'viewport.chromaticAberrationEnabled', 'Chromatic aberration', '', true, 'future'),
-      ].join(''), 'Effects remain disabled until the web renderer has matching, testable filter behavior.'),
       group('DOF Particles', [
         checkbox(this.draft, 'viewport.particlesWorldSpace', 'Force world-space simulation', 'Keeps emitted particles in world space after spawning.'),
         numberInput(this.draft, 'viewport.particleCap', 'Viewport particle cap', 0, 1000000, 50, 'Limits active sprites without changing source animation data.'),
-        numberInput(this.draft, 'viewport.particleDistanceSensitivity', 'Distance sensitivity', 0, 100, 0.05, 'Stored for rate-over-distance emitters.', true, 'partial'),
       ].join('')),
     ].join('');
     if (active === 'conversion') body = [
@@ -440,8 +335,6 @@ export class SettingsPane {
           ['Rev 4', '4'], ['Rev 5', '5'], ['Rev 6', '6'],
         ]),
       ].join('')),
-      group('Monster Name Rosetta', checkbox(this.draft, 'conversion.automaticRosettaRefresh', 'Automatic Rosetta refresh', 'The hosted build ships its name data statically; this preference is retained for parity.', true, 'partial')),
-      `<article class="settings-omission"><strong>BIN converter intentionally omitted</strong><p>The converter is not part of this settings pane because it will receive a separate browser-native redesign.</p></article>`,
     ].join('');
     if (active === 'playback') body = [
       group('Playback Defaults', [
@@ -449,14 +342,6 @@ export class SettingsPane {
         numberInput(this.draft, 'playback.volume', 'Default audio volume', 0, 1, 0.05),
         checkbox(this.draft, 'playback.muted', 'Start audio muted'),
       ].join('')),
-      group('Playback and Metronome', [
-        checkbox(this.draft, 'playback.metronomeEnabled', 'Enable metronome when playback starts', '', true, 'future'),
-        checkbox(this.draft, 'playback.metronomeAudible', 'Enable audible metronome tick', '', true, 'future'),
-        numberInput(this.draft, 'playback.timeSignatureNumerator', 'Time signature numerator', 1, 16, 1, '', true, 'future'),
-        selectInput(this.draft, 'playback.timeSignatureDenominator', 'Time signature denominator', [['1', 1], ['2', 2], ['4', 4], ['8', 8], ['16', 16]], '', true, 'future'),
-        checkbox(this.draft, 'playback.showBeatGrid', 'Show beat grid on timeline', '', true, 'future'),
-        checkbox(this.draft, 'playback.allowBeatEditing', 'Allow dragging beat markers', '', true, 'future'),
-      ].join(''), 'The settings mirror desktop defaults; the web metronome and editable beat grid are not ported yet.'),
     ].join('');
     if (active === 'system') body = [
       group('Browser Runtime', `
@@ -466,21 +351,6 @@ export class SettingsPane {
           <div><span>Renderer</span><strong>WebGL 2 / PixiJS</strong></div>
           <div><span>Persistent preferences</span><strong>Local storage</strong></div>
         </div>`),
-      pendingFeature('FFmpeg Tools', 'Desktop FFmpeg installation does not apply to a hosted browser app. Video exports will use browser encoders and muxers instead.'),
-    ].join('');
-    if (active === 'diagnostics') body = [
-      group('Diagnostics and Logging', [
-        checkbox(this.draft, 'diagnostics.enabled', 'Enable diagnostics logging', 'Exposes runtime diagnostic metadata for browser debugging.'),
-        checkbox(this.draft, 'diagnostics.highlightProblemLayers', 'Highlight problem layers', 'Reserved for layer validation results.', true, 'partial'),
-        checkbox(this.draft, 'diagnostics.throttleLayerUpdates', 'Throttle layer status updates', '', true, 'partial'),
-        checkbox(this.draft, 'diagnostics.performanceLogging', 'Performance logging', 'Records coarse browser performance marks.', false, 'partial'),
-        numberInput(this.draft, 'diagnostics.slowSampleThresholdMs', 'Slow sample threshold (ms)', 1, 5000, 1, '', false, 'partial'),
-        numberInput(this.draft, 'diagnostics.reportIntervalSeconds', 'Report interval (seconds)', 2, 120, 1, '', false, 'partial'),
-        selectInput(this.draft, 'diagnostics.minimumSeverity', 'Minimum severity', [['Debug', 'DEBUG'], ['Info', 'INFO'], ['Warning', 'WARNING'], ['Error', 'ERROR']], '', false, 'partial'),
-        checkbox(this.draft, 'diagnostics.includeDebugPayloads', 'Include debug payloads', '', false, 'partial'),
-        numberInput(this.draft, 'diagnostics.rateLimitPerSecond', 'Maximum events per second', 10, 1000, 10, '', false, 'partial'),
-        numberInput(this.draft, 'diagnostics.maxEntries', 'Log history size', 100, 10000, 100, '', false, 'partial'),
-      ].join(''), 'Browser diagnostics are kept in memory and developer tools; automatic filesystem log export is intentionally omitted because a web page cannot silently write to a user path.'),
     ].join('');
     return `${this.sectionTabs('application', sections)}<div class="settings-section-body">${body}</div>`;
   }

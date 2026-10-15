@@ -150,8 +150,8 @@ video duration. Audio codec packet padding can add a few milliseconds to a file.
 Cancel terminates the worker and restores the viewport. Encoded files remain in
 memory until download, with a 128 MiB output budget and separate stereo/128 MiB
 decoded-audio limit. Large audio files must still be decoded before their PCM size
-can be checked. Progress reports actual file size and elapsed time. Desktop
-FFmpeg presets in Settings are reserved; use the **Fast Video** settings instead.
+can be checked. Progress reports actual file size and elapsed time. Use
+**Settings > Export > Fast Video** for browser video export preferences.
 
 Completed exports remain available in an Export Ready panel with Save File, Open
 File, and Share where supported, so mobile users can save with a fresh tap even if
@@ -198,10 +198,10 @@ See [IK setup, mathematics and limits](../docs/WEB_IK_CONSTRAINTS.md).
 The Settings button opens a desktop-style pane from the top of the workspace. Browser
 preferences are stored locally and include system/light/dark appearance, four-color
 theme overrides, UI scale, viewport texture and particle behavior, playback and PNG
-export defaults, manual or automatic BIN revision selection, diagnostics preferences,
-and available keyboard shortcuts. Desktop-only settings remain identified as port
-pending. The legacy BIN converter is intentionally excluded pending its browser-native
-redesign.
+export defaults, manual or automatic BIN revision selection, and available keyboard
+shortcuts. Only implemented controls are shown; unimplemented desktop presets and
+placeholder tabs are omitted. Playback controls remain on the timeline, with default
+loop, volume, and mute preferences under Settings > Application > Playback.
 
 Select related files together, select a parent folder, drag files into the viewport,
 or open a standard ZIP. ZIP contents are indexed first and each animation, XML, or

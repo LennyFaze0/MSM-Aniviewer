@@ -21,7 +21,6 @@ import {
   PanelRight,
   Pause,
   Play,
-  Repeat2,
   RotateCcw,
   Search,
   Settings,
@@ -138,14 +137,10 @@ appRoot.innerHTML = `
           <div class="control-tab-list" role="tablist" aria-label="Control panel sections">
             <button id="controlTab-files" class="control-tab active" type="button" role="tab" data-control-tab="files" aria-controls="controlPanel-files" aria-selected="true">Files</button>
             <button id="controlTab-animation" class="control-tab" type="button" role="tab" data-control-tab="animation" aria-controls="controlPanel-animation" aria-selected="false" tabindex="-1">Animation</button>
-            <button id="controlTab-playback" class="control-tab" type="button" role="tab" data-control-tab="playback" aria-controls="controlPanel-playback" aria-selected="false" tabindex="-1">Playback</button>
             <button id="controlTab-viewport" class="control-tab" type="button" role="tab" data-control-tab="viewport" aria-controls="controlPanel-viewport" aria-selected="false" tabindex="-1">Viewport</button>
-            <button id="controlTab-spatial3d" class="control-tab" type="button" role="tab" data-control-tab="spatial3d" aria-controls="controlPanel-spatial3d" aria-selected="false" tabindex="-1">3D</button>
             <button id="controlTab-audio" class="control-tab" type="button" role="tab" data-control-tab="audio" aria-controls="controlPanel-audio" aria-selected="false" tabindex="-1">Audio</button>
             <button id="controlTab-sprites" class="control-tab" type="button" role="tab" data-control-tab="sprites" aria-controls="controlPanel-sprites" aria-selected="false" tabindex="-1">Sprites</button>
-            <button id="controlTab-terrain" class="control-tab" type="button" role="tab" data-control-tab="terrain" aria-controls="controlPanel-terrain" aria-selected="false" tabindex="-1">Terrain</button>
             <button id="controlTab-export" class="control-tab" type="button" role="tab" data-control-tab="export" aria-controls="controlPanel-export" aria-selected="false" tabindex="-1">Export</button>
-            <button id="controlTab-rigging" class="control-tab" type="button" role="tab" data-control-tab="rigging" aria-controls="controlPanel-rigging" aria-selected="false" tabindex="-1">Rigging</button>
             <button id="controlTab-system" class="control-tab" type="button" role="tab" data-control-tab="system" aria-controls="controlPanel-system" aria-selected="false" tabindex="-1">System</button>
           </div>
           <button class="control-tab-scroll" type="button" data-control-tab-scroll="next" title="Next control tabs" aria-label="Next control tabs">
@@ -227,35 +222,15 @@ appRoot.innerHTML = `
             </div>
           </section>
 
-          <section id="controlPanel-playback" class="control-tab-panel" role="tabpanel" data-control-panel="playback" aria-labelledby="controlTab-playback" hidden>
-            <div class="panel-heading control-section-heading"><div><i data-lucide="play"></i><h2>Playback</h2></div></div>
-            <div class="control-panel-scroll">
-              <fieldset class="control-group">
-                <legend>Transport</legend>
-                <div class="control-readout"><span>Animation</span><strong id="panelCurrentTrack">No animation</strong></div>
-                <div class="control-command-grid">
-                  <button class="button primary" id="panelPlayButton" type="button"><i data-lucide="play"></i><span>Play</span></button>
-                  <button class="button active" id="panelLoopButton" type="button" aria-pressed="true"><i data-lucide="repeat-2"></i><span>Loop On</span></button>
-                </div>
-                <div class="control-readout"><span>Position</span><strong id="panelTimeValue">00:00.000 / 00:00.000</strong></div>
-              </fieldset>
-            </div>
-          </section>
-
           <section id="controlPanel-viewport" class="control-tab-panel" role="tabpanel" data-control-panel="viewport" aria-labelledby="controlTab-viewport" hidden>
             <div class="panel-heading control-section-heading"><div><i data-lucide="maximize-2"></i><h2>Viewport</h2></div></div>
             <div class="control-panel-scroll">
               <fieldset class="control-group">
                 <legend>Camera</legend>
                 <button class="button control-wide-button" id="panelFitButton" type="button"><i data-lucide="maximize-2"></i><span>Fit Animation to View</span></button>
-                <p class="control-hint">Use Pan in the viewport toolbar or drag with the middle mouse button. Scroll to zoom. On touch screens, two fingers pan and pinch-zoom without editing sprites.</p>
+                <p class="control-hint">Choose Pan from Tools in the viewport toolbar or drag with the middle mouse button. Scroll to zoom. On touch screens, two fingers pan and pinch-zoom without editing sprites.</p>
               </fieldset>
             </div>
-          </section>
-
-          <section id="controlPanel-spatial3d" class="control-tab-panel" role="tabpanel" data-control-panel="spatial3d" aria-labelledby="controlTab-spatial3d" hidden>
-            <div class="panel-heading control-section-heading"><div><h2>Stereoscopic 3D</h2></div></div>
-            <div class="control-panel-scroll"><div class="control-pending"><strong>3D controls are not available yet</strong><span>The desktop stereoscopic controls will be ported with the specialized viewer tools.</span></div></div>
           </section>
 
           <section id="controlPanel-audio" class="control-tab-panel" role="tabpanel" data-control-panel="audio" aria-labelledby="controlTab-audio" hidden>
@@ -273,11 +248,6 @@ appRoot.innerHTML = `
           <section id="controlPanel-sprites" class="control-tab-panel" role="tabpanel" data-control-panel="sprites" aria-labelledby="controlTab-sprites" hidden>
             <div class="panel-heading control-section-heading"><div><h2>Sprites</h2></div></div>
             <div class="control-panel-scroll" id="spriteTransformInspector"></div>
-          </section>
-
-          <section id="controlPanel-terrain" class="control-tab-panel" role="tabpanel" data-control-panel="terrain" aria-labelledby="controlTab-terrain" hidden>
-            <div class="panel-heading control-section-heading"><div><h2>Terrain</h2></div></div>
-            <div class="control-panel-scroll"><div class="control-pending"><strong>Terrain controls are not available yet</strong><span>Island geometry and terrain alignment will arrive with specialized viewer support.</span></div></div>
           </section>
 
           <section id="controlPanel-export" class="control-tab-panel" role="tabpanel" data-control-panel="export" aria-labelledby="controlTab-export" hidden>
@@ -319,13 +289,7 @@ appRoot.innerHTML = `
                 <span id="exportProgressText">Preparing export...</span>
               </div>
               <div id="exportResult" hidden></div>
-              <div class="control-pending export-future-note"><strong>Desktop parity work</strong><span>PSD layers, After Effects rigs, transparent/ProRes video, layer passes, batch-all-animations, and animation BIN writing are still pending. MP4, MOV, WebM, GIF, PNG, and PNG ZIP are available with the limitations shown above.</span></div>
             </div>
-          </section>
-
-          <section id="controlPanel-rigging" class="control-tab-panel" role="tabpanel" data-control-panel="rigging" aria-labelledby="controlTab-rigging" hidden>
-            <div class="panel-heading control-section-heading"><div><h2>Rigging</h2></div></div>
-            <div class="control-panel-scroll"><div class="control-pending"><strong>Rigging controls are not available yet</strong><span>Constraints and the joint solver will be added only after deterministic editing support is in place.</span></div></div>
           </section>
 
           <section id="controlPanel-system" class="control-tab-panel" role="tabpanel" data-control-panel="system" aria-labelledby="controlTab-system" hidden>
@@ -501,7 +465,6 @@ const icons = {
   PanelRight,
   Pause,
   Play,
-  Repeat2,
   RotateCcw,
   Search,
   Settings,
@@ -574,11 +537,7 @@ const controlTabs = new ControlPanelTabs(element<HTMLElement>('.library-panel'),
   initialTab: 'files',
   storageKey: 'aniviewer.controlPanelTab',
 });
-const panelPlayButton = element<HTMLButtonElement>('#panelPlayButton');
-const panelLoopButton = element<HTMLButtonElement>('#panelLoopButton');
 const panelFitButton = element<HTMLButtonElement>('#panelFitButton');
-const panelCurrentTrack = element<HTMLElement>('#panelCurrentTrack');
-const panelTimeValue = element<HTMLElement>('#panelTimeValue');
 const panelAudioButton = element<HTMLButtonElement>('#panelAudioButton');
 const panelAudioVolume = element<HTMLInputElement>('#panelAudioVolume');
 const panelAudioStatus = element<HTMLElement>('#panelAudioStatus');
@@ -1552,7 +1511,6 @@ function selectTrack(index: number): void {
   if (!track || !session.setTrack(index)) return;
   renderer.setTrack(index);
   currentTrack.textContent = track.name;
-  panelCurrentTrack.textContent = track.name;
   renderTracks();
   renderLayers(track);
   audioLoadPromise = loadAudioForTrack(track).catch((error) => {
@@ -1979,9 +1937,6 @@ const updateLoopControls = (loop: boolean): void => {
   loopButton.title = loop ? 'Loop enabled' : 'Loop disabled';
   loopButton.setAttribute('aria-label', loopButton.title);
   loopButtonImage.src = loop ? loopEnabledIcon : loopDisabledIcon;
-  panelLoopButton.classList.toggle('active', loop);
-  panelLoopButton.setAttribute('aria-pressed', String(loop));
-  panelLoopButton.innerHTML = `<i data-lucide="repeat-2"></i><span>${loop ? 'Loop On' : 'Loop Off'}</span>`;
   hydrateIcons();
 };
 const toggleLoop = (): void => {
@@ -2107,7 +2062,6 @@ function executeKeybind(event: KeyboardEvent): boolean {
 applyViewerSettings(viewerSettings);
 
 playButton.addEventListener('click', togglePlayback);
-panelPlayButton.addEventListener('click', togglePlayback);
 audioButton.addEventListener('click', toggleAudioMuted);
 panelAudioButton.addEventListener('click', toggleAudioMuted);
 audioVolume.addEventListener('input', () => {
@@ -2121,7 +2075,6 @@ panelAudioVolume.addEventListener('input', () => {
   persistViewerSettings();
 });
 loopButton.addEventListener('click', toggleLoop);
-panelLoopButton.addEventListener('click', toggleLoop);
 timeline.addEventListener('input', () => {
   if (exportBusy) return;
   transformControls.cancelGesture();
@@ -2145,7 +2098,6 @@ renderer.onPlaybackChange = (playing) => {
   playButtonImage.src = playing ? pauseIcon : playIcon;
   playButton.title = playing ? 'Pause' : 'Play';
   playButton.setAttribute('aria-label', playButton.title);
-  panelPlayButton.innerHTML = `<i data-lucide="${playing ? 'pause' : 'play'}"></i><span>${playing ? 'Pause' : 'Play'}</span>`;
   hydrateIcons();
   syncAudioPlayback(renderer.getTime(), playing);
 };
@@ -2154,7 +2106,6 @@ renderer.onTimeChange = (time, duration) => {
   timeline.max = String(Math.max(0.001, duration));
   timeline.value = String(time);
   timeValue.textContent = `${formatTime(time)} / ${formatTime(duration)}`;
-  panelTimeValue.textContent = timeValue.textContent;
   syncAudioPlayback(time, renderer.isPlaying());
 };
 

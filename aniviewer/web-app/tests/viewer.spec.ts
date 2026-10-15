@@ -175,23 +175,20 @@ test('opens a usable local viewer without horizontal overflow', async ({ page })
   expect(libraryLayout?.trackHeight).toBeGreaterThanOrEqual(80);
 });
 
-test('provides the desktop control-panel sections with accessible tab navigation', async ({ page }) => {
+test('provides implemented control-panel sections with accessible tab navigation', async ({ page }) => {
   await page.goto('.');
 
   const tabs = page.locator('.control-tab-list [role="tab"]');
   await expect(tabs).toHaveText([
     'Files',
     'Animation',
-    'Playback',
     'Viewport',
-    '3D',
     'Audio',
     'Sprites',
-    'Terrain',
     'Export',
-    'Rigging',
     'System',
   ]);
+  await expect(page.locator('.control-pending, #controlPanel-playback, #controlPanel-spatial3d, #controlPanel-terrain, #controlPanel-rigging')).toHaveCount(0);
   await expect(page.locator('#controlTab-files')).toHaveAttribute('aria-selected', 'true');
   await expect(page.locator('#controlPanel-files')).toBeVisible();
   await expect(page.locator('#controlPanel-animation')).toBeHidden();
@@ -223,7 +220,7 @@ test('opens a top settings drawer with persisted browser-native preferences', as
   await page.locator('#settingsButton').click();
   await expect(page.locator('#settingsLayer')).toHaveAttribute('data-open', 'true');
   await expect(page.locator('.settings-tabs [role="tab"]')).toHaveText([
-    'Export', 'Tools', 'Paths', 'Keybinds', 'Application',
+    'Export', 'Paths', 'Keybinds', 'Application',
   ]);
   await expect(page.locator('#settingsLayer')).not.toContainText('BIN Converter');
 

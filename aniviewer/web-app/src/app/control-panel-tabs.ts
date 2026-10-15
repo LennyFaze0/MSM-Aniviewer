@@ -24,7 +24,11 @@ export class ControlPanelTabs {
     const storedTab = options.storageKey ? this.readStoredTab(options.storageKey) : undefined;
     const initialTab = storedTab ?? options.initialTab ?? this.buttons[0]!.dataset.controlTab!;
     this.bindEvents(options.storageKey);
-    this.activate(initialTab);
+    if (!this.activate(initialTab)) {
+      const fallback = this.buttons[0]!.dataset.controlTab!;
+      this.activate(fallback);
+      if (options.storageKey) this.storeTab(options.storageKey, fallback);
+    }
   }
 
   get currentTab(): string {
