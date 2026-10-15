@@ -115,7 +115,8 @@ test('touch selection, step controls and two-finger interruption never leave a p
 test('rotation handle, flips and keyboard shortcuts work without stealing numeric input keys', async ({ page }) => {
   await fixture(page); await select(page, 0); await inspector(page);
   await page.locator('#viewportPanel').focus(); await page.keyboard.press('e');
-  await expect(page.locator('#transformDock [data-transform-tool="rotate"]')).toHaveAttribute('aria-pressed', 'true');
+  await expect(page.locator('#toolModeButton [data-current-tool]')).toHaveText('Rotate');
+  await expect(page.locator('#viewportPanel')).toHaveAttribute('data-transform-tool', 'rotate');
   const pivot = await page.locator('.transform-pivot').evaluate((node) => {
     const b = node.getBoundingClientRect(); return { x: b.x + b.width / 2, y: b.y + b.height / 2 };
   });
@@ -156,7 +157,8 @@ test('rotation handle, flips and keyboard shortcuts work without stealing numeri
   await page.keyboard.press('v'); await page.keyboard.press('Shift+ArrowRight');
   await expect(page.locator('[data-transform-field="offsetX"]')).toHaveValue('10');
   await page.locator('[data-transform-field="offsetX"]').focus(); await page.keyboard.press('e');
-  await expect(page.locator('#transformDock [data-transform-tool="move"]')).toHaveAttribute('aria-pressed', 'true');
+  await expect(page.locator('#toolModeButton [data-current-tool]')).toHaveText('Move');
+  await expect(page.locator('#viewportPanel')).toHaveAttribute('data-transform-tool', 'move');
 });
 
 test('dragging stays aligned under UI scaling and viewport resizing', async ({ page }) => {

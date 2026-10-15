@@ -92,17 +92,19 @@ test('reduced motion, repeated opening, resize and blur leave no stale modal', a
   await expect(menu.locator('[data-picker-mode="rotate"]')).toHaveAttribute('aria-pressed', 'true');
 });
 
-test('touch taskbar remains compact; mouse shortcuts and inspector fallback remain available', async ({ page, isMobile }) => {
+test('taskbar uses one compact Tools launcher on desktop and touch; adjustment controls remain available', async ({ page, isMobile }) => {
   await fixture(page); await select(page, 0);
+  const dock = page.locator('#transformDock');
+  await expect(dock.locator('.transform-tools, button[data-transform-tool]')).toHaveCount(0);
+  await expect(dock.locator('#toolModeButton')).toBeVisible();
+  expect(await dock.evaluate((node) => node.getBoundingClientRect().height)).toBeLessThan(65);
+  expect(await dock.evaluate((node) => node.scrollWidth <= node.clientWidth)).toBe(true);
   const touchFirst = await page.evaluate(() => matchMedia('(pointer: coarse) and (hover: none)').matches);
-  const tools = page.locator('#transformDock .transform-tools');
   if (touchFirst) {
-    await expect(tools).toBeHidden();
-    expect(await page.locator('#transformDock').evaluate((node) => node.getBoundingClientRect().height)).toBeLessThan(65);
     await inspector(page); await expect(page.locator('#touchToolSelect')).toBeVisible();
     await page.locator('#touchToolSelect').selectOption('pan');
     await expect(page.locator('#toolModeButton [data-current-tool]')).toHaveText('Pan');
-  } else await expect(tools).toBeVisible();
+  }
   await open(page, isMobile); await activate(page.locator('[data-picker-mode="move"]'), isMobile);
   await expect(page.locator('#toolModePicker')).toBeHidden();
   await expect(page.locator('#transformDock [data-action="right"]')).toBeVisible();

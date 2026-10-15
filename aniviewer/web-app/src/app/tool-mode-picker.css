@@ -17,8 +17,6 @@
 .touch-tool-fallback { display: none; gap: 6px; margin-bottom: 12px; font-size: 12px; }
 .touch-tool-fallback select { min-width: 0; min-height: 44px; color: var(--text); background: var(--surface-sunken); border: 1px solid var(--line-strong); }
 @media (pointer: coarse) and (hover: none) {
-  .transform-dock .transform-tools { display: none; }
-  .transform-dock .transform-options { margin-top: 0; }
   .touch-tool-fallback { display: grid; }
   .touch-tool-fallback select { font-size: 16px; }
 }

@@ -37,14 +37,10 @@ export async function inspector(page: Page) {
   await page.locator('#controlTab-sprites').click();
 }
 export async function chooseTool(page: Page, mode: string) {
-  const button = page.locator(`[data-transform-tool="${mode}"]`);
-  if (await button.isVisible()) await button.click();
-  else {
-    await page.locator('#toolModeButton').click();
-    await page.locator(`#toolModePicker [data-picker-mode="${mode}"]`).click();
-    await expect(page.locator('#toolModePicker')).toBeHidden();
-    await page.locator('#viewportPanel').evaluate((host) => host.scrollIntoView({ block: 'start' }));
-  }
+  await page.locator('#toolModeButton').click();
+  await page.locator(`#toolModePicker [data-picker-mode="${mode}"]`).click();
+  await expect(page.locator('#toolModePicker')).toBeHidden();
+  await page.locator('#viewportPanel').evaluate((host) => host.scrollIntoView({ block: 'start' }));
 }
 export async function field(page: Page, key: string, value: string) {
   await inspector(page);

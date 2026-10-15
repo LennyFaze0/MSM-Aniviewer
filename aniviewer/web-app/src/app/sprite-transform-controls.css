@@ -10,10 +10,10 @@
 .transform-handle-hit { fill: transparent; pointer-events: all; cursor: grab; }
 .transform-dock { position: absolute; z-index: 3; inset: auto 0 0; padding: 4px; border-top: 1px solid var(--line-strong); background: var(--surface); cursor: default; touch-action: manipulation; }
 .transform-dock[hidden], .transform-steps[hidden] { display: none; }
-.transform-tools, .transform-options, .transform-steps { display: flex; gap: 4px; justify-content: center; }
-.transform-options, .transform-steps { margin-top: 4px; }
+.transform-options, .transform-steps { display: flex; gap: 4px; justify-content: center; }
+.transform-steps { margin-top: 4px; }
 .transform-dock .button { min-width: 0; min-height: 32px; padding: 4px 7px; flex: 1 1 0; gap: 4px; justify-content: center; max-width: 112px; font-size: 11px; }
-.transform-tools .button svg, .transform-steps .button svg { width: 17px; height: 17px; flex: 0 0 auto; }
+.transform-steps .button svg { width: 17px; height: 17px; flex: 0 0 auto; }
 .transform-dock button[aria-pressed='true'] { background: var(--selection); border-color: var(--accent-strong); color: #fff; }
 .transform-dock select { flex: 1 1 0; min-width: 0; max-width: 112px; border: 1px solid var(--line-strong); background: var(--surface-sunken); color: var(--text); }
 .transform-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
@@ -27,5 +27,4 @@
   .transform-dock .button, .transform-dock select { min-height: 44px; }
   .transform-fields input { min-height: 44px; font-size: 16px; }
   .transform-inspector .button { min-height: 44px; }
-  .transform-tools .button { flex-direction: column; padding: 3px; gap: 1px; }
 }

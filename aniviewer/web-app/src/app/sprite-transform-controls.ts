@@ -71,10 +71,7 @@ export class SpriteTransformControls {
     this.dock.className = 'transform-dock';
     this.dock.id = 'transformDock';
     this.dock.innerHTML = `
-      <div class="transform-tools" role="group" aria-label="Sprite tools">
-        ${(['select', 'move', 'rotate', 'scale', 'pan'] as Tool[]).map((tool) => `<button type="button" class="button" data-transform-tool="${tool}" aria-pressed="false">${icon(tool)}<span>${tool[0]!.toUpperCase() + tool.slice(1)}</span></button>`).join('')}
-      </div>
-      <div class="transform-options">
+      <div class="transform-options" role="group" aria-label="Sprite tools">
         <button type="button" class="button tool-launcher" id="toolModeButton" data-action="tools"><span>Tools</span><span data-current-tool>Select</span></button>
         <button type="button" class="button" data-action="undo" title="Undo transform (Ctrl/Cmd+Z)">Undo</button>
         <button type="button" class="button" data-action="redo" title="Redo transform (Ctrl/Cmd+Shift+Z)">Redo</button>
@@ -123,8 +120,7 @@ export class SpriteTransformControls {
       </fieldset>`;
     const activate = (button: HTMLButtonElement) => {
       if (this.busy || button.disabled) return;
-      if (button.dataset.transformTool) this.setTool(button.dataset.transformTool as Tool);
-      else if (button.dataset.action) this.action(button.dataset.action);
+      if (button.dataset.action) this.action(button.dataset.action);
     };
     let touchButton: { id: number; button: HTMLButtonElement; x: number; y: number } | undefined;
     let consumedClick: { button: HTMLButtonElement; until: number } | undefined;
@@ -487,7 +483,6 @@ export class SpriteTransformControls {
     const picked = this.session.snapshot().selectedLayerIds;
     const redirected = picked.some((id) => !selected.includes(id));
     this.inspector.querySelector('#transformSelection')!.textContent = names.length ? `${redirected ? 'Editing linked driver: ' : ''}${names.join(', ')}` : 'Select a sprite in the viewport or Layers panel.';
-    this.dock.querySelectorAll<HTMLButtonElement>('[data-transform-tool]').forEach((button) => button.setAttribute('aria-pressed', String(button.dataset.transformTool === this.tool)));
     this.dock.querySelector('[data-action="multi"]')!.setAttribute('aria-pressed', String(this.multi));
     this.dock.querySelector('[data-action="snap"]')!.setAttribute('aria-pressed', String(this.snap));
     this.dock.querySelector<HTMLButtonElement>('[data-action="undo"]')!.disabled = !this.session.history.canUndo || this.session.transforming;
