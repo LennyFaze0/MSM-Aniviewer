@@ -4,6 +4,7 @@ import { nativeRev6Fixture } from '../tests/native-fixture';
 
 // Reuse real-sample audio checks without dev-server-only module imports.
 import '../tests/buffered-audio-playback.spec';
+import '../tests/manual-reader.spec';
 
 test('home-screen metadata uses valid iOS and Android viewer icons under the deployed base', async ({ page, request }) => {
   await page.goto('.');
@@ -44,7 +45,8 @@ test('published shell, settings, assets and decoder load on desktop and phones',
   await page.goto('.');
   await expect(page.locator('.viewport-canvas')).toBeVisible();
   await expect(page.locator('#importFilesButton')).toBeVisible();
-  await expect(page.locator('#manualButton, a[href$="manual.html"]')).toHaveCount(0);
+  await expect(page.locator('#manualButton')).toBeVisible();
+  await expect(page.locator('a[href$="manual.html"]')).toHaveCount(0);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
   await page.locator('#settingsButton').click();
   await expect(page.locator('#settingsLayer')).toHaveAttribute('data-open', 'true');

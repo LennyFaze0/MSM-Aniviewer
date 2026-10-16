@@ -127,7 +127,7 @@ function muppetsAudioManifest(trackName: string, audioPath: string): Buffer {
 test('opens a usable local viewer without horizontal overflow', async ({ page }) => {
   await page.goto('.');
 
-  await expect(page.getByText('MSM Aniviewer')).toBeVisible();
+  await expect(page.getByText('MSM Aniviewer', { exact: true })).toBeVisible();
   await expect(page.locator('.viewport-canvas')).toBeVisible();
   await expect(page.getByText('Local processing')).toBeVisible();
   await expect(page.locator('.app-header #dofGrabberButton')).toHaveCount(0);

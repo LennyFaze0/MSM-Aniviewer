@@ -1,5 +1,6 @@
 import {
   ArrowLeftRight,
+  BookOpen,
   Check,
   ChevronLeft,
   ChevronRight,
@@ -44,6 +45,7 @@ import { ControlPanelTabs } from './app/control-panel-tabs';
 import { AssetRetention } from './app/asset-retention';
 import { ExportDownload } from './app/export-download';
 import { MonsterBrowser } from './app/monster-browser';
+import { ManualReader } from './app/manual-reader';
 import { SettingsPane } from './app/settings-pane';
 import { ViewerSession } from './app/viewer-session';
 import {
@@ -119,6 +121,9 @@ appRoot.innerHTML = `
       </div>
       <div class="header-file" id="headerFile">No animation loaded</div>
       <div class="header-actions">
+        <button class="button header-tool-button" id="manualButton" type="button" title="Open manual" aria-label="Open manual">
+          <i data-lucide="book-open"></i><span>Manual</span>
+        </button>
         <button class="button header-tool-button" id="fitButton" type="button" title="Fit animation to viewport" aria-label="Fit animation to viewport">
           <i data-lucide="rotate-ccw"></i><span>Fit View</span>
         </button>
@@ -445,6 +450,7 @@ appRoot.innerHTML = `
 
 const icons = {
   ArrowLeftRight,
+  BookOpen,
   Check,
   ChevronLeft,
   ChevronRight,
@@ -591,6 +597,7 @@ let dofDownloadAbortController: AbortController | undefined;
 let exportAbortController: AbortController | undefined;
 let exportBusy = false;
 const transformControls = new SpriteTransformControls(viewportPanel, element('#spriteTransformInspector'), session, renderer);
+const manualReader = new ManualReader(element<HTMLButtonElement>('#manualButton'), () => transformControls.cancelGesture());
 session.subscribe((_snapshot, change) => {
   if (change !== 'selection') return;
   layerList.querySelectorAll<HTMLElement>('[data-layer-id]').forEach((row) => {
@@ -1758,7 +1765,7 @@ dofGrabberBackdrop.addEventListener('click', (event) => {
 });
 document.addEventListener('keydown', (event) => {
   if (event.key === 'Escape' && !dofGrabberBackdrop.hidden) closeDofGrabber();
-  if (event.defaultPrevented || settingsPane.isOpen || monsterBrowser.isOpen || !dofGrabberBackdrop.hidden) return;
+  if (event.defaultPrevented || settingsPane.isOpen || manualReader.isOpen || monsterBrowser.isOpen || !dofGrabberBackdrop.hidden) return;
   const target = event.target as HTMLElement | null;
   if (target?.matches('input, select, textarea, [contenteditable="true"]')) return;
   if (executeKeybind(event) || transformControls.handleKey(event)) event.preventDefault();

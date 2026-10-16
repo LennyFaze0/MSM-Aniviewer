@@ -1,0 +1,494 @@
+MSM Aniviewer Manual (Manual Re-written by LennyFaze)
+
+Greetings, welcome to the web version of the aniviewer.
+
+You might be wondering how to use this program, so here is an info dump concerning this web-based version. The desktop version will probably never recieve a manual due to its complexity.
+
+0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o
+
+(((FILES TAB)))
+
+0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o
+
+
+FILE SELECTION -
+
+The file selection section consists of several buttons:
+
+Open Game Folder - use this button to select what folder you want to use for the game's assets (the files) to show up in the viewer.
+
+(Note on file structure: most MSM game dumps have a "data" folder, with that name, which is the folder you want to open with the "Open Game Folder" button, not the folders within, the viewer will grab the assets automatically in most cases)
+
+
+Open Animation Files - use this button to select individual files to add to the viewer, that being track bins (ones that begin with numbers, for examples see BIN FILE EXAMPLES: 001_B.bin and 001_kermit.bin) animation bins (multiple examples, see BIN FILE EXAMPLES: monster_a.bin and muppet_kermit_stage01.bin) spritesheet xml's (multiple examples, see XML FILE EXAMPLES: monster_A_sheet.xml and kermit_sheet.xml) and any other files you wish to add to the viewer that it supports natively
+
+
+Dumping your own game files is required for use within the viewer (aside from DOF assets which can be retrieved with the Dawn of Fire Asset grabber)
+
+You can retrieve these dumps by getting your own APK's (Android), ipa files (iOS), or getting the files from steam directly.
+
+
+XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+
+Monster Browser - use this button to open the monster browser, a GUI to view all of the loadable bins within your current loaded file structure
+
+-(While open)-
+
+Search Monsters Search bar - use this bar to search for specifc assets by name
+
+Source Dropdown - this dropdown is used for filtering between the different types of bins/animation files present within the current loaded library
+
+Open Game Folder - use this button for adding another game folder into the local library loaded on this device
+Open Animation Files - use this button for adding assets into the local library loaded on this device
+
+^ Both of these buttons are redundant and do the same thing as the ones in the "File Selection" section.
+
+XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+
+Dawn of Fire Asset Grabber - use this button to open the Dawn of Fire Asset Grabber, a tool to grab assets for the dawn of fire version of msm. (See below for further details)
+
+-(While open)-
+
+Known Build Dropdown - this dropdown is used for selecting between known builds (added via a new build key) that are available within the viewer. Custom is used when adding a new build key into the viewer.
+
+Platform Dropdown - this dropdown is used for selecting between platforms to grab assets from (iOS and Android)
+
+Build Key - this prompt box is used for selecting the build key, the set of characters used to define what build of dawn of fire that the viewer will grab from big blue bubble's dlc2 server.
+
+These can only be obtained by somewhat forensic ways,
+
+Example for a good, known URL with a build key:
+
+https://dlc2.bbbgame.net/monster_babies/dlc/00018241-2807c732a3da/ios/
+
+
+I'll split this into sections so it's easy to read:
+
+Build Key: 00018241-2807c732a3da
+Base URL (CDN Source): https://dlc2.bbbgame.net/monster_babies/dlc
+Platform: ios
+
+Only known ways to get these keys currently are by using Cheat Engine / hxd memory reader, or by using http toolkit. Ask a fellow MSM modder to grab one for you if you don't know how to do this (I don't know how so don't ask LennyFaze)
+
+------------------------------------
+
+Load Manifest - use this button to load from the current information in the previous section. Requires a valid build key to grab assets.
+
+Import Manifest - use this button to load a saved bundles.json from the button listed below:
+
+External Link Button - use this button to view the json for the current loaded manifest, can be downloaded and saved for later for loading the manifest manually if your browser has problems with contacting BBB's server directly for some reason (redundancy!)
+
+------------------------------------
+
+Filter Bundle Names Search Bar - allows for searching specific assets within the loaded manifest
+
+------------------------------------
+
+Open Files - opens .unity3d and .bundle files directly, this will cause the viewer to load the animation for the opened local bundle
+
+Download checked - downloads all of the checked unity bundles in the list above this button
+
+XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+
+
+Remember imported assets section - this section is used for manipulating the files that are currently loaded into the viewer.
+
+
+Refresh Saved Folders - use this button to refresh currently saved folders (in the case that new files were added to the currently loaded game directory and the viewer hasn't indexed them yet)
+
+Forget Saved Library - use this button to remove the currently saved local library for the viewer on this device
+
+Retry Saving Library - use this button to retry the save library process (in case it has failed to save automatically with the "Remember imported assets on this device" function enabled)
+
+All Files loaded into the viewer are stored locally on your designated device that the viewer is loaded onto.
+
+Animation File Section - this section is used for viewing ALL of the current detected bins within the local library that is currently loaded in a dropdown menu
+
+Bin Revision Dropdown - this dropdown is used for selecting the type of revision the viewer uses for decyphering bin files (leave on automatic if you aren't sure what this means)
+
+0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o
+
+(((ANIMATION TAB)))
+
+0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o
+
+
+Appearance dropdown - this dropdown is used for selecting between the current loaded entity's costumes
+
+
+XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+
+Animation Section -
+
+This Animation section is where you will have the current animation file's animations listed. Whatever animations can be loaded from the current bin or other files (such as unity bundles)
+
+
+Select animation section
+The way the animations are laid out are as follows:
+
+[island ID] - [Monster Value/Codename] _ [type of entity] _ [Animation Number]
+
+In addition to these animations, there are also idles, sleep animations, and store view animations just to name a few.
+
+0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o
+
+(((AUDIO TAB)))
+
+0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o
+
+Audio Playback controls - basic audio controls, nuff said. (Mute button mutes, volume slider adjusts volume wwooowww)
+
+0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o
+
+((SPRITES TAB))
+
+Selected Sprites Section -
+
+This section is primarily for adjusting scaling and positions of sprites.
+
+
+[Positioning]
+X offset (px) - Adjusts X offset of selected sprite(s) by a set number of pixels
+Y offset (px) - Adjusts Y offset of selected sprite(s) by a set number of pixels
+Rotation (deg) - Adjusts degree of rotation of selected sprite(s) by a set number of degree(s)
+
+[Scaling]
+Scale X (%) - Adjusts X (width) of selected sprite(s) by a specified percentage
+Scale Y (%) - Adjusts Y (height) of selected sprite(s) by a specified percentage
+
+0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o
+
+(((EXPORT TAB)))
+
+0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o
+
+PNG Export Section -
+
+This section offers two different methods of exporting frames from a currently loaded animation as individual .png image files.
+
+Export Current Frame (PNG) button - Does as it says on the tin, exports the current frame in the viewport (the current frame of the animation you are viewing) as a PNG file
+Export Animation Frames (ZIP) button - Exports all of the current loaded animation's frames as a set of .png files into a packaged zip file
+
+XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+
+Video Export Section -
+
+This section offers many different formats to export loaded animations as, such as MP4's, webM's, and MOV's!
+
+------------------------------------
+
+Format dropdown - use this to select the format you wish to export the loaded animation as
+
+Types of formats:
+
+MP4 - Standard video format, will not have transparency but has the widest compatibility
+WebM - Video format primarily used on web pages, can be used in discord to post transparent videos (only seems to be transparent on desktop as of making this)
+MOV - Highest quality format that supports transparency for animations. If your video editor supports it, use this one
+GIF (at the bottom of export tab) - Lowest quality format used for easy sharing on a variety of platforms. Great compatibility with discord, no audio support, however.
+
+------------------------------------
+
+Processing dropdown - allows for choosing between two different processing codecs:
+
+Fast (WebCodecs) - it's in the name, a lot speedier than the compatibility codec
+
+Compatibility - use this one if you're having problems with WebCodecs
+
+------------------------------------
+
+Bitrate prompt box - use this prompt box to adjust the Mbps (megabits per second) of the bitrate, adjusts how clean the final output will be and can change the filesize drastically depending on how high of a bitrate you choose
+
+If using a higher resolution for the animation output within the frame settings, you will want to up the bitrate to a higher value to keep the output looking clean and visible
+
+------------------------------------
+
+Include matched audio checkbox - use this box to tell the viewer weather to add the audio in with the final export or not (the audio attatched to the current animation)
+
+Export Video - use this button to... you guessed it!- export the video, pretty self explanatory.
+
+XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+
+Frame Settings Section -
+
+This section allows for framing the current animation into the correct bounds when exporting
+
+Framing dropdown - this dropdown is used to select between the two types of export framing:
+
+[Animation Canvas]
+Will export the animation with the positoning as seen within the current viewport presentation (basically what you actively see in the animation window)
+Can sometimes cut things off if your view is not encompassing the entire animation
+
+[Stable Content Bounds] (Recommended)
+Will export the animation with smart bounds and will determine the best cropping of the final export on its own. This guarantees the final export will be visible at all times in the output
+
+
+Fill background with solid color toggle - use this toggle to fill the background with a solid color upon exporting (self explanatory)
+
+0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o
+
+(((SYSTEM TAB)))
+
+0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o0o
+
+System section - shows the browser runtime implementation status (just for a point of reference, this tab can't be interacted with)
+
+
+Settings will not be touched on within this manual for the time being, feel free to experiment with the settings that are offered, most of the settings have their own descriptions which would make this section redundant.
+
+(((BIN FILE EXAMPLES)))
+
+BIN File Examples Section -
+
+This section is for figuring out which files do what, because a folder full of bins isn't exactly self explanatory. These are examples of file families, not a list of files that every monster needs. Names and available files will differ depending on the game and version you have dumped.
+
+One important thing before we start: .bin just means a binary file. It does NOT mean that every file ending in .bin is an animation! Some contain animation layers, some tell the game which sounds to use, and others contain menus or other game data.
+
+File type and BIN revision are also two different things. The filename gives you a clue about what the file is used for; the revision tells the viewer how to read the information inside it. Leave Bin Revision on Automatic unless you know which layout your file uses.
+
+Track Bins Section -
+
+Examples: 001_B.bin, 001_BC.bin, 001_kermit.bin
+
+These are the number-prefixed files mentioned in the file selection section. They can describe the relationship between an entity's animation tracks and its audio, rather than containing the sprite layers needed to draw the entity itself.
+
+001_B.bin - an MSM example containing references to tracks such as 01-B_Monster_01 and 01-B_Dance_01, along with audio paths such as audio/music/01-B_Monster_01.ogg. The .ogg is the actual sound file; the .bin is not secretly an audio recording.
+
+001_kermit.bin - a My Muppets Show example. This links 01-kermit_01 and 01-kermit_02 to their matching audio files, while Idle has no audio assigned. The viewer reads recognized Muppets audio manifests as supporting files, rather than showing them as standalone sprite animations.
+
+Keep these files with the animation and audio assets when importing a game folder. To actually see the character, open its monster_ or muppet_ animation BIN instead. A track BIN by itself is not a replacement for that animation, its XML, or its spritesheet.
+
+The number prefix is a naming clue, not a guarantee that every numbered BIN has the same internal format. Also, importing a track BIN does not mean that the viewer will assemble and play an entire island song for you.
+
+Standard Monster Bins Section -
+
+Examples: monster_a.bin, monster_ab.bin, monster_den.bin
+
+These contain the actual animation data for the monster: its sprite layers, positions, scaling, rotation, and the frames that make those layers move. One BIN can contain multiple named animations, so you do not necessarily need a separate BIN for Idle, Sleep, Store, or each song part.
+
+monster_a.bin - an example that references monster_A_sheet.xml. The animation list includes names such as 01-A_Dance_01 and 02-A_Monster_01. Those are animations inside the BIN, not extra files you need to search for with those exact names.
+
+monster_ab.bin - another standard monster example. The letters after monster_ are an internal monster identifier, which is why searching the file list for the monster's displayed in-game name will not always find it.
+
+Import the matching atlas XML and the image it references as well. For the atlas side of this, see XML FILE EXAMPLES.
+
+Rare and Epic Bins Section -
+
+Examples: monster_a_RARE.bin, monster_a_EPIC.bin, monster_ab_RARE.bin, monster_u05_RARE.bin
+
+These are animation files for alternate monster variants. RARE and EPIC describe the variant, not the BIN revision. You do not need to choose a different revision just because the monster is rare or epic.
+
+monster_a_RARE.bin - an example that still references monster_A_sheet.xml, the regular monster's atlas. A rare does not always come with a completely separate image; animation color information can change how the shared artwork looks.
+
+monster_a_EPIC.bin - an example that references monster_A_EPIC_sheet.xml instead. In this case you need the epic atlas and its matching image, not just the regular monster's artwork.
+
+monster_u05_RARE.bin - an example that references BOTH monster_U05_RARE_sheet.xml and monster_U05_sheet.xml. Its Activate animation is a good example of why importing only the rare spritesheet can leave parts missing. Keep both atlas/image pairs available.
+
+Basically, follow what the animation actually references rather than guessing that every variant uses only one sheet with a matching name.
+
+Island-Specific Monster Bins Section -
+
+Examples: monster_VOC_01_island1.bin, monster_VOC_01_island2.bin, monster_VOC_01_island5.bin
+
+Some monsters have separate files for different islands or contexts. These can share an atlas while containing different named animations for each location.
+
+monster_VOC_01_island1.bin - an example referencing monster_VOC_01_sheet.xml and containing tracks such as 01-VOC_01_Monster_01. The island suffix belongs to the animation filename; it does not mean you should rename the shared spritesheet to include that suffix.
+
+Muppet Bins Section -
+
+Examples: muppet_kermit_stage01.bin, muppet_animal_stage01.bin, muppet_animal_stage02.bin, muppet_beaker_stage02.bin
+
+These are My Muppets Show's character animation files. The stage number is part of the character's animation context, not a BIN revision number.
+
+muppet_kermit_stage01.bin - an example referencing kermit_sheet.xml and containing 01-kermit_01, 01-kermit_02, Idle, and Store. Keep the matching 001_kermit.bin and music files as well if you want the associated audio to be available.
+
+muppet_animal_stage01.bin and muppet_animal_stage02.bin - examples of the same character appearing in different stage-specific files. Do not assume that every stage uses the same animation tracks or sound clip.
+
+My Singing Muppets beta files can have the same names as released My Muppets Show files, including muppet_kermit_stage01.bin, while using a different binary layout. The beta example uses standard Rev 2; the released example uses Rev 2 (My Muppets Show). Automatic detection is the easiest way to avoid mixing these up.
+
+Use the XMLs, images, and audio from the same game dump as the animation whenever possible. Matching filenames from two different builds do not necessarily mean matching contents.
+
+Costume Bins Section -
+
+Example: costume_A_09.bin
+
+Costume definition files tell the viewer how to change a base monster's appearance. Depending on the costume, this can involve replacing sprites, changing colors, using additional sheets, or attaching extra animated parts.
+
+costume_A_09.bin - a costume definition example associated with monster_a.bin. Its accompanying artwork includes monster_A_costume_09_sheet.xml and the image referenced by that XML. Keep the base monster's assets too; a costume does not necessarily replace every sprite on the monster.
+
+Load the base monster, then use the Appearance dropdown in the Animation tab to choose an available costume. Importing only the costume definition without its base monster and artwork is not the same as importing a complete character.
+
+Costume Animation Resources Section -
+
+Example: monster_ABE_costume_10.bin
+
+Not everything with costume in its name is a costume definition. Some are animation resources used by a costume's attached parts.
+
+monster_ABE_costume_10.bin - an example containing an animation named costume_10_sketchy and referencing monster_ABE_costume_10_sheet.xml. This is animation data, which is a different job from the remapping instructions in a costume definition.
+
+Keep any accompanying animation resources when importing costumes. The definition, attachment animation, atlas XML, and image can all be separate files, so grabbing just one of them can leave an incomplete appearance.
+
+Structures, Islands, and Effects Section -
+
+Examples: bakeries.bin, island01.bin, T_fx_ring.bin
+
+Animation BINs are not limited to monsters. Some animate buildings, island scenery, or effects, and their names do not have to begin with monster_.
+
+bakeries.bin - a structure animation example referencing bakeries_sheet.xml. Its animation list includes states such as structure_bakery_01_cooking and structure_bakery_01_open.
+
+island01.bin - an island animation example containing island01_loop and referencing more than one source, including island01_sheet01.xml. Importing an island BIN is not the same thing as loading a saved island with every placed monster and decoration on it.
+
+T_fx_ring.bin - an effect animation example containing an activate animation and referencing monster_T_fx_sheet.xml. An effect's artwork can live on a monster-related atlas even when the BIN itself has a different filename.
+
+Other Game Data Bins Section -
+
+Examples: contextbar_def.bin, composer_buddy_info.bin, battle_sequence_a_costume_2.bin
+
+These are examples of why the .bin extension alone is not enough to identify a loadable sprite animation. They contain other kinds of game information rather than the ordinary animation document expected by the viewer's BIN animation parser.
+
+contextbar_def.bin - an example containing interface definitions and references to context buttons.
+
+composer_buddy_info.bin - an example of Composer-related supporting data. Composer in the filename does not automatically make the file a standalone monster animation or an entire playable composition.
+
+battle_sequence_a_costume_2.bin - an example of battle-related costume data, not the costume's sprite animation itself. Do not use its name as a reason to replace the normal costume definition with it.
+
+If one of these files is present in your dump, keep the folder structure intact, but choose an actual animation BIN when you want something to appear in the viewport. Changing the revision dropdown cannot turn unrelated game data into sprite layers.
+
+BIN Revisions Section -
+
+These are the animation layout choices currently offered by the viewer. The same filename, such as monster_a.bin, can exist in several revisions with different contents. The examples below describe particular game builds, not a rule that every file from a game or platform must use that revision.
+
+Rev 1 - the early animation layout, with monster_a.bin from an MSM 1.0.0 dump as an example.
+
+Rev 1 (Legacy Mobile) - a separate early-mobile layout. It is not interchangeable with the other Rev 1 option just because both have 1 in their name. Let Automatic inspect the file if you are unsure which early layout you have.
+
+Rev 2 - the standard Rev 2 layout, with monster_a.bin from an MSM 1.2.9 dump as an example. The My Singing Muppets beta also has files using this layout, including muppet_kermit_stage01.bin.
+
+Rev 2 (My Muppets Show) - the released My Muppets Show animation layout. muppet_kermit_stage01.bin from that game is an example. This is the choice for those released-format files, not a blanket setting for every file with muppet in its name.
+
+Rev 3 (Monster Choir) - a layout used by Monster Choir Android assets and MSM 1.3.2 assets, including their monster_a.bin files. Some Monster Choir iOS assets use standard Rev 2 instead, so the game title alone is not a reliable way to choose between them.
+
+Rev 4 - a later MSM animation layout, with monster_a.bin from an MSM 3.0.2 dump as an example.
+
+Rev 5 - another later layout, with monster_a.bin from an MSM 4.4.0 dump as an example.
+
+Rev 6 - the layout used by the MSM 5.3.0 examples in this section, including monster_a.bin, monster_a_RARE.bin, and monster_u05_RARE.bin.
+
+Automatic - tries the supported animation layouts for you. Selecting a revision manually changes how the viewer reads the file; it does not convert or rewrite the original file.
+
+DOF and Converted Animation Files Section -
+
+Dawn of Fire uses different packaging. Its animation objects can live inside Unity bundles rather than being ordinary MSM animation BINs, so do not rename a .unity3d file to .bin and expect that to convert it.
+
+Examples: staticinfo_acde_riff_chromatic_red.unity3d, ACDE_riff_red_idle.ANIMBBB
+
+The .unity3d file is a bundle container. ACDE_riff_red_idle.ANIMBBB is an example of a named animation object inside a bundle, not necessarily a loose file in the folder you downloaded. The viewer extracts supported DOF animations from imported bundles through its separate DOF handling.
+
+The bundles.json used by the Dawn of Fire Asset Grabber is a download manifest, not an animation JSON. Import it through Import Manifest in the grabber rather than expecting it to draw a monster by itself.
+
+Converted animation JSON - a different kind of .json file containing animation data. For example, an exported conversion named str_juicer_active.json can be accompanied by str_juicer_active.xml and str_juicer_active_texture.png. Keep all of those together when loading that conversion. Renaming a BIN to .json does not create one of these files.
+
+(((XML FILE EXAMPLES)))
+
+XML File Examples Section -
+
+The spritesheet XML is the map; the image is the actual artwork. The animation asks for sprites by name, the XML tells the viewer where those sprites are on the sheet, and the image supplies the pixels. You generally need all three pieces for the monster to display properly.
+
+Standard Atlas and Image Section -
+
+Examples: monster_A_sheet.xml, monster_AB_sheet.xml, monster_DEN_sheet.xml
+
+monster_A_sheet.xml - an atlas example used by monster_a.bin. In the MSM 5.3.0 example, its imagePath points to gfx/monsters/monster_A_sheet.png.
+
+monster_AB_sheet.xml - another standard atlas example, used for the artwork referenced by monster_ab.bin.
+
+monster_DEN_sheet.xml - another example of a monster atlas. The XML's name helps identify it, but the imagePath inside the XML is what tells you which image it expects.
+
+The BIN and XML filenames do not have to be identical. monster_a.bin referring to monster_A_sheet.xml is normal; there is no need to rename the XML to monster_a.xml.
+
+Rare, Epic, and Shared Atlases Section -
+
+Examples: monster_A_sheet.xml, monster_A_EPIC_sheet.xml, monster_U05_RARE_sheet.xml, monster_U05_sheet.xml
+
+monster_A_sheet.xml - also used by the monster_a_RARE.bin example. A shared atlas is not automatically a missing rare file, and differently colored variants can use the same image with different animation color information.
+
+monster_A_EPIC_sheet.xml - a separate epic atlas example. Keep the image it references alongside it.
+
+monster_U05_RARE_sheet.xml and monster_U05_sheet.xml - an example of two atlases used by one animation file. The rare U05 Activate animation needs assets from both sources. Import both XMLs AND both referenced images, not just one XML and whichever picture looks right.
+
+Sprite names can be repeated in different atlases. Keep the separate sources available rather than combining or overwriting their files just because some sprite names match.
+
+Muppets Atlases Section -
+
+Examples: kermit_sheet.xml, kermit_sheet_stage03.xml
+
+kermit_sheet.xml - the atlas referenced by muppet_kermit_stage01.bin. In the released My Muppets Show example, its imagePath is gfx/muppets/kermit_sheet.png.
+
+kermit_sheet_stage03.xml - an example of a stage-specific atlas filename. Use whichever atlas the selected animation actually references; do not assume that every stage uses the same one.
+
+There does not have to be a muppet_ prefix on the XML just because the animation BIN has one. Likewise, the beta and released game can have matching atlas filenames without having identical artwork.
+
+Costume Atlases Section -
+
+Examples: monster_A_costume_09_sheet.xml, monster_ABE_costume_10_sheet.xml
+
+monster_A_costume_09_sheet.xml - a costume atlas example whose imagePath points to gfx/costumes/monster_A_costume_09_sheet.png. It is used alongside the base monster's assets, not as a reason to delete or replace the regular atlas.
+
+monster_ABE_costume_10_sheet.xml - an example referenced by a costume animation resource. Extra animated attachments can need their own atlas and image, separate from the base monster and the costume definition.
+
+A costume that changes only part of a monster can use both regular and costume artwork at the same time. Keep all of the referenced sources available, even if a particular sheet only supplies one small attachment.
+
+Structure and Effect Atlases Section -
+
+Examples: bakeries_sheet.xml, island01_sheet01.xml, monster_T_fx_sheet.xml
+
+bakeries_sheet.xml - an atlas used by the bakeries.bin structure animations.
+
+island01_sheet01.xml - an island atlas example. A sheet number can identify one source in a larger set; it is not an animation frame number.
+
+monster_T_fx_sheet.xml - an effect atlas referenced by T_fx_ring.bin. This is another case where the BIN and XML names are related but not identical.
+
+Converted DOF Atlases Section -
+
+Example: str_juicer_active.xml
+
+This is an example of an atlas written alongside a DOF animation conversion. Keep it with its matching converted animation JSON and the image named inside the XML, rather than substituting a similar-looking sheet from another conversion.
+
+When importing a Unity bundle directly, the viewer can obtain its sprite information from the bundle instead. That is a different path from loading a loose converted JSON/XML/image set; you do not need to invent an XML filename for a bundle.
+
+Inside an Atlas Section -
+
+A spritesheet XML used by this viewer has a TextureAtlas root and named sprite entries. For example, the monster_A_sheet.xml mentioned above contains this root line:
+
+<TextureAtlas imagePath="gfx/monsters/monster_A_sheet.png" width="512" height="1024" hires="true">
+
+imagePath - tells the viewer which image contains the artwork. In this example the path is relative to the game's asset layout, not a website to download from.
+
+width and height - describe the atlas dimensions. These are not the animation's canvas dimensions.
+
+hires - extra atlas scale information. Keep this as authored rather than changing it just because an image looks large.
+
+Sprite name (n or name) - identifies an individual sprite, so the animation can ask for the correct mouth, eye, limb, or other piece. A name inside the XML is not necessarily a separate image file on disk.
+
+x, y, w, and h - describe the sprite's rectangle within the packed sheet.
+
+r - indicates a packed sprite that has been rotated on the sheet. This is packing information, not a request to rotate the monster's limb during playback.
+
+oX, oY, oW, and oH - describe trimmed sprites and their original bounds. These help the viewer put a cropped piece of artwork back in the correct place.
+
+pX and pY - contain pivot information used when placing sprites. Treat the XML and its image as a matched pair; mixing an atlas from one version with a different version's image can cause cropped or misplaced segments even if both files load.
+
+Other XMLs and Keeping Files Together Section -
+
+Examples: template_achievemententry.xml, context_buttons.xml
+
+Not every XML is a monster atlas. template_achievemententry.xml is an example of a game interface template, while context_buttons.xml contains interface artwork. An XML being present in the game files does not mean it is the missing sheet for the monster you are trying to open.
+
+For a normal monster example, keep monster_a.bin, monster_A_sheet.xml, and the image referenced by that atlas available together. Add the relevant audio files and track BINs if you also want matching audio.
+
+For a Muppets example, keep muppet_kermit_stage01.bin, kermit_sheet.xml, gfx/muppets/kermit_sheet.png, 001_kermit.bin, and its referenced music files available together.
+
+Opening the game's data folder is usually easier than selecting these one at a time because the relationships between xml_bin, xml_resources, gfx, and audio are preserved. If you import individual files, include every referenced atlas and image, including extra sheets used by costumes or alternate animations.
+
+Some animation sources point directly to an image instead of an atlas XML. In that case, supply the referenced image; do not create or rename an unrelated XML just to make the filenames match.
+
+The important part is that the animation, its atlas information, and the matching artwork belong together. A familiar filename is a useful clue, not a substitute for the files it actually references.
